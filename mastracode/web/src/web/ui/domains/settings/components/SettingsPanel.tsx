@@ -45,7 +45,7 @@ function SettingsSubsection({
     <div className="flex flex-col gap-3">
       <div className="flex flex-col gap-1">
         <div className="flex items-center justify-between gap-3">
-          <Txt variant="ui-md" className="font-medium text-icon6">
+          <Txt variant="ui-md" className="text-icon6 font-medium">
             {title}
           </Txt>
           {action}
@@ -56,7 +56,7 @@ function SettingsSubsection({
           </Txt>
         )}
       </div>
-      <div className="rounded-lg border border-border1 p-4">{children}</div>
+      <div className="border-border1 rounded-lg border p-4">{children}</div>
     </div>
   );
 }
@@ -69,7 +69,7 @@ function getSettingsUpdateErrorMessage(error: unknown): string {
 
 /**
  * Settings content pane: renders the section addressed by the settings-page
- * URL, with an independently scrolling content column.
+ * URL while the page shell supplies document scrolling.
  */
 export function SettingsPanel() {
   const section = useSettingsSection();
@@ -103,60 +103,58 @@ export function SettingsPanel() {
   };
 
   return (
-    <section aria-label="Settings" className="flex min-h-0 flex-1 flex-col overflow-hidden">
-      <div className="min-h-0 flex-1 overflow-y-auto px-5 pb-5">
-        <div className="mx-auto grid w-full max-w-4xl py-3">
-          {!isMobile && <SettingsHeader autoFocus placement="desktop" />}
-          {section === 'general' && (
-            <>
-              <GeneralSettings theme={theme} onThemeChange={setTheme} />
-              <FactorySetupSection />
-              <IntakeSection />
-            </>
-          )}
-          {section === 'source-control' && <SourceControlSection />}
-          {section === 'model' && (
-            <div className="flex flex-col gap-8">
-              <SettingsSubsection title="Defaults">
-                {/* Rows bring their own py-3; -my-3 keeps the card's effective padding even on all sides. */}
-                <div className="-my-3 divide-y divide-border1/40">
-                  <FactoryDefaultModelSection models={models} />
-                  <ModelSettings
-                    settings={settings}
-                    updating={updateSettingsMutation.isPending}
-                    onBehaviorChange={onBehaviorChange}
-                  />
-                </div>
-              </SettingsSubsection>
-              <SettingsSubsection title="Providers">
-                <ProviderAccessSection />
-              </SettingsSubsection>
-              <SettingsSubsection
-                title="Model packs"
-                description="A pack sets a model for each mode (build / plan / fast)."
-              >
-                <ModelPacksSection resourceId={sessionResourceId} scope={sessionScope} models={models} />
-              </SettingsSubsection>
-              <SettingsSubsection
-                title="Observational memory"
-                description="Choose the models and token thresholds used to summarize and retain conversation context."
-              >
-                <OMSection resourceId={sessionResourceId} scope={sessionScope} models={models} />
-              </SettingsSubsection>
-            </div>
-          )}
-          {section === 'behavior' && (
-            <BehaviorSettings
-              settings={settings}
-              updating={updateSettingsMutation.isPending}
-              onBehaviorChange={onBehaviorChange}
-              permissions={permissions ?? null}
-              pendingPermissionCategory={pendingPermissionCategory}
-              setPermissionForCategory={setPermissionForCategory}
-            />
-          )}
-          {section === 'custom-providers' && <CustomProvidersSection />}
-        </div>
+    <section aria-label="Settings" className="flex flex-1 flex-col px-5 pb-5">
+      <div className="mx-auto grid w-full max-w-4xl py-3">
+        {!isMobile && <SettingsHeader autoFocus placement="desktop" />}
+        {section === 'general' && (
+          <>
+            <GeneralSettings theme={theme} onThemeChange={setTheme} />
+            <FactorySetupSection />
+            <IntakeSection />
+          </>
+        )}
+        {section === 'source-control' && <SourceControlSection />}
+        {section === 'model' && (
+          <div className="flex flex-col gap-8">
+            <SettingsSubsection title="Defaults">
+              {/* Rows bring their own py-3; -my-3 keeps the card's effective padding even on all sides. */}
+              <div className="divide-border1/40 -my-3 divide-y">
+                <FactoryDefaultModelSection models={models} />
+                <ModelSettings
+                  settings={settings}
+                  updating={updateSettingsMutation.isPending}
+                  onBehaviorChange={onBehaviorChange}
+                />
+              </div>
+            </SettingsSubsection>
+            <SettingsSubsection title="Providers">
+              <ProviderAccessSection />
+            </SettingsSubsection>
+            <SettingsSubsection
+              title="Model packs"
+              description="A pack sets a model for each mode (build / plan / fast)."
+            >
+              <ModelPacksSection resourceId={sessionResourceId} scope={sessionScope} models={models} />
+            </SettingsSubsection>
+            <SettingsSubsection
+              title="Observational memory"
+              description="Choose the models and token thresholds used to summarize and retain conversation context."
+            >
+              <OMSection resourceId={sessionResourceId} scope={sessionScope} models={models} />
+            </SettingsSubsection>
+          </div>
+        )}
+        {section === 'behavior' && (
+          <BehaviorSettings
+            settings={settings}
+            updating={updateSettingsMutation.isPending}
+            onBehaviorChange={onBehaviorChange}
+            permissions={permissions ?? null}
+            pendingPermissionCategory={pendingPermissionCategory}
+            setPermissionForCategory={setPermissionForCategory}
+          />
+        )}
+        {section === 'custom-providers' && <CustomProvidersSection />}
       </div>
     </section>
   );

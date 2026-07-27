@@ -2,7 +2,7 @@ import { useMainSidebar } from '@mastra/playground-ui/components/MainSidebar';
 import { Navigate, useLocation, useParams } from 'react-router';
 
 import { Sidebar } from '../Sidebar';
-import { PageLayout } from '../ui/PageLayout';
+import { PageLayout } from '../layouts/PageLayout';
 import { ChatHeader } from '../domains/chat/components/ChatHeader';
 import { SettingsHeader } from '../domains/settings/components/SettingsHeader';
 import { SettingsPanel } from '../domains/settings/components/SettingsPanel';
@@ -30,8 +30,12 @@ function SettingsPageContent() {
 
   if (!factoryId) {
     return (
-      <main className="flex h-screen min-h-0 flex-col overflow-hidden bg-surface2">
-        {isMobile && <SettingsHeader autoFocus placement="mobile" />}
+      <main className="bg-surface2 flex min-h-dvh flex-col">
+        {isMobile && (
+          <div className="bg-surface2 sticky top-0 z-2 shrink-0 px-3 py-2">
+            <SettingsHeader autoFocus placement="mobile" />
+          </div>
+        )}
         <SettingsPanel />
       </main>
     );

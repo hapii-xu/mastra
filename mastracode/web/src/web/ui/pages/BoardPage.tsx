@@ -12,7 +12,6 @@ import {
   CircleDot,
   CircleX,
   EllipsisVertical,
-  ExternalLink,
   GitCompareArrows,
   GitPullRequest,
   Link2,
@@ -48,8 +47,8 @@ import {
   useTransitionWorkItemMutation,
   useUpdateWorkItemMutation,
   useUpsertWorkItemMutation,
+  useWorkItemsQuery,
 } from '../../../shared/hooks/useWorkItems';
-import { useWorkItemsQuery } from '../../../shared/hooks/useWorkItems';
 import type { FactoryDecisionStatus, FactoryDecisionSummary } from '../domains/factory/services/decisions';
 import type { GithubIssue, GithubPullRequest } from '../domains/factory/services/factory';
 import type { LinearIssue } from '../domains/factory/services/linear';
@@ -908,7 +907,6 @@ function BoardContent({
                     retryingDecisionId={retryDecision.isPending ? retryDecision.variables : undefined}
                     onRetryDecision={decisionId => retryDecision.mutate(decisionId)}
                     pendingRunRoles={pendingRunRolesByItem.get(item.id) ?? EMPTY_PENDING_RUN_ROLES}
-                    onOpenThread={session => void openThread(session)}
                     onCreateSession={() => void openOrCreateSession(item, stage.id)}
                     onStartRun={(_spec, action) => void openOrStartRun(item, action.role)}
                     onMove={toStage => moveItem(item.id, stage.id, toStage)}
@@ -1072,11 +1070,11 @@ function BoardColumnEmptyState({
 }) {
   const copy = boardColumnEmptyCopy(stage, kind, hasIntakeSource);
   return (
-    <div className="flex min-h-24 flex-col justify-center rounded-lg border border-dashed border-border1 px-4 py-4">
-      <Txt as="p" variant="ui-sm" className="m-0 font-medium text-icon4">
+    <div className="border-border1 flex min-h-24 flex-col justify-center rounded-lg border border-dashed px-4 py-4">
+      <Txt as="p" variant="ui-sm" className="text-icon4 m-0 font-medium">
         {copy.title}
       </Txt>
-      <Txt as="p" variant="ui-xs" className="mt-1 mb-0 max-w-60 leading-5 text-icon3">
+      <Txt as="p" variant="ui-xs" className="text-icon3 mt-1 mb-0 max-w-60 leading-5">
         {copy.description}
       </Txt>
     </div>
@@ -1092,7 +1090,7 @@ function ColumnTaskBadge({ count, total, label }: { count: number; total: number
     <span
       aria-label={`${count} of ${total} visible board tasks in ${label}`}
       title={`${count} of ${total} visible board tasks`}
-      className="flex h-6 min-w-12 shrink-0 items-center justify-center gap-1.5 rounded-full border border-border1 bg-surface2 px-2 text-ui-xs font-medium tabular-nums text-icon4"
+      className="border-border1 bg-surface2 text-ui-xs text-icon4 flex h-6 min-w-12 shrink-0 items-center justify-center gap-1.5 rounded-full border px-2 font-medium tabular-nums"
     >
       <svg viewBox="0 0 14 14" className="size-3.5 -rotate-90" aria-hidden>
         <circle cx="7" cy="7" r="5" fill="none" strokeWidth="2" className="stroke-border1" />
@@ -1161,13 +1159,18 @@ function BoardColumn({
   const [dragOver, setDragOver] = useState(false);
   const [dropLineTop, setDropLineTop] = useState(0);
   const cardListRef = useRef<HTMLDivElement>(null);
+  const collapsed = stage !== 'intake' && !loading && taskCount === 0;
 
   return (
     <section
       ref={laneRef}
-      aria-label={label}
+      aria-label={collapsed ? `${label}, empty` : label}
       data-testid={`board-column-${stage}`}
-      className="flex min-h-0 w-80 shrink-0 flex-col gap-4"
+      className={cn(
+        'flex min-h-0 shrink-0 flex-col transition-[width,background-color] motion-reduce:transition-none',
+        collapsed ? 'w-14 rounded-lg' : 'w-80 gap-4',
+        collapsed && dragOver && 'bg-surface2 ring-1 ring-border1',
+      )}
       onDragOver={event => {
         if (!event.dataTransfer.types.includes(CARD_MIME)) return;
         event.preventDefault();
@@ -1187,37 +1190,50 @@ function BoardColumn({
         if (payload) onDrop(payload, stage);
       }}
     >
-      <div className="flex min-h-8 items-start justify-between gap-2">
-        <div className="flex h-8 min-w-0 items-center gap-2">
-          <BoardStageIcon stage={stage} />
-          <Txt as="h2" variant="ui-smd" className="m-0 truncate font-semibold text-icon3">
+      {collapsed ? (
+        <div className="flex min-h-0 flex-1 flex-col items-center gap-3 py-1">
+          <span aria-hidden className="text-ui-xs text-icon3 flex h-8 items-center font-medium tabular-nums">
+            {taskCount}
+          </span>
+          <Txt as="h2" variant="ui-smd" className="text-icon3 m-0 font-semibold [writing-mode:vertical-rl]">
             {label}
           </Txt>
-          {loading ? (
-            <Skeleton className="h-6 w-12 shrink-0 rounded-full" />
-          ) : (
-            <ColumnTaskBadge count={taskCount} total={totalTaskCount} label={label} />
-          )}
         </div>
-        {headerAction && <div className="flex h-8 shrink-0 items-center">{headerAction}</div>}
-      </div>
-      {headerExtras}
-      {/* Cards scroll inside the swimlane; the page stays fixed. */}
-      <div className="min-h-16 flex-1">
-        <ScrollArea className="h-full">
-          <div ref={cardListRef} className="relative flex flex-col gap-2.5 pb-2">
-            {children}
-            <div
-              aria-hidden
-              style={{ top: dropLineTop }}
-              className={cn(
-                'pointer-events-none absolute inset-x-0 z-10 h-0.5 rounded-full bg-neutral1 transition-opacity motion-reduce:transition-none',
-                dragOver ? 'opacity-100' : 'opacity-0',
+      ) : (
+        <>
+          <div className="flex min-h-8 items-start justify-between gap-2">
+            <div className="flex h-8 min-w-0 items-center gap-2">
+              <BoardStageIcon stage={stage} />
+              <Txt as="h2" variant="ui-smd" className="text-icon3 m-0 truncate font-semibold">
+                {label}
+              </Txt>
+              {loading ? (
+                <Skeleton className="h-6 w-12 shrink-0 rounded-full" />
+              ) : (
+                <ColumnTaskBadge count={taskCount} total={totalTaskCount} label={label} />
               )}
-            />
+            </div>
+            {headerAction && <div className="flex h-8 shrink-0 items-center">{headerAction}</div>}
           </div>
-        </ScrollArea>
-      </div>
+          {headerExtras}
+          {/* Cards scroll inside the swimlane; the page stays fixed. */}
+          <div className="min-h-16 flex-1">
+            <ScrollArea className="h-full">
+              <div ref={cardListRef} className="relative flex flex-col gap-2.5 pb-2">
+                {children}
+                <div
+                  aria-hidden
+                  style={{ top: dropLineTop }}
+                  className={cn(
+                    'pointer-events-none absolute inset-x-0 z-10 h-0.5 rounded-full bg-neutral1 transition-opacity motion-reduce:transition-none',
+                    dragOver ? 'opacity-100' : 'opacity-0',
+                  )}
+                />
+              </div>
+            </ScrollArea>
+          </div>
+        </>
+      )}
     </section>
   );
 }
@@ -1242,11 +1258,11 @@ const STAGE_ICON_SOURCES: Partial<Record<BoardStageId, string>> = {
 
 function BoardStageIcon({ stage }: { stage: BoardStageId }) {
   if (stage === 'intake') return <ArrowRightCircleIcon className="shrink-0 text-[#939393]" />;
-  if (stage === 'review') return <GitPullRequest size={16} className="shrink-0 text-icon3" aria-hidden />;
+  if (stage === 'review') return <GitPullRequest size={16} className="text-icon3 shrink-0" aria-hidden />;
   const source = STAGE_ICON_SOURCES[stage];
   if (source) return <img src={source} alt="" aria-hidden className="size-4 shrink-0" />;
   const Icon = stage === 'done' ? CheckCircle2 : CircleX;
-  return <Icon size={16} className="shrink-0 text-icon3" aria-hidden />;
+  return <Icon size={16} className="text-icon3 shrink-0" aria-hidden />;
 }
 
 function ArrowRightCircleIcon({ size = 16, className }: { size?: number; className?: string }) {
@@ -1294,7 +1310,7 @@ function CardLabels({ labels }: { labels: readonly string[] }) {
       {visibleLabels.map(label => (
         <span
           key={label}
-          className="inline-flex h-6 max-w-full items-center gap-1 rounded-full border border-border1 px-2 text-ui-xs text-icon4"
+          className="border-border1 text-ui-xs text-icon4 inline-flex h-6 max-w-full items-center gap-1 rounded-full border px-2"
           title={label}
         >
           <span className={cn('size-1.5 shrink-0 rounded-full', labelDotClass(label))} aria-hidden />
@@ -1302,7 +1318,7 @@ function CardLabels({ labels }: { labels: readonly string[] }) {
         </span>
       ))}
       {hiddenCount > 0 && (
-        <span className="inline-flex h-6 items-center rounded-full border border-border1 px-2 text-ui-xs text-icon3">
+        <span className="border-border1 text-ui-xs text-icon3 inline-flex h-6 items-center rounded-full border px-2">
           +{hiddenCount}
         </span>
       )}
@@ -1352,7 +1368,6 @@ function WorkItemCard({
   retryingDecisionId,
   onRetryDecision,
   pendingRunRoles,
-  onOpenThread,
   onCreateSession,
   onStartRun,
   onMove,
@@ -1371,7 +1386,6 @@ function WorkItemCard({
   retryingDecisionId?: string;
   onRetryDecision: (decisionId: string) => void;
   pendingRunRoles: ReadonlyMap<string, FactoryRunPhase | undefined>;
-  onOpenThread: (session: WorkItemSessionRef) => void;
   /** Title click when the card has no live session: open an empty session (no run). */
   onCreateSession: (spec: { branch: string; threadTitle: string }) => void;
   onStartRun: (spec: ItemRunSpec, action: RunAction) => void;
@@ -1409,91 +1423,89 @@ function WorkItemCard({
         if (!evaluating) setDragPayload(event, { kind: 'work-item', id: item.id, fromStage: columnStage });
       }}
       className={cn(
-        'group flex flex-col gap-3 rounded-xl border border-border1 bg-surface1 p-3 outline-none transition-colors hover:bg-surface3',
+        'group relative flex flex-col gap-3 rounded-xl border border-border1/50 bg-neutral6/5 p-3 outline-none transition-colors hover:bg-surface3',
         evaluating ? 'cursor-wait' : 'cursor-grab active:cursor-grabbing',
         runPending && 'opacity-70',
       )}
     >
+      {threadSession !== null ? (
+        <Link
+          to={`/factories/${factoryId}/workspaces/${threadSession.sessionId}/threads/${threadSession.threadId}`}
+          draggable={false}
+          aria-label={`Open thread for ${item.title}`}
+          className="focus-visible:outline-accent1 absolute inset-0 z-10 cursor-pointer rounded-xl outline-none focus-visible:outline-2 focus-visible:outline-offset-2"
+        />
+      ) : (
+        <button
+          type="button"
+          draggable={false}
+          disabled={runDisabled}
+          aria-busy={pendingRunRoles.size > 0 || undefined}
+          aria-label={`Create thread for ${item.title}`}
+          className="focus-visible:outline-accent1 absolute inset-0 z-10 cursor-pointer rounded-xl outline-none focus-visible:outline-2 focus-visible:outline-offset-2 disabled:cursor-not-allowed"
+          onClick={() => onCreateSession(itemSessionSpec(item))}
+        />
+      )}
+      <div className="absolute top-2 right-2 z-20">
+        <DropdownMenu>
+          <DropdownMenu.Trigger
+            render={
+              <Button
+                type="button"
+                variant="ghost"
+                size="icon-xs"
+                disabled={evaluating}
+                aria-label={`Actions for ${item.title}`}
+              >
+                <EllipsisVertical size={13} aria-hidden />
+              </Button>
+            }
+          />
+          <DropdownMenu.Content align="end" className="min-w-44">
+            {runSpec !== null &&
+              runActions.map(action => {
+                const starting = pendingRunRoles.has(action.role);
+                return (
+                  <DropdownMenu.Item
+                    key={action.label}
+                    disabled={runDisabled || starting}
+                    onClick={() => onStartRun(runSpec, action)}
+                  >
+                    {actionIcon(action.label)}
+                    <span>{starting ? 'Starting…' : action.label}</span>
+                  </DropdownMenu.Item>
+                );
+              })}
+            {columnStage === 'intake' &&
+              item.url !== null &&
+              (item.source === 'github-issue' || item.source === 'linear-issue') && (
+                <DropdownMenu.Item render={<a href={item.url} target="_blank" rel="noreferrer" />}>
+                  <ArrowUpRight aria-hidden />
+                  <span>{externalLinkLabel(item.source)}</span>
+                </DropdownMenu.Item>
+              )}
+            {itemStageOptions(item)
+              .filter(stage => stage.id !== columnStage)
+              .map(stage => (
+                <DropdownMenu.Item key={stage.id} onClick={() => onMove(stage.id)}>
+                  <BoardStageIcon stage={stage.id} />
+                  <span>{stage.id === 'done' ? 'Mark done' : `Move to ${stage.label}`}</span>
+                </DropdownMenu.Item>
+              ))}
+            <DropdownMenu.Item onClick={onRemove}>
+              <Trash2 aria-hidden />
+              <span>Remove</span>
+            </DropdownMenu.Item>
+          </DropdownMenu.Content>
+        </DropdownMenu>
+      </div>
       <div className="flex min-w-0 flex-col gap-1.5">
-        <span className="truncate text-ui-xs text-icon2">{workItemMeta(item)}</span>
+        <span className="text-ui-xs text-icon2 truncate pr-8">{workItemMeta(item)}</span>
         <div className="flex min-w-0 items-center gap-1.5">
           <Icon size={16} className={cn('shrink-0', iconClassName)} aria-hidden />
-          {threadSession !== null ? (
-            <a
-              href={`/factories/${factoryId}/threads/${threadSession.threadId}`}
-              onClick={event => {
-                event.preventDefault();
-                onOpenThread(threadSession);
-              }}
-              className="min-w-0 flex-1 truncate text-ui-smd font-semibold text-icon6 no-underline hover:underline"
-            >
-              <SourceTitle source={item.source} title={item.title} />
-            </a>
-          ) : (
-            <button
-              type="button"
-              disabled={runDisabled}
-              aria-busy={pendingRunRoles.size > 0 || undefined}
-              onClick={() => onCreateSession(itemSessionSpec(item))}
-              className="min-w-0 flex-1 truncate text-left text-ui-smd font-semibold text-icon6 hover:underline disabled:opacity-60"
-            >
-              <SourceTitle source={item.source} title={item.title} />
-            </button>
-          )}
-          {item.url !== null && (
-            <a
-              href={item.url}
-              target="_blank"
-              rel="noreferrer"
-              aria-label={externalLinkLabel(item.source)}
-              className="shrink-0 text-icon3 hover:text-icon5"
-            >
-              <ExternalLink size={12} aria-hidden />
-            </a>
-          )}
-          <DropdownMenu>
-            <DropdownMenu.Trigger
-              render={
-                <Button
-                  type="button"
-                  variant="ghost"
-                  size="icon-xs"
-                  disabled={evaluating}
-                  aria-label={`Actions for ${item.title}`}
-                >
-                  <EllipsisVertical size={13} aria-hidden />
-                </Button>
-              }
-            />
-            <DropdownMenu.Content align="end" className="min-w-44">
-              {runSpec !== null &&
-                runActions.map(action => {
-                  const starting = pendingRunRoles.has(action.role);
-                  return (
-                    <DropdownMenu.Item
-                      key={action.label}
-                      disabled={runDisabled || starting}
-                      onClick={() => onStartRun(runSpec, action)}
-                    >
-                      {actionIcon(action.label)}
-                      <span>{starting ? 'Starting…' : action.label}</span>
-                    </DropdownMenu.Item>
-                  );
-                })}
-              {itemStageOptions(item)
-                .filter(stage => stage.id !== columnStage)
-                .map(stage => (
-                  <DropdownMenu.Item key={stage.id} onClick={() => onMove(stage.id)}>
-                    <BoardStageIcon stage={stage.id} />
-                    <span>{stage.id === 'done' ? 'Mark done' : `Move to ${stage.label}`}</span>
-                  </DropdownMenu.Item>
-                ))}
-              <DropdownMenu.Item onClick={onRemove}>
-                <Trash2 aria-hidden />
-                <span>Remove</span>
-              </DropdownMenu.Item>
-            </DropdownMenu.Content>
-          </DropdownMenu>
+          <span className="text-ui-smd text-icon6 min-w-0 flex-1 truncate font-semibold">
+            <SourceTitle source={item.source} title={item.title} />
+          </span>
         </div>
       </div>
       <CardLabels labels={labels} />
@@ -1504,43 +1516,38 @@ function WorkItemCard({
         );
         const relatedSession = itemThreadSession(relatedLiveSessions);
         return (
-          <a
+          <Link
             key={related.id}
-            href={
+            to={
               relatedSession
-                ? `/factories/${factoryId}/threads/${relatedSession.threadId}`
+                ? `/factories/${factoryId}/workspaces/${relatedSession.sessionId}/threads/${relatedSession.threadId}`
                 : relationshipPath(related, factoryId)
             }
-            onClick={event => {
-              if (!relatedSession) return;
-              event.preventDefault();
-              onOpenThread(relatedSession);
-            }}
-            className="flex items-center gap-1 text-ui-xs text-icon4 hover:text-icon6 hover:underline"
+            className="text-ui-xs text-icon4 hover:text-icon6 relative z-20 flex items-center gap-1 hover:underline"
             aria-label={`Open ${relationText}`}
           >
             <Link2 size={11} aria-hidden />
             <span className="truncate">{relationText}</span>
-          </a>
+          </Link>
         );
       })}
       {otherStages.length > 0 && (
         <div className="flex flex-wrap items-center gap-1.5">
           {otherStages.map(stage => (
-            <span key={stage} className="rounded-full border border-border1 px-2 py-0.5 text-ui-xs text-icon4">
+            <span key={stage} className="border-border1 text-ui-xs text-icon4 rounded-full border px-2 py-0.5">
               {itemStageLabel(item, stage)}
             </span>
           ))}
         </div>
       )}
       {evaluatingStage !== undefined && (
-        <span role="status" aria-live="polite" className="flex items-center gap-1.5 text-ui-xs text-icon4">
+        <span role="status" aria-live="polite" className="text-ui-xs text-icon4 flex items-center gap-1.5">
           <Spinner size="sm" aria-hidden className="size-3" />
           {evaluatingStage === 'done' ? 'Marking done…' : `Moving to ${itemStageLabel(item, evaluatingStage)}…`}
         </span>
       )}
       {[...pendingRunRoles].map(([role, phase]) => (
-        <span key={role} role="status" aria-live="polite" className="flex items-center gap-1.5 text-ui-xs text-icon4">
+        <span key={role} role="status" aria-live="polite" className="text-ui-xs text-icon4 flex items-center gap-1.5">
           <Spinner size="sm" aria-hidden className="size-3" />
           {runSpec?.actions.find(action => action.role === role)?.label ?? 'Starting run'} —{' '}
           {phase !== undefined ? RUN_PHASE_LABELS[phase] : 'starting…'}
@@ -1559,6 +1566,7 @@ function WorkItemCard({
               type="button"
               variant="outline"
               size="sm"
+              className="relative z-20"
               disabled={retryingDecisionId === decision.id}
               onClick={() => onRetryDecision(decision.id)}
             >
@@ -1620,10 +1628,10 @@ function CandidateCard({
           },
         })
       }
-      className="group flex cursor-grab flex-col gap-3 rounded-xl border border-border1 bg-surface1 p-3 outline-none transition-colors hover:bg-surface3 active:cursor-grabbing"
+      className="group border-border1/50 bg-neutral6/5 hover:bg-surface3 flex cursor-grab flex-col gap-3 rounded-xl border p-3 transition-colors outline-none active:cursor-grabbing"
     >
       <div className="flex min-w-0 flex-col gap-1.5">
-        <span className="block truncate text-ui-xs text-icon2">{candidate.meta}</span>
+        <span className="text-ui-xs text-icon2 block truncate">{candidate.meta}</span>
         <div className="flex min-w-0 items-center gap-1.5">
           <Icon size={16} className={cn('shrink-0', candidate.iconClassName)} aria-hidden />
           <button
@@ -1631,7 +1639,7 @@ function CandidateCard({
             disabled={disabled}
             aria-busy={pendingRunRoles.has(defaultAction.role) || undefined}
             onClick={onOpenSession}
-            className="min-w-0 flex-1 truncate text-left text-ui-smd font-semibold text-icon6 hover:underline disabled:opacity-60"
+            className="text-ui-smd text-icon6 min-w-0 flex-1 truncate text-left font-semibold hover:underline disabled:opacity-60"
           >
             <SourceTitle source={candidate.source} title={candidate.title} />
           </button>
@@ -1640,7 +1648,7 @@ function CandidateCard({
             target="_blank"
             rel="noreferrer"
             aria-label={externalLinkLabel(candidate.source)}
-            className="shrink-0 text-icon3 transition-[opacity,translate] hover:text-icon5 focus-visible:translate-x-0 focus-visible:translate-y-0 focus-visible:opacity-100 pointer-fine:-translate-x-1 pointer-fine:translate-y-1 pointer-fine:opacity-0 pointer-fine:group-hover:translate-x-0 pointer-fine:group-hover:translate-y-0 pointer-fine:group-hover:opacity-100 motion-reduce:transition-none"
+            className="text-icon3 hover:text-icon5 shrink-0 transition-[opacity,translate] focus-visible:translate-x-0 focus-visible:translate-y-0 focus-visible:opacity-100 motion-reduce:transition-none pointer-fine:-translate-x-1 pointer-fine:translate-y-1 pointer-fine:opacity-0 pointer-fine:group-hover:translate-x-0 pointer-fine:group-hover:translate-y-0 pointer-fine:group-hover:opacity-100"
           >
             <ArrowUpRight size={12} aria-hidden />
           </a>

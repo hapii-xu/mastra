@@ -53,8 +53,11 @@ export function ChatSessionConfigProvider({
   // memory resourceId and no scope (see FactoryStartCoordinator.prepare and
   // UserSessionsSection), so the chat surface must address the same
   // (resourceId, no scope) session to read threads and share the live run.
-  // On user routes the :threadId param IS the sessionId.
-  const resourceId = userScoped ? threadId : (storedSession?.sessionId ?? sessionId);
+  // On user routes the :threadId param IS the sessionId. Factory routes with
+  // no workspace session (e.g. /settings/*) fall back to the factory-level
+  // session address returned by the /ensure route so resource-scoped surfaces
+  // (behavior settings, tool permissions) stay functional.
+  const resourceId = userScoped ? threadId : (storedSession?.sessionId ?? sessionId ?? ensureQuery.data?.resourceId);
   const projectPath = undefined;
   const sessionEnabled = userScoped
     ? Boolean(storedSession) && !resolvingSession
@@ -146,7 +149,7 @@ export function ChatMessageBoundary({ children }: { children: ReactNode }) {
 function ChatMessageFeedback({ threadId, isPending, error }: ChatThreadMessagesApi) {
   if (threadId && isPending) {
     return (
-      <div className="flex min-h-0 flex-1 flex-col gap-4 overflow-y-auto scroll-smooth px-3 pb-2 pt-6 md:px-5 [&>*]:mx-auto [&>*]:w-full [&>*]:max-w-[80ch]">
+      <div className="flex min-h-0 flex-1 flex-col gap-4 overflow-y-auto scroll-smooth px-3 pt-6 pb-2 md:px-5 [&>*]:mx-auto [&>*]:w-full [&>*]:max-w-[80ch]">
         <SkeletonRows label="Loading messages" rows={6} />
       </div>
     );
@@ -155,7 +158,7 @@ function ChatMessageFeedback({ threadId, isPending, error }: ChatThreadMessagesA
   if (threadId && error) {
     const errorMessage = error instanceof Error ? error.message : undefined;
     return (
-      <div className="flex min-h-0 flex-1 flex-col place-items-center gap-4 overflow-y-auto scroll-smooth px-3 pb-2 pt-6 md:px-5 [&>*]:mx-auto [&>*]:w-full [&>*]:max-w-[80ch]">
+      <div className="flex min-h-0 flex-1 flex-col place-items-center gap-4 overflow-y-auto scroll-smooth px-3 pt-6 pb-2 md:px-5 [&>*]:mx-auto [&>*]:w-full [&>*]:max-w-[80ch]">
         <Notice variant="destructive">
           {errorMessage ? `Failed to load messages: ${errorMessage}` : 'Failed to load messages.'}
         </Notice>
