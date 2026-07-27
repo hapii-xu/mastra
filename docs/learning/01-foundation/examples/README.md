@@ -5,13 +5,12 @@
 ## 怎么跑
 
 ```bash
-# 从仓库根目录
+# 从仓库根目录（推荐：用 workspace 里的 vitest，不要用 npx vitest）
 cd docs/learning/01-foundation/examples
+node ../../../../node_modules/vitest/vitest.mjs run   # 104 用例，~300ms
 
-npx vitest run                       # 跑全部 7 个文件，~300ms
-npx vitest run 02-request-context-fork   # 只跑某一个文件
-npx vitest                           # watch 模式
-npx vitest run -t "越权防护"          # 只跑名字匹配的用例
+# 或（需已 pnpm install）
+pnpm exec vitest run
 ```
 
 **不需要 `pnpm install`、不需要 `pnpm build`。** 示例通过相对路径直接 import `packages/_internal-core/src/` 的源码，vitest 配置（`vitest.config.ts`）没有 `setupFiles`、不依赖任何 `dist`。

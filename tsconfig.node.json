@@ -29,6 +29,9 @@
     "lib": ["ES2023"],
 
     /* TS 6 no longer auto-discovers @types; list globals explicitly: */
-    "types": ["node"]
+    "types": ["node"],
+
+    /* TS 6: silence baseUrl deprecation during DTS builds (see docs/learning/README.md) */
+    "ignoreDeprecations": "6.0"
   }
 }

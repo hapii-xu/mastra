@@ -2,6 +2,9 @@
 
 面向「企业级 AI Agent 自研」的源码学习索引。学习方式：**每个模块的示例 + 源码 + debug 单步执行**。
 
+> **先会用再看源码？** 见 [SDK-QUICKSTART.md](./SDK-QUICKSTART.md)（官方 course / create-mastra / examples/agent + Studio 4111）。
+> **断点清单？** 见 [DEBUG-BREAKPOINTS.md](./DEBUG-BREAKPOINTS.md)。
+
 本目录是**导航式索引**，不是教程。每份 `.md` 的作用是告诉你：这个模块干什么、该读哪几个文件、执行链路怎么走、断点打在哪、坑在哪。真正的理解发生在你打开 IDE 单步跑的时候。
 
 > 代码坐标（`file:line`）采集于 2026-07-14，基于 commit `44ec81392a`。行号会随代码漂移，**类名/方法名是稳定的锚点**——行号对不上时用 `grep -n "方法名" 文件` 重新定位。
