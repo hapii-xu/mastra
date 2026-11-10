@@ -9,8 +9,16 @@ import { createAnthropic } from '@ai-sdk/anthropic';
 import type { MastraModelConfig } from '@mastra/core/llm';
 import { wrapLanguageModel } from 'ai';
 import type { LanguageModelMiddleware } from 'ai';
+import { ProviderAuthRequiredError, rejectUnauthorizedResponse } from '../auth/provider-auth-error.js';
 import { AuthStorage } from '../auth/storage.js';
 import type { CredentialStore } from '../auth/types.js';
+import { runCatalogThinkingLevel } from '../thinking-catalog.js';
+import { ANTHROPIC_PROMPT_CACHE_TTL } from './anthropic-prompt-cache.js';
+import type { AnthropicPromptCacheScope } from './anthropic-prompt-cache.js';
+import { ANTHROPIC_THINKING_BUDGET_TOKENS, getAnthropicThinkingCapability } from './anthropic-thinking.js';
+import type { ThinkingLevel } from './openai-codex.js';
+
+const PROVIDER_NAME = 'Anthropic';
 
 // Required for Claude Max plan OAuth - the endpoint checks for this system message
 const claudeCodeIdentity = "You are Claude Code, Anthropic's official CLI for Claude.";
@@ -52,7 +60,7 @@ export function setAuthStorage(storage: AuthStorage | undefined): void {
  * Required for Claude Max OAuth authentication
  */
 export const claudeCodeMiddleware: LanguageModelMiddleware = {
-  specificationVersion: 'v3',
+  specificationVersion: 'v4',
   transformParams: async ({ params }) => {
     // Prepend the Claude Code identity as the first system message
     const systemMessage = {
@@ -76,18 +84,21 @@ export const claudeCodeMiddleware: LanguageModelMiddleware = {
  *
  * Adds cache breakpoints at strategic locations:
  * 1. Last system message (end of static instructions + dynamic memory)
- * 2. Most recent user/assistant message (conversation context)
+ * 2. Most recent user/assistant message (conversation context), `conversation` scope only
  *
  * This allows Anthropic to cache:
  * - System prompts and instructions (rarely change)
  * - Conversation history up to the last message
  */
-export const promptCacheMiddleware: LanguageModelMiddleware = {
-  specificationVersion: 'v3',
+export const createPromptCacheMiddleware = (scope: AnthropicPromptCacheScope): LanguageModelMiddleware => ({
+  specificationVersion: 'v4',
   transformParams: async ({ params }) => {
     const prompt = [...params.prompt];
 
-    const cacheControl = { type: 'ephemeral' as const, ttl: '5m' as const };
+    const cacheControl = {
+      type: 'ephemeral' as const,
+      ttl: scope === 'conversation' ? ANTHROPIC_PROMPT_CACHE_TTL : ('5m' as const),
+    };
 
     // Helper to add cache control to a message's last content part
     const addCacheToMessage = (msg: any) => {
@@ -135,13 +146,65 @@ export const promptCacheMiddleware: LanguageModelMiddleware = {
 
     // Add cache breakpoint to the most recent message (last in array)
     const lastIdx = prompt.length - 1;
-    if (lastIdx >= 0 && lastIdx !== lastSystemIdx) {
+    if (scope === 'conversation' && lastIdx >= 0 && lastIdx !== lastSystemIdx) {
       prompt[lastIdx] = addCacheToMessage(prompt[lastIdx]);
     }
 
     return { ...params, prompt };
   },
-};
+});
+
+function runAnthropicRequestLevel(modelId: string, level: ThinkingLevel): ThinkingLevel {
+  return runCatalogThinkingLevel(`anthropic/${modelId}`, level);
+}
+
+/**
+ * Middleware that maps the session thinking level onto Anthropic extended
+ * thinking. Returns `undefined` (no middleware) when the level is `off` or the
+ * model doesn't support thinking, preserving the previous request shape.
+ *
+ * - Adaptive-era models (Sonnet 4.6+/Opus 4.6+): `thinking: adaptive` plus
+ *   `output_config.effort`, the closest effort the model accepts.
+ * - Budget-era models (Claude 3.7 – Opus 4.5): `thinking: enabled` with a
+ *   `budget_tokens` value derived from the level.
+ */
+export function createAnthropicThinkingMiddleware(
+  modelId: string,
+  thinkingLevel?: ThinkingLevel,
+): LanguageModelMiddleware | undefined {
+  if (!thinkingLevel || thinkingLevel === 'off') return undefined;
+  const capability = getAnthropicThinkingCapability(modelId);
+  const level = runAnthropicRequestLevel(modelId, thinkingLevel);
+  if (level === 'off') return undefined;
+
+  return {
+    specificationVersion: 'v4',
+    transformParams: async ({ params }) => {
+      const anthropicOptions = (params.providerOptions?.anthropic ?? {}) as Record<string, unknown>;
+      // Don't override explicit per-request thinking configuration.
+      if (anthropicOptions.thinking !== undefined || anthropicOptions.effort !== undefined) {
+        return params;
+      }
+
+      // Anthropic rejects sampling parameters when thinking is enabled.
+      delete params.temperature;
+      delete params.topP;
+      delete params.topK;
+
+      params.providerOptions = {
+        ...params.providerOptions,
+        anthropic: {
+          ...anthropicOptions,
+          ...(capability === 'adaptive'
+            ? { thinking: { type: 'adaptive', display: 'summarized' }, effort: level }
+            : { thinking: { type: 'enabled', budgetTokens: ANTHROPIC_THINKING_BUDGET_TOKENS[level] } }),
+        },
+      } as typeof params.providerOptions;
+
+      return params;
+    },
+  };
+}
 
 /**
  * Build a fetch function that handles Anthropic OAuth.
@@ -160,26 +223,16 @@ export function buildAnthropicOAuthFetch(opts: { authStorage?: CredentialStore }
 
     const accessToken = await storage.getApiKey('anthropic');
     if (!accessToken) {
-      throw new Error('Not logged in to Anthropic. Run /login first.');
+      throw storage.get('anthropic')?.type === 'oauth'
+        ? ProviderAuthRequiredError.signInExpired(PROVIDER_NAME)
+        : ProviderAuthRequiredError.notSignedIn(PROVIDER_NAME);
     }
 
-    // Preserve existing headers, strip auth-related ones
-    const headers = new Headers();
-    if (init?.headers) {
-      const source =
-        init.headers instanceof Headers
-          ? init.headers
-          : Array.isArray(init.headers)
-            ? new Headers(init.headers as Array<[string, string]>)
-            : new Headers(init.headers as Record<string, string>);
-      source.forEach((value, key) => {
-        const lower = key.toLowerCase();
-        if (lower !== 'authorization' && lower !== 'x-api-key') {
-          headers.set(key, value);
-        }
-      });
-    }
-
+    // Preserve Request headers and let explicit init headers override them.
+    const headers = new Headers(url instanceof Request ? url.headers : undefined);
+    if (init?.headers) new Headers(init.headers).forEach((value, key) => headers.set(key, value));
+    headers.delete('authorization');
+    headers.delete('x-api-key');
     headers.set('Authorization', `Bearer ${accessToken}`);
     const requestBetas = (headers.get('anthropic-beta') ?? '')
       .split(',')
@@ -188,13 +241,15 @@ export function buildAnthropicOAuthFetch(opts: { authStorage?: CredentialStore }
     headers.set('anthropic-beta', Array.from(new Set([...OAUTH_REQUIRED_BETAS, ...requestBetas])).join(','));
     headers.set('anthropic-version', '2023-06-01');
 
+    const requestUrl = url instanceof URL ? url.toString() : typeof url === 'string' ? url : url.url;
     try {
-      return await fetch(url, { ...init, headers });
+      return await rejectUnauthorizedResponse(await fetch(url, { ...init, headers }), {
+        providerName: PROVIDER_NAME,
+        requestUrl,
+      });
     } catch (error) {
       if (error && typeof error === 'object') {
-        Object.assign(error as Record<string, unknown>, {
-          requestUrl: url instanceof URL ? url.toString() : typeof url === 'string' ? url : url.url,
-        });
+        Object.assign(error as Record<string, unknown>, { requestUrl });
       }
       throw error;
     }
@@ -206,10 +261,21 @@ export function buildAnthropicOAuthFetch(opts: { authStorage?: CredentialStore }
  * Uses OAuth tokens from AuthStorage (auto-refreshes when needed)
  */
 export function opencodeClaudeMaxProvider(
-  modelId: string = 'claude-sonnet-4-20250514',
-  options?: { headers?: Record<string, string>; authStorage?: CredentialStore },
+  modelId: string = 'claude-sonnet-5-5',
+  options?: {
+    headers?: Record<string, string>;
+    authStorage?: CredentialStore;
+    thinkingLevel?: ThinkingLevel;
+    promptCacheScope?: AnthropicPromptCacheScope;
+  },
 ): MastraModelConfig {
   const headers = options?.headers;
+  const thinkingMiddleware = createAnthropicThinkingMiddleware(modelId, options?.thinkingLevel);
+  const middleware = [
+    claudeCodeMiddleware,
+    createPromptCacheMiddleware(options?.promptCacheScope ?? 'conversation'),
+    ...(thinkingMiddleware ? [thinkingMiddleware] : []),
+  ];
 
   // Test environment: use API key
   if (process.env.NODE_ENV === 'test' || process.env.VITEST) {
@@ -219,7 +285,7 @@ export function opencodeClaudeMaxProvider(
     });
     return wrapLanguageModel({
       model: anthropic(modelId),
-      middleware: [claudeCodeMiddleware, promptCacheMiddleware],
+      middleware,
     });
   }
 
@@ -232,6 +298,6 @@ export function opencodeClaudeMaxProvider(
   // Wrap with middleware to inject Claude Code identity and enable prompt caching
   return wrapLanguageModel({
     model: anthropic(modelId),
-    middleware: [claudeCodeMiddleware, promptCacheMiddleware],
+    middleware,
   });
 }

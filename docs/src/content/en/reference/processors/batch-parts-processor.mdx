@@ -1,13 +1,13 @@
 ---
 title: "Reference: BatchPartsProcessor | Processors"
-description: "Documentation for the BatchPartsProcessor in Mastra, which batches multiple stream parts together to reduce frequency of emissions."
+description: "The BatchPartsProcessor is an output processor that batches multiple stream parts together to reduce the frequency of emissions during streaming."
 packages:
   - "@mastra/core"
 ---
 
 # BatchPartsProcessor
 
-The `BatchPartsProcessor` is an **output processor** that batches multiple stream parts together to reduce the frequency of emissions during streaming. This processor is useful for reducing network overhead, improving user experience by consolidating small text chunks, and optimizing streaming performance by controlling when parts are emitted to the client.
+The `BatchPartsProcessor` is an **output processor** that batches multiple stream parts together to reduce the frequency of emissions during streaming. This processor is useful for reducing network overhead and consolidating small text chunks for users, while controlling emissions to optimize streaming performance.
 
 ## Usage example
 
@@ -76,19 +76,13 @@ const processor = new BatchPartsProcessor({
   {
     name: 'name',
     type: 'string',
-    description: 'Optional processor display name',
-    isOptional: true,
-  },
-  {
-    name: 'processOutputStream',
-    type: '(args: { part: ChunkType; streamParts: ChunkType[]; state: Record<string, any>; abort: (reason?: string) => never }) => Promise<ChunkType | null>',
-    description: 'Processes streaming output parts to batch them together',
+    description: 'Processor display name. Always `Batch Parts`.',
     isOptional: false,
   },
   {
-    name: 'flush',
-    type: '(state?: BatchPartsState) => ChunkType | null',
-    description: 'Force flush any remaining batched parts when the stream ends',
+    name: 'processOutputStream',
+    type: '(args: { part: ChunkType; streamParts: ChunkType[]; state: Record<string, any>; abort: (reason?: string) => never; writer?: { custom: (data: ChunkType) => Promise<void> } }) => Promise<ChunkType | null>',
+    description: 'Processes streaming output parts to batch them together',
     isOptional: false,
   },
 ]}

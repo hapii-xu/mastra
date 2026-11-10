@@ -1,10 +1,11 @@
 import { execFileSync } from 'node:child_process';
-import { randomBytes } from 'node:crypto';
 import { readFileSync } from 'node:fs';
 import { chmod, mkdir, readFile, writeFile, unlink } from 'node:fs/promises';
 import { createServer } from 'node:http';
 import { homedir, release } from 'node:os';
 import { join } from 'node:path';
+
+import * as p from '@clack/prompts';
 
 import { MASTRA_PLATFORM_API_URL } from './client.js';
 
@@ -22,6 +23,30 @@ export interface Credentials {
   };
   organizationId: string;
   currentOrgId?: string;
+}
+
+/** Which CLI entry point started the browser login. Sent to the platform for signup attribution. */
+export type LoginSource = 'create-mastra' | 'mastra-cli-create' | 'create-factory' | 'mastra-cli';
+
+export interface LoginOptions {
+  skipOnInput?: boolean;
+  allowLogin?: boolean;
+  timeoutMs?: number;
+  source?: LoginSource;
+}
+
+export class LoginCancelledError extends Error {
+  constructor() {
+    super('Login cancelled.');
+    this.name = 'LoginCancelledError';
+  }
+}
+
+class LoginTimedOutError extends Error {
+  constructor() {
+    super('Login timed out.');
+    this.name = 'LoginTimedOutError';
+  }
 }
 
 export async function saveCredentials(creds: Credentials): Promise<void> {
@@ -75,14 +100,21 @@ function isWSL(): boolean {
   }
 }
 
-function openBrowser(url: string) {
+export function openBrowser(url: string) {
   // Use execFileSync (shell: false) to avoid shell-injection via the URL.
   if (process.platform === 'darwin') {
     execFileSync('open', [url]);
   } else if (process.platform === 'win32') {
     execFileSync('cmd', ['/c', 'start', '', url]);
   } else if (isWSL()) {
-    execFileSync('powershell.exe', ['-NoProfile', '-Command', `Start-Process '${url.replace(/'/g, "''")}'`]);
+    // Pass the URL through the environment so it is never parsed as PowerShell code.
+    execFileSync(
+      'powershell.exe',
+      ['-NoProfile', '-NonInteractive', '-Command', 'Start-Process -FilePath $env:MASTRA_OPEN_URL'],
+      {
+        env: { ...process.env, MASTRA_OPEN_URL: url },
+      },
+    );
   } else {
     execFileSync('xdg-open', [url]);
   }
@@ -127,11 +159,17 @@ export async function tryRefreshToken(creds: Credentials, signal?: AbortSignal):
   }
 }
 
-function callbackPage({ success }: { success: boolean }): string {
+function escapeHtml(text: string): string {
+  return text.replace(/[&<>"']/g, char => `&#${char.charCodeAt(0)};`);
+}
+
+function callbackPage({ success, error }: { success: boolean; error?: string }): string {
   const title = success ? 'Logged in!' : 'Login failed';
   const message = success
     ? 'You can close this tab and return to the terminal.'
-    : 'Missing parameters. Close this tab and try again.';
+    : error
+      ? `${escapeHtml(error)}. Close this tab and return to the terminal.`
+      : 'Missing parameters. Close this tab and try again.';
 
   return `<!doctype html>
 <html lang="en">
@@ -179,12 +217,97 @@ function callbackPage({ success }: { success: boolean }): string {
 </html>`;
 }
 
-export async function login(signal?: AbortSignal): Promise<Credentials> {
+interface CallbackResult {
+  token: string;
+  refreshToken: string | null;
+  user: Credentials['user'];
+  organizationId: string;
+}
+
+/** Platform's error redirect after a rejected sign-in, e.g. `email_domain_not_allowed` or `sso_required`. */
+interface CallbackError {
+  error: string;
+}
+
+function parseCallback(url: URL, state: string): CallbackResult | CallbackError | null {
+  if (url.pathname !== '/callback') return null;
+  const error = url.searchParams.get('error');
+  if (error && url.searchParams.get('state') === state) {
+    return { error: url.searchParams.get('error_description') || error };
+  }
+  const token = url.searchParams.get('token');
+  const userParam = url.searchParams.get('user');
+  const organizationId = url.searchParams.get('org');
+  if (url.searchParams.get('state') !== state || !token || !userParam || !organizationId) return null;
+
+  try {
+    const user = JSON.parse(decodeURIComponent(userParam)) as Credentials['user'] | null;
+    if (typeof user?.email !== 'string') return null;
+    return { token, refreshToken: url.searchParams.get('refresh_token'), user, organizationId };
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * Reads the terminal while waiting for the browser. A pasted URL is passed to `onPaste` on Enter: when the
+ * browser runs on another machine, it can't reach the callback server, but its address bar holds the callback.
+ * With `onSkip`, any other key skips the login.
+ */
+function listenForInput({ onSkip, onPaste }: { onSkip?: () => void; onPaste: (text: string) => void }): () => void {
+  const stdin = process.stdin;
+  if (!stdin.isTTY || typeof stdin.setRawMode !== 'function') return () => {};
+
+  const wasRaw = stdin.isRaw;
+  // A fresh stdin is neither paused nor flowing; leaving it flowing would keep the process alive after login.
+  const wasFlowing = stdin.readableFlowing === true;
+  let listening = true;
+  let buffer = '';
+
+  const cleanup = () => {
+    if (!listening) return;
+    listening = false;
+    stdin.removeListener('data', handleInput);
+    if (!wasRaw) stdin.setRawMode(false);
+    if (!wasFlowing) stdin.pause();
+  };
+
+  const handleInput = (input: Buffer | string) => {
+    const data = typeof input === 'string' ? input : input.toString('utf8');
+    if (data.includes('\x03')) {
+      cleanup();
+      process.kill(process.pid, 'SIGINT');
+      return;
+    }
+
+    // With a skip key, input that doesn't start with the scheme (even a lone `h`) is a keypress, not a paste.
+    buffer += data;
+    if (onSkip && !buffer.startsWith('http')) {
+      cleanup();
+      onSkip();
+      return;
+    }
+
+    // Raw mode has no line length limit, so long pasted URLs arrive whole (possibly in several chunks).
+    const end = buffer.search(/[\r\n]/);
+    if (end === -1) return;
+    const line = buffer.slice(0, end).trim();
+    buffer = '';
+    if (line) onPaste(line);
+  };
+
+  stdin.setRawMode(true);
+  stdin.resume();
+  stdin.on('data', handleInput);
+  return cleanup;
+}
+
+async function loginAttempt(signal?: AbortSignal, options: LoginOptions = {}): Promise<Credentials> {
   signal?.throwIfAborted();
   console.info('\n   Logging in to Mastra...\n');
 
   const server = createServer();
-  const state = randomBytes(16).toString('hex');
+  const state = Buffer.from(globalThis.crypto.getRandomValues(new Uint8Array(16))).toString('hex');
 
   const port = await new Promise<number>(resolve => {
     server.listen(0, '127.0.0.1', () => {
@@ -195,71 +318,91 @@ export async function login(signal?: AbortSignal): Promise<Credentials> {
     });
   });
 
-  const loginUrl = `${MASTRA_PLATFORM_API_URL}/v1/auth/login?product=cli&cli_port=${port}&state=${state}`;
-  console.info(`   Opening browser...\n`);
-  console.info(`   Waiting for your input. Skip this step with Ctrl+C\n`);
+  const loginUrl = `${MASTRA_PLATFORM_API_URL}/v1/auth/login?product=cli&cli_port=${port}&state=${state}&source=${options.source ?? 'mastra-cli'}`;
 
+  // Always print the link: the opened browser may not be the one the user sees (SSH, containers, dev boxes).
+  console.info(`   Opening browser. If it doesn't open, visit:\n   ${loginUrl}\n`);
   try {
     openBrowser(loginUrl);
   } catch {
-    console.info(`   Could not open browser automatically.`);
-    console.info(`   Open this URL manually: ${loginUrl}\n`);
+    console.info(`   Could not open browser automatically. Open the URL above.\n`);
     if (isWSL()) {
       console.info(`   Note: If login times out, ensure localhost forwarding is enabled in your .wslconfig.\n`);
     }
   }
+  if (process.stdin.isTTY) {
+    console.info(
+      `   Signing in on another device? If the page fails to load after sign-in, paste its URL here and press Enter.\n`,
+    );
+  }
+  console.info(
+    options.skipOnInput
+      ? `   Waiting for browser sign-in. Press any key to skip this step.\n`
+      : `   Waiting for browser sign-in...\n`,
+  );
 
-  const result = await new Promise<{
-    token: string;
-    refreshToken: string | null;
-    user: Credentials['user'];
-    organizationId: string;
-  }>((resolve, reject) => {
+  const result = await new Promise<CallbackResult>((resolve, reject) => {
     let settled = false;
+    let stopListeningForInput = () => {};
     const finish = (callback: () => void) => {
       if (settled) return;
       settled = true;
       clearTimeout(timeout);
       signal?.removeEventListener('abort', handleAbort);
+      stopListeningForInput();
       server.close(callback);
       server.closeAllConnections();
     };
     const handleAbort = () => {
       finish(() => reject(signal?.reason instanceof Error ? signal.reason : new Error('Login cancelled')));
     };
-    const timeout = setTimeout(() => {
-      finish(() => reject(new Error('Login timed out (60s)')));
-    }, 60000);
+    const timeout = setTimeout(
+      () => {
+        finish(() => reject(new LoginTimedOutError()));
+      },
+      options.timeoutMs ?? 5 * 60 * 1000,
+    );
 
     signal?.addEventListener('abort', handleAbort, { once: true });
     if (signal?.aborted) {
       handleAbort();
       return;
     }
+    const settle = (result: CallbackResult | CallbackError) => {
+      if ('error' in result) finish(() => reject(new Error(`Sign-in failed: ${result.error}.`)));
+      else finish(() => resolve(result));
+    };
+
+    stopListeningForInput = listenForInput({
+      onSkip: options.skipOnInput ? () => finish(() => reject(new LoginCancelledError())) : undefined,
+      onPaste: text => {
+        const result = URL.canParse(text) ? parseCallback(new URL(text), state) : null;
+        if (!result) {
+          console.info(
+            `\n   That doesn't look like the sign-in address. Copy the full URL from the browser's address bar and paste it again.\n`,
+          );
+          return;
+        }
+        settle(result);
+      },
+    });
 
     server.on('request', (req, res) => {
       const url = new URL(req.url!, `http://localhost:${port}`);
+      if (url.pathname !== '/callback') return;
 
-      if (url.pathname === '/callback') {
-        const callbackState = url.searchParams.get('state');
-        const token = url.searchParams.get('token');
-        const refreshToken = url.searchParams.get('refresh_token');
-        const userParam = url.searchParams.get('user');
-        const orgId = url.searchParams.get('org');
-
-        if (callbackState !== state || !token || !userParam || !orgId) {
-          res.writeHead(400, { 'Content-Type': 'text/html' });
-          res.end(callbackPage({ success: false }));
-          return;
-        }
-
-        const user = JSON.parse(decodeURIComponent(userParam));
-
-        res.writeHead(200, { 'Content-Type': 'text/html', Connection: 'close' });
-        res.end(callbackPage({ success: true }));
-
-        finish(() => resolve({ token, refreshToken, user, organizationId: orgId }));
+      const result = parseCallback(url, state);
+      if (!result || 'error' in result) {
+        res.writeHead(400, { 'Content-Type': 'text/html', Connection: 'close' });
+        res.end(callbackPage({ success: false, error: result?.error }));
+        if (result) settle(result);
+        return;
       }
+
+      res.writeHead(200, { 'Content-Type': 'text/html', Connection: 'close' });
+      res.end(callbackPage({ success: true }));
+
+      settle(result);
     });
   });
 
@@ -275,11 +418,36 @@ export async function login(signal?: AbortSignal): Promise<Credentials> {
   return creds;
 }
 
-function isInteractive(): boolean {
+export async function login(signal?: AbortSignal, options: LoginOptions = {}): Promise<Credentials> {
+  while (true) {
+    try {
+      return await loginAttempt(signal, options);
+    } catch (error) {
+      if (!(error instanceof LoginTimedOutError)) throw error;
+    }
+
+    if (!isInteractive()) throw new LoginCancelledError();
+
+    const cancelValue = options.skipOnInput ? 'skip' : 'cancel';
+    const choice = await p.select({
+      message: 'Browser sign-in timed out.',
+      options: [
+        { value: 'retry', label: 'Retry' },
+        { value: cancelValue, label: options.skipOnInput ? 'Skip platform setup' : 'Cancel login' },
+      ],
+      initialValue: 'retry',
+      showInstructions: false,
+      signal,
+    });
+    if (p.isCancel(choice) || choice === cancelValue) throw new LoginCancelledError();
+  }
+}
+
+export function isInteractive(): boolean {
   return Boolean(process.stdin.isTTY && process.stdout.isTTY) && !process.env.CI;
 }
 
-export async function getToken(signal?: AbortSignal): Promise<string> {
+export async function getToken(signal?: AbortSignal, options: LoginOptions = {}): Promise<string> {
   signal?.throwIfAborted();
 
   // CI/CD headless path
@@ -289,10 +457,10 @@ export async function getToken(signal?: AbortSignal): Promise<string> {
   const creds = await loadCredentials();
   signal?.throwIfAborted();
   if (!creds) {
-    if (!isInteractive()) {
+    if (options.allowLogin === false || !isInteractive()) {
       throw new Error('Not logged in. Run `mastra auth login` interactively or set MASTRA_API_TOKEN.');
     }
-    const newCreds = await login(signal);
+    const newCreds = await login(signal, options);
     return newCreds.token;
   }
 
@@ -305,10 +473,10 @@ export async function getToken(signal?: AbortSignal): Promise<string> {
   if (refreshed) return refreshed;
   signal?.throwIfAborted();
 
-  if (!isInteractive()) {
+  if (options.allowLogin === false || !isInteractive()) {
     throw new Error('Session expired. Run `mastra auth login` interactively or set MASTRA_API_TOKEN.');
   }
-  const newCreds = await login(signal);
+  const newCreds = await login(signal, options);
   return newCreds.token;
 }
 

@@ -2,9 +2,15 @@ import { z } from 'zod/v4';
 import { createTool } from '../../tools';
 import { WORKSPACE_TOOLS } from '../constants';
 import { SandboxFeatureNotSupportedError } from '../errors';
-import { emitWorkspaceMetadata, getDynamicSandboxCacheKeyHint, requireSandbox } from './helpers';
-import { DEFAULT_TAIL_LINES, truncateOutput, sandboxToModelOutput } from './output-helpers';
+import { coerceNumericString, emitWorkspaceMetadata, getDynamicSandboxCacheKeyHint, requireSandbox } from './helpers';
+import { DEFAULT_TAIL_LINES, noteDroppedOutput, truncateOutput, sandboxToModelOutput } from './output-helpers';
 import { startWorkspaceSpan } from './tracing';
+
+const LEFT_BEHIND_NOTE =
+  'The command exited, but a process it started is still running and holding its output open. Call kill_process to stop it.';
+
+const ABORTED_PROCESS_NOTE =
+  'Process aborted: the run that started or was waiting on this process was cancelled (by the user or system), so it was killed before it finished.';
 
 export const getProcessOutputTool = createTool({
   id: WORKSPACE_TOOLS.SANDBOX.GET_PROCESS_OUTPUT,
@@ -12,10 +18,11 @@ export const getProcessOutputTool = createTool({
 
 Use this after starting a background command with execute_command (background: true) to check if the process is still running and read its output.`,
   toModelOutput: sandboxToModelOutput,
+  outputSchema: z.string(),
   inputSchema: z.object({
     pid: z.string().describe('The process ID returned when the background command was started'),
     tail: z
-      .number()
+      .preprocess(coerceNumericString, z.number().int())
       .optional()
       .describe(
         `Number of lines to return, similar to tail -n. Positive or negative returns last N lines from end. Defaults to ${DEFAULT_TAIL_LINES}. Use 0 for no limit.`,
@@ -58,9 +65,15 @@ Use this after starting a background command with execute_command (background: t
         });
       }
 
-      // If wait requested, block until process exits with streaming callbacks
+      // If wait requested, block until process exits with streaming callbacks.
+      // The run's abortSignal is forwarded so aborting the run (e.g. a user
+      // stop) interrupts a blocking wait instead of outliving the turn: the
+      // handle kills the process on abort, mirroring the spawn-time
+      // `abortSignal` convention.
+      let result: Awaited<ReturnType<typeof handle.wait>> | undefined;
       if (shouldWait && handle.exitCode === undefined) {
-        const result = await handle.wait({
+        result = await handle.wait({
+          abortSignal: context?.abortSignal,
           onStdout: context?.writer
             ? async (data: string) => {
                 await context.writer!.custom({
@@ -92,13 +105,24 @@ Use this after starting a background command with execute_command (background: t
         });
       }
 
-      const running = handle.exitCode === undefined;
+      // wait() can settle when the command exits while a process it left behind
+      // still holds its output; the handle then reports no exit code yet.
+      const exitCode = handle.exitCode ?? result?.exitCode;
+      const running = exitCode === undefined;
 
       const tokenLimit = workspace.getToolsConfig()?.[WORKSPACE_TOOLS.SANDBOX.GET_PROCESS_OUTPUT]?.maxOutputTokens;
-      const stdout = await truncateOutput(handle.stdout, tail, tokenLimit, 'sandwich');
-      const stderr = await truncateOutput(handle.stderr, tail, tokenLimit, 'sandwich');
+      const stdout = noteDroppedOutput(
+        await truncateOutput(handle.stdout, tail, tokenLimit, 'sandwich'),
+        handle.stdoutDroppedBytes,
+        'stdout',
+      );
+      const stderr = noteDroppedOutput(
+        await truncateOutput(handle.stderr, tail, tokenLimit, 'sandwich'),
+        handle.stderrDroppedBytes,
+        'stderr',
+      );
 
-      if (!stdout && !stderr) {
+      if (running && !stdout && !stderr) {
         span.end({ success: true }, { exitCode: handle.exitCode });
         return '(no output yet)';
       }
@@ -110,15 +134,21 @@ Use this after starting a background command with execute_command (background: t
         parts.push('stdout:', stdout, '', 'stderr:', stderr);
       } else if (stdout) {
         parts.push(stdout);
-      } else {
+      } else if (stderr) {
         parts.push('stderr:', stderr);
       }
 
       if (!running) {
-        parts.push('', `Exit code: ${handle.exitCode}`);
+        // The exit code of an aborted process is a provider-specific kill code, so say why it stopped.
+        const terminalLines = [
+          ...(handle.killedByAbort ? [ABORTED_PROCESS_NOTE] : []),
+          ...(handle.exitCode === undefined ? [LEFT_BEHIND_NOTE] : []),
+          `Exit code: ${exitCode}`,
+        ];
+        parts.push(...(parts.length > 0 ? [''] : []), ...terminalLines);
       }
 
-      span.end({ success: true }, { exitCode: handle.exitCode });
+      span.end({ success: true }, { exitCode });
       return parts.join('\n');
     } catch (err) {
       span.error(err);

@@ -23,6 +23,7 @@ export const RESOURCES = [
   'embedders',
   'experiments',
   'infrastructure',
+  'knowledge',
   'logs',
   'mcp',
   'memory',
@@ -36,6 +37,7 @@ export const RESOURCES = [
   'stored-prompt-blocks',
   'stored-scorers',
   'stored-skills',
+  'stored-workflows',
   'stored-workspaces',
   'system',
   'tool-providers',
@@ -110,6 +112,8 @@ export const PERMISSION_PATTERNS = {
   'experiments:*': 'experiments:*',
   /** Full access to infrastructure */
   'infrastructure:*': 'infrastructure:*',
+  /** Full access to knowledge */
+  'knowledge:*': 'knowledge:*',
   /** Full access to logs */
   'logs:*': 'logs:*',
   /** Full access to MCP servers */
@@ -136,6 +140,8 @@ export const PERMISSION_PATTERNS = {
   'stored-scorers:*': 'stored-scorers:*',
   /** Full access to stored skills */
   'stored-skills:*': 'stored-skills:*',
+  /** Full access to stored workflows */
+  'stored-workflows:*': 'stored-workflows:*',
   /** Full access to stored workspaces */
   'stored-workspaces:*': 'stored-workspaces:*',
   /** Full access to system info */
@@ -178,6 +184,8 @@ export const PERMISSION_PATTERNS = {
   'agents:write': 'agents:write',
   /** View auth */
   'auth:read': 'auth:read',
+  /** Execute background tasks */
+  'background-tasks:execute': 'background-tasks:execute',
   /** View background tasks */
   'background-tasks:read': 'background-tasks:read',
   /** View channels */
@@ -194,10 +202,14 @@ export const PERMISSION_PATTERNS = {
   'datasets:write': 'datasets:write',
   /** View embedders */
   'embedders:read': 'embedders:read',
+  /** Delete experiments */
+  'experiments:delete': 'experiments:delete',
   /** View experiments */
   'experiments:read': 'experiments:read',
   /** View infrastructure */
   'infrastructure:read': 'infrastructure:read',
+  /** View knowledge */
+  'knowledge:read': 'knowledge:read',
   /** View logs */
   'logs:read': 'logs:read',
   /** Execute MCP servers */
@@ -214,6 +226,8 @@ export const PERMISSION_PATTERNS = {
   'memory:read': 'memory:read',
   /** Create and modify memory and threads */
   'memory:write': 'memory:write',
+  /** Delete traces and spans */
+  'observability:delete': 'observability:delete',
   /** View traces and spans */
   'observability:read': 'observability:read',
   /** Create and modify traces and spans */
@@ -276,6 +290,10 @@ export const PERMISSION_PATTERNS = {
   'stored-skills:read': 'stored-skills:read',
   /** Create and modify stored skills */
   'stored-skills:write': 'stored-skills:write',
+  /** View stored workflows */
+  'stored-workflows:read': 'stored-workflows:read',
+  /** Create and modify stored workflows */
+  'stored-workflows:write': 'stored-workflows:write',
   /** Delete stored workspaces */
   'stored-workspaces:delete': 'stored-workspaces:delete',
   /** View stored workspaces */
@@ -359,6 +377,7 @@ export const PERMISSIONS = [
   'agents:read',
   'agents:write',
   'auth:read',
+  'background-tasks:execute',
   'background-tasks:read',
   'channels:read',
   'channels:write',
@@ -367,8 +386,10 @@ export const PERMISSIONS = [
   'datasets:read',
   'datasets:write',
   'embedders:read',
+  'experiments:delete',
   'experiments:read',
   'infrastructure:read',
+  'knowledge:read',
   'logs:read',
   'mcp:execute',
   'mcp:read',
@@ -377,6 +398,7 @@ export const PERMISSIONS = [
   'memory:execute',
   'memory:read',
   'memory:write',
+  'observability:delete',
   'observability:read',
   'observability:write',
   'processor-providers:read',
@@ -408,6 +430,8 @@ export const PERMISSIONS = [
   'stored-skills:publish',
   'stored-skills:read',
   'stored-skills:write',
+  'stored-workflows:read',
+  'stored-workflows:write',
   'stored-workspaces:delete',
   'stored-workspaces:read',
   'stored-workspaces:write',
@@ -469,6 +493,8 @@ export const MastraFGAPermissions = {
   AGENTS_WRITE: 'agents:write',
   /** View auth */
   AUTH_READ: 'auth:read',
+  /** Execute background tasks */
+  BACKGROUND_TASKS_EXECUTE: 'background-tasks:execute',
   /** View background tasks */
   BACKGROUND_TASKS_READ: 'background-tasks:read',
   /** View channels */
@@ -485,10 +511,14 @@ export const MastraFGAPermissions = {
   DATASETS_WRITE: 'datasets:write',
   /** View embedders */
   EMBEDDERS_READ: 'embedders:read',
+  /** Delete experiments */
+  EXPERIMENTS_DELETE: 'experiments:delete',
   /** View experiments */
   EXPERIMENTS_READ: 'experiments:read',
   /** View infrastructure */
   INFRASTRUCTURE_READ: 'infrastructure:read',
+  /** View knowledge */
+  KNOWLEDGE_READ: 'knowledge:read',
   /** View logs */
   LOGS_READ: 'logs:read',
   /** Execute MCP servers */
@@ -505,6 +535,8 @@ export const MastraFGAPermissions = {
   MEMORY_READ: 'memory:read',
   /** Create and modify memory and threads */
   MEMORY_WRITE: 'memory:write',
+  /** Delete traces and spans */
+  OBSERVABILITY_DELETE: 'observability:delete',
   /** View traces and spans */
   OBSERVABILITY_READ: 'observability:read',
   /** Create and modify traces and spans */
@@ -567,6 +599,10 @@ export const MastraFGAPermissions = {
   STORED_SKILLS_READ: 'stored-skills:read',
   /** Create and modify stored skills */
   STORED_SKILLS_WRITE: 'stored-skills:write',
+  /** View stored workflows */
+  STORED_WORKFLOWS_READ: 'stored-workflows:read',
+  /** Create and modify stored workflows */
+  STORED_WORKFLOWS_WRITE: 'stored-workflows:write',
   /** Delete stored workspaces */
   STORED_WORKSPACES_DELETE: 'stored-workspaces:delete',
   /** View stored workspaces */

@@ -1,31 +1,54 @@
-import { cva } from 'class-variance-authority';
+import { ScrollArea as ScrollAreaPrimitive } from '@base-ui/react/scroll-area';
 import type { CSSProperties, ReactNode, RefObject } from 'react';
-import { ScrollArea } from '@/ds/components/ScrollArea/scroll-area';
+import { useId, useMemo } from 'react';
+import {
+  columnOrderSchema,
+  getColumnOrderStorageKey,
+  identityOrder,
+  keyedColumnOrderSchema,
+  moveIndex,
+  moveKeyedOrder,
+  normalizeOrder,
+  resolveKeyedOrder,
+  splitGridTracks,
+} from './data-list-column-order';
+import { DataListReorderContext } from './data-list-reorder-context';
+import type { DataListReorderContextValue } from './data-list-reorder-context';
+import { ScrollArea, ScrollAreaViewport } from '@/ds/components/ScrollArea/scroll-area';
 import type { ScrollAreaMask, ScrollAreaProps } from '@/ds/components/ScrollArea/scroll-area';
+import { raisedSurfaceStyle } from '@/ds/primitives/raised-surface';
+import { useLocalStorageState } from '@/hooks/use-local-storage-state';
 import { cn } from '@/lib/utils';
 
 /**
- * Visual treatment for the whole list.
+ * Horizontal sizing of the list grid.
  *
- * - `striped`: borderless and full-bleed, zebra-striped rows (every other row
- *   tinted), contrasting sticky header band, no row separators.
- * - `lined`: borderless and full-bleed like `striped`, but rows stay transparent
- *   and use subtle separators instead of zebra tints.
+ * - `content`: the grid is as wide as its widest content (`w-max`) and the
+ *   ScrollArea scrolls horizontally when it exceeds the container.
+ * - `container`: the grid fills the container width and never exceeds it;
+ *   flexible tracks (`minmax(0, 1fr)`) shrink so truncating cells ellipsize
+ *   instead of widening the table.
  */
-export type DataListVariant = 'striped' | 'lined';
-export type DataListStickyHeaderBackground = 'tinted' | 'surface' | 'transparent';
-type DataListStickyHeaderBackgroundValue = { background: string; hoverBackground: string };
+export type DataListFit = 'content' | 'container';
 
-export type DataListRootProps = Omit<ScrollAreaProps, 'children' | 'orientation' | 'mask' | 'viewportRef'> & {
+/**
+ * Surface treatment of the list.
+ *
+ * - `default`: rows sit as wells inside a raised card panel — the same material
+ *   and elevation as a card, a popover or a settings container.
+ * - `light`: no panel behind the rows; rows sit directly on the page.
+ */
+export type DataListVariant = 'default' | 'light';
+
+export type DataListRootProps = Omit<ScrollAreaProps, 'children' | 'orientation' | 'mask'> & {
   children: ReactNode;
   columns: string;
+  /** Grid width behavior; defaults to `content` (existing horizontal-scroll sizing). */
+  fit?: DataListFit;
+  /** Surface treatment; defaults to `default` (rows on a raised card panel). */
   variant?: DataListVariant;
-  /**
-   * Shared fill for the sticky top header and sticky row-header column.
-   * `tinted` is an opaque equivalent of the former `neutral6/10` tint, so sticky
-   * headers do not reveal scrolled content beneath them.
-   */
-  stickyHeaderBackground?: DataListStickyHeaderBackground;
+  /** Disable the internal scroll area when a parent owns scrolling, allowing row effects to extend outside the list. */
+  scrollable?: boolean;
   /**
    * Edge fades from the underlying ScrollArea. DataList keeps the top fade off
    * by default so it does not fade the sticky top header.
@@ -37,142 +60,244 @@ export type DataListRootProps = Omit<ScrollAreaProps, 'children' | 'orientation'
    * scrolls normally.
    */
   scrollRef?: RefObject<HTMLDivElement | null>;
+  /**
+   * Lets users drag header cells (or press Alt+Arrow on a focused header cell)
+   * to reorder columns. Requires `id`: the order is persisted in localStorage
+   * under that id. Sticky cells stay pinned. Supported for flat lists whose
+   * header and rows span the full grid; `repeat()` templates are not supported.
+   */
+  reorderable?: boolean;
+  /** Stable identifier of the list, used to persist the column order when `reorderable`. */
+  id?: string;
+  /**
+   * Stable key per column, in `columns` order. With `reorderable`, the order is
+   * persisted by key, so it survives columns being shown, hidden or added.
+   * Without it, the order is persisted by index and resets when the column count changes.
+   */
+  columnKeys?: string[];
 };
 
-const stickyHeaderBackgroundValues = {
-  tinted: {
-    background: 'color-mix(in oklch, var(--surface1), var(--neutral6) 10%)',
-    hoverBackground: 'color-mix(in oklch, var(--surface1), var(--neutral6) 14%)',
-  },
-  surface: {
-    background: 'var(--surface2)',
-    hoverBackground: 'color-mix(in oklch, var(--surface2), var(--neutral6) 10%)',
-  },
-  transparent: {
-    background: 'transparent',
-    hoverBackground: 'transparent',
-  },
-} satisfies Record<DataListStickyHeaderBackground, DataListStickyHeaderBackgroundValue>;
-
 type DataListRootStyle = CSSProperties & {
-  '--data-list-sticky-header-background'?: string;
-  '--data-list-sticky-header-hover-background'?: string;
+  '--data-list-background'?: string;
 };
 
 function getDataListMask(mask: ScrollAreaMask | undefined): ScrollAreaMask {
   if (mask === undefined) return { top: false };
-  if (typeof mask === 'object') return { top: false, ...mask };
+  if (mask === true || mask === false) return mask;
 
-  return mask;
+  return { top: false, ...mask };
 }
 
 /**
- * Root grid styling per `variant`. Kept module-private (an exported cva in a
- * `.tsx` trips react-refresh). The borderless table treatments are driven
- * entirely from the root with CSS descendant selectors on the `.data-list-top` /
- * `.data-list-row` markers - the header and row primitives stay untouched, no JS
- * per-row index:
- * - no container fill or border: rows composite over any view.
- * - `gap-y-px`: a uniform 1px gap between every grid track (header and rows).
- * - header: a contrasting band that owns the radius (the container no longer
- *   rounds/clips) — `rounded-t-xl` top, `rounded-b-md` bottom to match the rows
- *   sitting below the 1px gap, no hairline.
- * - rows: full-bleed, `rounded-md` (last row included); rows zero
- *   their own margins so the grid gap is the only spacing.
- * - striped adds translucent zebra tints with `:even`; hover & focus use `!` so
- *   they still win over root-level row styling.
+ * The root owns the unified table treatment so standalone and wrapped rows look
+ * identical without requiring a per-row index. The ScrollArea provides the
+ * fixed frame; this grid paints the sticky header and separators. The root is
+ * the only element that defines a color: sticky parts read the background
+ * through `--data-list-background` so they stay opaque while scrolling, and
+ * rows/header draw no separators, borders or rings of their own.
  */
-const borderlessTableStyles = [
+const dataListGridStyles = [
   'gap-y-px',
-  // A shared opaque tint gives both column headers and sticky row headers the
-  // same treatment without revealing scrolled content beneath sticky surfaces.
-  '[&_.data-list-top]:mx-0 [&_.data-list-top]:bg-[var(--data-list-sticky-header-background)] [&_.data-list-top]:after:hidden',
-  '[&_.data-list-top]:rounded-t-xl [&_.data-list-top]:rounded-b-md',
-  // header column separators: a short, faint vertical line centered in the gap
-  // to the left of every header cell but the first. A `before` pseudo (not a
-  // `border-l` + padding) keeps header text aligned with the row cells below.
-  // The cell's default `overflow-hidden` would clip a gap-positioned pseudo, so
-  // these cells switch to `overflow-visible`; the title text still truncates via
-  // its inner `truncate` span, so nothing else spills.
-  '[&_.data-list-top>*:not(:first-child)]:relative [&_.data-list-top>*:not(:first-child)]:overflow-visible',
-  '[&_.data-list-top>*:not(:first-child)]:before:absolute [&_.data-list-top>*:not(:first-child)]:before:-left-4 [&_.data-list-top>*:not(:first-child)]:before:top-1/2 [&_.data-list-top>*:not(:first-child)]:before:-translate-y-1/2 [&_.data-list-top>*:not(:first-child)]:before:h-4 [&_.data-list-top>*:not(:first-child)]:before:w-px [&_.data-list-top>*:not(:first-child)]:before:bg-border2 [&_.data-list-top>*:not(:first-child)]:before:content-[""]',
-  '[&_.data-list-row]:mx-0 [&_.data-list-row]:my-0 [&_.data-list-row]:rounded-md',
-  '[&_.data-list-row]:hover:bg-surface-overlay-strong!',
-  '[&_.data-list-row]:focus-visible:bg-surface-overlay-strong!',
-  '[&_.data-list-row>.data-list-sticky-start]:bg-[var(--data-list-sticky-header-background)]',
+  // Rows are siblings of the header, so first/last are found via sibling combinators.
+  '[&_.data-list-row:not(.data-list-row~.data-list-row)]:rounded-t-lg',
+  '[&_.data-list-row:not(:has(~.data-list-row))]:rounded-b-lg',
+  '[&_.data-list-row:not(.data-list-row~.data-list-row)>.data-list-sticky-start]:rounded-tl-lg',
+  '[&_.data-list-row:not(:has(~.data-list-row))>.data-list-sticky-start]:rounded-bl-lg',
+  // Subheaders split the rows into sections; each section gets its own rounded ends.
+  '[&_.data-list-subheader+.data-list-row]:rounded-t-lg',
+  '[&_.data-list-row:has(+.data-list-subheader)]:rounded-b-lg',
+  '[&_.data-list-subheader+.data-list-row>.data-list-sticky-start]:rounded-tl-lg',
+  '[&_.data-list-row:has(+.data-list-subheader)>.data-list-sticky-start]:rounded-bl-lg',
+  '[&_.data-list-top]:bg-(--data-list-background)',
+  '[&_.data-list-row>.data-list-sticky-start]:bg-background',
+  // A sticky cell must stay opaque over horizontally scrolled cells, so it
+  // cannot show the hover layer through; it takes the opaque twin of a fill
+  // rung over the row well instead, the same level a selected row rests on.
+  '[&_.data-list-row-interactive:not(:disabled):hover>.data-list-sticky-start]:bg-surface-panel',
   '[&_.data-list-row>.data-list-sticky-start]:after:right-0',
-  '[&_.data-list-row:hover>.data-list-sticky-start]:bg-[var(--data-list-sticky-header-hover-background)]',
-  '[&_.data-list-row:focus-visible>.data-list-sticky-start]:bg-[var(--data-list-sticky-header-hover-background)]',
-  '[&_.data-list-row:focus-within>.data-list-sticky-start]:bg-[var(--data-list-sticky-header-hover-background)]',
   '[&_.data-list-top>.data-list-sticky-start]:after:right-0',
-  '[&_.data-list-top>.data-list-sticky-start+*]:before:hidden',
 ] as const;
 
-const dataListRootVariants = cva(cn('grid w-max max-w-none min-w-full content-start'), {
-  variants: {
-    variant: {
-      striped: cn(
-        ...borderlessTableStyles,
-        '[&_.data-list-row]:after:hidden',
-        '[&_.data-list-row]:even:bg-surface-overlay-soft',
-      ),
-      lined: cn(
-        ...borderlessTableStyles,
-        '[&_.data-list-row]:after:pointer-events-none [&_.data-list-row]:after:absolute [&_.data-list-row]:after:h-px [&_.data-list-row]:after:content-[""]',
-        '[&_.data-list-row]:after:inset-x-2 [&_.data-list-row]:after:-bottom-px [&_.data-list-row]:after:bg-neutral6/10',
-      ),
-    },
-  },
-  defaultVariants: {
-    variant: 'lined',
-  },
-});
+const dataListVariantClasses: Record<DataListVariant, string> = {
+  default: raisedSurfaceStyle,
+  light: '',
+};
 
-export function DataListRoot({
+// The sticky header reads this so it stays opaque while scrolling: the panel
+// material by default, the page surface when there is no panel.
+const dataListVariantBackground: Record<DataListVariant, string> = {
+  default: 'var(--card)',
+  light: 'var(--background)',
+};
+
+const dataListFitClasses: Record<DataListFit, string> = {
+  content: 'w-max max-w-none min-w-full',
+  container: 'w-full max-w-full',
+};
+
+const disabledReorder: DataListReorderContextValue = { reorderable: false, order: [], move: () => {} };
+
+export function DataListRoot({ reorderable, id, columns, columnKeys, ...props }: DataListRootProps) {
+  const tracks = reorderable && id ? splitGridTracks(columns) : null;
+  if (id && tracks && columnKeys && columnKeys.length === tracks.length) {
+    return (
+      <DataListKeyedReorderableRoot
+        key={id}
+        storageId={id}
+        tracks={tracks}
+        columnKeys={columnKeys}
+        id={id}
+        columns={columns}
+        {...props}
+      />
+    );
+  }
+  if (id && tracks) {
+    return <DataListReorderableRoot key={id} storageId={id} tracks={tracks} id={id} columns={columns} {...props} />;
+  }
+  return <DataListBase id={id} columns={columns} reorder={disabledReorder} {...props} />;
+}
+
+function DataListKeyedReorderableRoot({
+  storageId,
+  tracks,
+  columnKeys,
+  ...props
+}: DataListReorderableRootProps & { columnKeys: string[] }) {
+  const [stored, setStored] = useLocalStorageState({
+    initialKey: getColumnOrderStorageKey(storageId),
+    defaultValue: columnKeys,
+    schema: keyedColumnOrderSchema,
+  });
+  const keysSignature = columnKeys.join('\u0000');
+  // eslint-disable-next-line react-hooks/exhaustive-deps -- keyed by content, not array identity
+  const order = useMemo(() => resolveKeyedOrder(stored, columnKeys), [stored, keysSignature]);
+
+  const reorder = useMemo<DataListReorderContextValue>(
+    () => ({
+      reorderable: true,
+      order,
+      move: (from, to) => setStored(current => moveKeyedOrder(current, columnKeys, from, to)),
+    }),
+    // eslint-disable-next-line react-hooks/exhaustive-deps -- keyed by content, not array identity
+    [order, keysSignature, setStored],
+  );
+
+  return <DataListBase {...props} columns={order.map(i => tracks[i]).join(' ')} reorder={reorder} />;
+}
+
+type DataListReorderableRootProps = Omit<DataListRootProps, 'reorderable' | 'columnKeys'> & {
+  storageId: string;
+  tracks: string[];
+};
+
+function DataListReorderableRoot({ storageId, tracks, ...props }: DataListReorderableRootProps) {
+  const count = tracks.length;
+  const [stored, setStored] = useLocalStorageState({
+    initialKey: getColumnOrderStorageKey(storageId),
+    defaultValue: identityOrder(count),
+    schema: columnOrderSchema,
+  });
+  const order = normalizeOrder(stored, count);
+
+  const reorder = useMemo<DataListReorderContextValue>(
+    () => ({
+      reorderable: true,
+      order,
+      move: (from, to) => setStored(current => moveIndex(normalizeOrder(current, count), from, to)),
+    }),
+    [order, count, setStored],
+  );
+
+  return <DataListBase {...props} columns={order.map(i => tracks[i]).join(' ')} reorder={reorder} />;
+}
+
+type DataListBaseProps = Omit<DataListRootProps, 'reorderable' | 'columnKeys'> & {
+  reorder: DataListReorderContextValue;
+};
+
+function DataListBase({
   children,
   columns,
   className,
-  variant = 'lined',
-  stickyHeaderBackground = 'tinted',
+  fit = 'content',
+  variant = 'default',
+  scrollable = true,
   mask,
   scrollRef,
+  reorder,
+  maxHeight,
+  autoScroll,
+  scrollButtons,
+  revealScrollbarOnHover,
   ...props
-}: DataListRootProps) {
-  const stickyHeaderColors = stickyHeaderBackgroundValues[stickyHeaderBackground];
+}: DataListBaseProps) {
+  const scopeId = useId();
   const gridStyle: DataListRootStyle = {
-    '--data-list-sticky-header-background': stickyHeaderColors.background,
-    '--data-list-sticky-header-hover-background': stickyHeaderColors.hoverBackground,
+    '--data-list-background': dataListVariantBackground[variant],
     gridTemplateColumns: columns,
   };
+  // Cells keep their DOM order; CSS `order` places each one in its moved track.
+  const orderRules = reorder.reorderable
+    ? reorder.order
+        .map(
+          (original, visual) =>
+            `[data-data-list="${scopeId}"] .data-list-cells > :nth-child(${original + 1}) { order: ${visual}; }`,
+        )
+        .join('\n')
+    : null;
 
   const grid = (
     <div
       // Lists scroll inside the ScrollArea viewport (below); the grid just lays out.
-      className={dataListRootVariants({ variant })}
+      // `isolate` keeps each row's negative-z surface and hover layers above the list's own background.
+      className={cn('relative isolate grid content-start', ...dataListGridStyles, dataListFitClasses[fit])}
       style={gridStyle}
+      data-data-list={reorder.reorderable ? scopeId : undefined}
     >
+      {orderRules && <style>{orderRules}</style>}
       {children}
     </div>
   );
 
-  // DataList uses the DS ScrollArea: an overlay scrollbar (no reserved gutter,
-  // so the sticky header spans the full width and both top corners clip cleanly)
-  // plus the default edge fades. When the list virtualizes it passes a
-  // `scrollRef`; forwarding it as `viewportRef` makes the virtualizer scroll
-  // this viewport.
-  //
-  // `rounded-t-xl` clips the viewport top. Masks default to every overflowing
-  // edge except the top — a top fade would fade the opaque sticky header.
+  if (!scrollable) {
+    return (
+      // Preserve Base UI's render/style/ref contract without adding a clipping viewport.
+      <ScrollAreaPrimitive.Root
+        {...props}
+        className={cn('w-full rounded-xl p-1', dataListVariantClasses[variant], className)}
+      >
+        <DataListReorderContext.Provider value={reorder}>{grid}</DataListReorderContext.Provider>
+      </ScrollAreaPrimitive.Root>
+    );
+  }
+
+  // DataList uses the DS ScrollArea: an overlay scrollbar, so the sticky header
+  // spans the full width. Masks default to every overflowing edge except the
+  // top — a top fade would fade the opaque sticky header.
   return (
     <ScrollArea
       {...props}
+      maxHeight={maxHeight}
+      autoScroll={autoScroll}
+      scrollButtons={scrollButtons}
+      revealScrollbarOnHover={revealScrollbarOnHover}
       orientation="both"
       mask={getDataListMask(mask)}
-      viewportRef={scrollRef}
-      viewPortClassName="max-h-[inherit]"
-      className={cn('size-full rounded-t-xl', className)}
+      // Outer radius = row radius (8px) + 4px inset so the corners stay concentric.
+      // Size to content but never exceed the parent. Flex (unlike grid `1fr`) lays
+      // items out against the max-height-clamped container, so short lists stay
+      // compact and long ones shrink the viewport and scroll. `self-start` stops
+      // a grid/flex parent from stretching the root to the full row height.
+      className={cn(
+        'flex max-h-full w-full flex-col self-start rounded-xl p-1',
+        dataListVariantClasses[variant],
+        className,
+      )}
     >
-      {grid}
+      <ScrollAreaViewport ref={scrollRef} className="min-h-0 flex-1 basis-auto">
+        <DataListReorderContext.Provider value={reorder}>{grid}</DataListReorderContext.Provider>
+      </ScrollAreaViewport>
     </ScrollArea>
   );
 }

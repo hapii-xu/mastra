@@ -72,6 +72,43 @@ describe('convertFullStreamChunkToUIMessageStream', () => {
       url: 'https://example.com/generated.jpeg',
     });
   });
+
+  it('keeps the finish reason on the terminal UI chunk', () => {
+    const result = convertFullStreamChunkToUIMessageStream({
+      part: {
+        type: 'finish',
+        finishReason: 'content-filter',
+        totalUsage: { inputTokens: 1, outputTokens: 2, totalTokens: 3 },
+      } as any,
+      sendFinish: true,
+      messageMetadataValue: { custom: true },
+      onError: error => `Error: ${error}`,
+    });
+
+    expect(result).toEqual({
+      type: 'finish',
+      finishReason: 'content-filter',
+      messageMetadata: { custom: true },
+    });
+  });
+
+  it('keeps preliminary on tool-output-available for partial tool results', () => {
+    const toUI = (preliminary?: boolean) =>
+      convertFullStreamChunkToUIMessageStream({
+        part: {
+          type: 'tool-result',
+          toolCallId: 'ig-1',
+          toolName: 'image_generation',
+          output: { result: 'partial' },
+          providerExecuted: true,
+          ...(preliminary ? { preliminary } : {}),
+        } as any,
+        onError: error => `Error: ${error}`,
+      });
+
+    expect(toUI(true)).toMatchObject({ type: 'tool-output-available', toolCallId: 'ig-1', preliminary: true });
+    expect(toUI()).not.toHaveProperty('preliminary');
+  });
 });
 
 describe('isUrlString', () => {

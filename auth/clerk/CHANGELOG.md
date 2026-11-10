@@ -1,5 +1,128 @@
 # @mastra/auth-clerk
 
+## 1.3.2
+
+### Patch Changes
+
+- dependencies updates: ([#28417](https://github.com/mastra-ai/mastra/pull/28417))
+  - Updated dependency [`@clerk/backend@^3.26.2` ↗︎](https://www.npmjs.com/package/@clerk/backend/v/3.26.2) (from `^3.17.2`, in `dependencies`)
+  - Updated dependency [`@types/node@22.19.15` ↗︎](https://www.npmjs.com/package/@types/node/v/22.19.15) (from `22.20.5`, in `devDependencies`)
+- Updated dependencies [[`ce5d473`](https://github.com/mastra-ai/mastra/commit/ce5d4731eeeb44779748852618b95c5cb6485bed)]:
+  - @mastra/auth@1.1.5
+
+## 1.3.2-alpha.0
+
+### Patch Changes
+
+- dependencies updates: ([#28417](https://github.com/mastra-ai/mastra/pull/28417))
+  - Updated dependency [`@clerk/backend@^3.26.2` ↗︎](https://www.npmjs.com/package/@clerk/backend/v/3.26.2) (from `^3.17.2`, in `dependencies`)
+  - Updated dependency [`@types/node@22.19.15` ↗︎](https://www.npmjs.com/package/@types/node/v/22.19.15) (from `22.20.5`, in `devDependencies`)
+- Updated dependencies [[`ce5d473`](https://github.com/mastra-ai/mastra/commit/ce5d4731eeeb44779748852618b95c5cb6485bed)]:
+  - @mastra/auth@1.1.5-alpha.0
+
+## 1.3.1
+
+### Patch Changes
+
+- Bump for npm ([#27221](https://github.com/mastra-ai/mastra/pull/27221))
+
+- Updated dependencies [[`fae54c5`](https://github.com/mastra-ai/mastra/commit/fae54c57917cd1f527937ca42b5ab7dfe1d55a2a)]:
+  - @mastra/auth@1.1.4
+
+## 1.3.1-alpha.0
+
+### Patch Changes
+
+- Bump for npm ([#27221](https://github.com/mastra-ai/mastra/pull/27221))
+
+- Updated dependencies [[`fae54c5`](https://github.com/mastra-ai/mastra/commit/fae54c57917cd1f527937ca42b5ab7dfe1d55a2a)]:
+  - @mastra/auth@1.1.4-alpha.0
+
+## 1.3.0
+
+### Minor Changes
+
+- Added single-organization login restriction to `@mastra/auth-clerk`. Set `organizationId` or `organizationSlug` (or the `CLERK_ORGANIZATION_ID` / `CLERK_ORGANIZATION_SLUG` env vars) to only allow members of one Clerk organization to sign in. Non-members are denied during authorization and SSO callback. ([#24188](https://github.com/mastra-ai/mastra/pull/24188))
+
+  ```typescript
+  new MastraAuthClerk({
+    jwksUri: process.env.CLERK_JWKS_URI,
+    publishableKey: process.env.CLERK_PUBLISHABLE_KEY,
+    secretKey: process.env.CLERK_SECRET_KEY,
+    organizationId: process.env.CLERK_ORGANIZATION_ID,
+  });
+  ```
+
+### Patch Changes
+
+- Fixed a stored XSS advisory in Clerk by updating @clerk/backend to 3.17.2. `createClerkClient` and the rest of the Mastra Clerk auth API are unchanged. ([#24027](https://github.com/mastra-ai/mastra/pull/24027))
+
+## 1.3.0-alpha.1
+
+### Minor Changes
+
+- Added single-organization login restriction to `@mastra/auth-clerk`. Set `organizationId` or `organizationSlug` (or the `CLERK_ORGANIZATION_ID` / `CLERK_ORGANIZATION_SLUG` env vars) to only allow members of one Clerk organization to sign in. Non-members are denied during authorization and SSO callback. ([#24188](https://github.com/mastra-ai/mastra/pull/24188))
+
+  ```typescript
+  new MastraAuthClerk({
+    jwksUri: process.env.CLERK_JWKS_URI,
+    publishableKey: process.env.CLERK_PUBLISHABLE_KEY,
+    secretKey: process.env.CLERK_SECRET_KEY,
+    organizationId: process.env.CLERK_ORGANIZATION_ID,
+  });
+  ```
+
+## 1.2.5-alpha.0
+
+### Patch Changes
+
+- Fixed a stored XSS advisory in Clerk by updating @clerk/backend to 3.17.2. `createClerkClient` and the rest of the Mastra Clerk auth API are unchanged. ([#24027](https://github.com/mastra-ai/mastra/pull/24027))
+
+## 1.2.4
+
+### Patch Changes
+
+- Update README to include accurate, up-to-date information ([#22858](https://github.com/mastra-ai/mastra/pull/22858))
+
+- Remove `CHANGELOG.md` from distributed npm files resulting in reduced package size ([#22737](https://github.com/mastra-ai/mastra/pull/22737))
+
+- Updated dependencies [[`e983f74`](https://github.com/mastra-ai/mastra/commit/e983f749873189f767f509eb33d1a3596c0f1c74), [`28ce924`](https://github.com/mastra-ai/mastra/commit/28ce924276eeca492e6a360e5482ed20c2785ef6)]:
+  - @mastra/auth@1.1.3
+
+## 1.2.4-alpha.1
+
+### Patch Changes
+
+- Update README to include accurate, up-to-date information ([#22858](https://github.com/mastra-ai/mastra/pull/22858))
+
+- Updated dependencies [[`e983f74`](https://github.com/mastra-ai/mastra/commit/e983f749873189f767f509eb33d1a3596c0f1c74)]:
+  - @mastra/auth@1.1.3-alpha.1
+
+## 1.2.4-alpha.0
+
+### Patch Changes
+
+- Remove `CHANGELOG.md` from distributed npm files resulting in reduced package size ([#22737](https://github.com/mastra-ai/mastra/pull/22737))
+
+- Updated dependencies [[`28ce924`](https://github.com/mastra-ai/mastra/commit/28ce924276eeca492e6a360e5482ed20c2785ef6)]:
+  - @mastra/auth@1.1.3-alpha.0
+
+## 1.2.3
+
+### Patch Changes
+
+- Fixed reading request headers from Express-style plain header objects so cookie-based auth providers no longer throw and fail with a misleading 401. ([#21261](https://github.com/mastra-ai/mastra/pull/21261))
+
+  Related to https://github.com/mastra-ai/mastra/issues/21253
+
+## 1.2.3-alpha.0
+
+### Patch Changes
+
+- Fixed reading request headers from Express-style plain header objects so cookie-based auth providers no longer throw and fail with a misleading 401. ([#21261](https://github.com/mastra-ai/mastra/pull/21261))
+
+  Related to https://github.com/mastra-ai/mastra/issues/21253
+
 ## 1.2.2
 
 ### Patch Changes

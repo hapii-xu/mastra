@@ -1,0 +1,109 @@
+import { screen } from '@testing-library/react';
+import userEvent from '@testing-library/user-event';
+import { http, HttpResponse } from 'msw';
+import { MemoryRouter, Route, Routes } from 'react-router';
+import { describe, expect, it, onTestFinished } from 'vitest';
+
+import { listedRepository } from '../../../../../../e2e/ui/factory-projects';
+import { server } from '../../../../../../e2e/ui/msw-server';
+import { TEST_BASE_URL, renderWithProviders, waitForMutationsIdle } from '../../../../../../e2e/ui/render';
+import { ChatSessionContext } from '../../../chat/context/ChatSessionContext';
+import type { FactoryUserSession } from '../../services/user-sessions';
+import { SessionsSection } from '../SessionsSection';
+import { testChatSession } from './fixtures/sessionsSection';
+
+const projectRepositoryId = 'ghp-1';
+const sessionId = 'sess-1';
+
+const session: FactoryUserSession = {
+  id: 'row-1',
+  sessionId,
+  projectRepositoryId,
+  orgId: 'org-1',
+  userId: 'user-1',
+  visibility: 'org' as const,
+  branch: 'user/my-feature',
+  baseBranch: 'main',
+  sandboxId: null,
+  sandboxWorkdir: null,
+  materializedAt: null,
+  createdAt: '2026-07-23T00:00:00.000Z',
+  updatedAt: '2026-07-23T00:00:00.000Z',
+};
+
+function renderSection() {
+  return renderWithProviders(
+    <MemoryRouter initialEntries={['/factories/fp-1']}>
+      <ChatSessionContext.Provider value={testChatSession('fp-1', projectRepositoryId)}>
+        <Routes>
+          <Route path="/factories/:factoryId" element={<SessionsSection />} />
+        </Routes>
+      </ChatSessionContext.Provider>
+    </MemoryRouter>,
+  );
+}
+
+describe('User sessions deletion', () => {
+  it.each(['dropdown', 'context'])('deletes the selected session from the %s menu', async entry => {
+    let sessions = [session];
+    const deletedSessions: string[] = [];
+    const threadRequests: string[] = [];
+
+    server.use(
+      http.get(`${TEST_BASE_URL}/web/factory/projects`, () =>
+        HttpResponse.json({
+          projects: [
+            {
+              id: 'fp-1',
+              name: 'Mastra',
+              repositories: [
+                listedRepository(projectRepositoryId, 'octo/hello', {
+                  branch: 'main',
+                  sandboxWorkdir: '/workspace/hello',
+                }),
+              ],
+            },
+          ],
+        }),
+      ),
+      http.get(`${TEST_BASE_URL}/web/factory/projects/:factoryId/sessions`, () => HttpResponse.json({ sessions })),
+      http.delete(`${TEST_BASE_URL}/web/user-sessions/:sessionId`, ({ params }) => {
+        deletedSessions.push(String(params.sessionId));
+        sessions = sessions.filter(item => item.sessionId !== params.sessionId);
+        return HttpResponse.json({ removed: true });
+      }),
+      // Sidebar activity poll — return no active threads so the row stays idle.
+      http.get(`${TEST_BASE_URL}/api/agent-controller/:agentControllerId/sessions/:resourceId/threads`, () =>
+        HttpResponse.json({ threads: [] }),
+      ),
+    );
+
+    // Only the sidebar activity poll is allowed to hit the threads endpoint; a stray delete-triggered
+    // thread request would signal that removing the session accidentally fired unrelated work.
+    const recordThreadRequest = ({ request }: { request: Request }) => {
+      const { pathname } = new URL(request.url);
+      if (pathname.includes('/threads') && request.method !== 'GET') {
+        threadRequests.push(`${request.method} ${pathname}`);
+      }
+    };
+    server.events.on('request:start', recordThreadRequest);
+    onTestFinished(() => server.events.removeListener('request:start', recordThreadRequest));
+
+    const user = userEvent.setup();
+    const { client } = renderSection();
+
+    if (entry === 'context') {
+      await user.pointer({ target: await screen.findByRole('link', { name: 'my-feature' }), keys: '[MouseRight]' });
+    } else {
+      await user.click(await screen.findByRole('button', { name: 'Session actions for my-feature' }));
+    }
+    await user.click(await screen.findByRole('menuitem', { name: 'Delete' }));
+    await user.click(screen.getByRole('button', { name: 'Delete' }));
+
+    await waitForMutationsIdle(client);
+    expect(deletedSessions).toEqual([sessionId]);
+    expect(threadRequests).toEqual([]);
+    expect(screen.queryByRole('link', { name: 'my-feature' })).not.toBeInTheDocument();
+    expect(screen.getByText('No sessions yet')).toBeInTheDocument();
+  });
+});

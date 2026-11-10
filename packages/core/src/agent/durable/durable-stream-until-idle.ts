@@ -3,7 +3,7 @@
  * `DurableAgent.resume(..., { untilIdle })`. Mirrors the regular agent's
  * `stream-until-idle.ts` but adapted for durable execution:
  * - `DurableAgent.stream()` returns `DurableAgentStreamResult` (not `MastraModelOutput`)
- * - Each continuation starts a new durable workflow (new runId)
+ * - The initial segment preserves a caller-supplied runId; each autonomous continuation starts a new durable workflow
  * - Cleanup functions from each inner stream are tracked and called on close
  * - Inner `abort()` handles are fanned out so the outer `result.abort()`
  *   cancels every active durable run
@@ -63,25 +63,37 @@ export async function runDurableStreamUntilIdle<OUTPUT = undefined>(
         threadId: ctx.threadId,
         resourceId: ctx.resourceId,
         cleanup: ctx.forceClose,
-        abort: (reason?: unknown) => {
+        abort: async (reason?: unknown) => {
           // Fan the abort out to every inner DurableAgent.stream() that has been
           // spawned by the idle loop so far. `forceClose` then unwinds the outer
           // stream + idle timer.
-          for (const innerAbort of innerAborts) {
-            try {
-              innerAbort(reason);
-            } catch {
-              // ignore — best-effort abort across siblings
-            }
-          }
-          ctx.forceClose();
+          await Promise.all(
+            innerAborts.map(async innerAbort => {
+              try {
+                await innerAbort(reason);
+              } catch {
+                // ignore — best-effort abort across siblings
+              }
+            }),
+          );
+          ctx.abort();
         },
       };
     },
     {
+      detachOnCancel: streamOptions?._detachObserverOnCancel === true,
       onInnerResult: (inner: any) => {
         if (typeof inner.cleanup === 'function') innerCleanups.push(inner.cleanup);
         if (typeof inner.abort === 'function') innerAborts.push(inner.abort);
+      },
+      onAbortActive: () => {
+        const abort = innerAborts.at(-1);
+        if (!abort) return;
+        try {
+          void Promise.resolve(abort(new Error('Aborted'))).catch(() => {});
+        } catch {
+          // ignore
+        }
       },
       onForceClose: () => {
         for (const fn of innerCleanups) {
@@ -116,7 +128,8 @@ export async function runResumeDurableStreamUntilIdle<OUTPUT = undefined>(
 
   return runIdleLoop<typeof agent, DurableAgentStreamResult<OUTPUT>, DurableAgentStreamResult<OUTPUT>>(
     agent,
-    streamOptions,
+    // The wrapper takes the resumed run's slot up front so it supersedes the run's parked wrapper.
+    { ...streamOptions, runId },
     deps,
     opts => (agent as any).resume(runId, resumeData, opts) as Promise<DurableAgentStreamResult<OUTPUT>>,
     opts => (agent as any).stream([], opts) as Promise<{ fullStream: ReadableStream<any> }>,
@@ -138,22 +151,34 @@ export async function runResumeDurableStreamUntilIdle<OUTPUT = undefined>(
         threadId: ctx.threadId,
         resourceId: ctx.resourceId,
         cleanup: ctx.forceClose,
-        abort: (reason?: unknown) => {
-          for (const innerAbort of innerAborts) {
-            try {
-              innerAbort(reason);
-            } catch {
-              // ignore
-            }
-          }
-          ctx.forceClose();
+        abort: async (reason?: unknown) => {
+          await Promise.all(
+            innerAborts.map(async innerAbort => {
+              try {
+                await innerAbort(reason);
+              } catch {
+                // ignore
+              }
+            }),
+          );
+          ctx.abort();
         },
       };
     },
     {
+      detachOnCancel: streamOptions?._detachObserverOnCancel === true,
       onInnerResult: (inner: any) => {
         if (typeof inner.cleanup === 'function') innerCleanups.push(inner.cleanup);
         if (typeof inner.abort === 'function') innerAborts.push(inner.abort);
+      },
+      onAbortActive: () => {
+        const abort = innerAborts.at(-1);
+        if (!abort) return;
+        try {
+          void Promise.resolve(abort(new Error('Aborted'))).catch(() => {});
+        } catch {
+          // ignore
+        }
       },
       onForceClose: () => {
         for (const fn of innerCleanups) {

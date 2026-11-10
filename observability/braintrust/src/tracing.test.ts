@@ -16,7 +16,7 @@ import type {
   ToolCallAttributes,
 } from '@mastra/core/observability';
 import { SpanType, TracingEventType } from '@mastra/core/observability';
-import { initLogger, _exportsForTestingOnly } from 'braintrust';
+import { initLogger, currentSpan, _exportsForTestingOnly } from 'braintrust';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { BraintrustExporter } from './tracing';
 import type { BraintrustExporterConfig, BraintrustLogger, BraintrustSpan } from './tracing';
@@ -65,6 +65,7 @@ describe('BraintrustExporter', () => {
     mockLogger = {
       id: 'mockLogger',
       startSpan: vi.fn().mockReturnValue(mockSpan),
+      logFeedback: vi.fn(),
     };
 
     mockInitLogger = vi.mocked(initLogger);
@@ -169,7 +170,8 @@ describe('BraintrustExporter', () => {
         spanId: 'root-span-id',
         name: 'root-agent',
         type: 'task', // Default span type mapping for AGENT_RUN
-        // No parentSpanIds for root spans!
+        // Roots pin rootSpanId to the Mastra trace ID with no span parents
+        parentSpanIds: { parentSpanIds: [], rootSpanId: traceId },
         startTime: rootSpan.startTime.getTime() / 1000,
         event: {
           id: 'root-span-id', // Row ID for logFeedback() compatibility
@@ -183,6 +185,22 @@ describe('BraintrustExporter', () => {
           },
         },
       });
+    });
+
+    it('keeps timeToFirstTokenMs out of metadata on non-LLM spans', async () => {
+      const rootSpan = createMockSpan({
+        id: 'root-span-id',
+        name: 'root-agent',
+        type: SpanType.AGENT_RUN,
+        isRoot: true,
+        attributes: { agentId: 'agent-123', timeToFirstTokenMs: 42 } as any,
+      });
+
+      await exporter.exportTracingEvent({ type: TracingEventType.SPAN_STARTED, exportedSpan: rootSpan });
+
+      const { event } = mockLogger.startSpan.mock.calls.at(-1)![0];
+      expect(event.metadata).toMatchObject({ agentId: 'agent-123' });
+      expect(event.metadata).not.toHaveProperty('timeToFirstTokenMs');
     });
 
     it('should handle logger initialization failure', async () => {
@@ -647,6 +665,29 @@ describe('BraintrustExporter', () => {
       expect(call.event.input[0].tool_calls[0].id).toBe('srvtoolu_123');
       expect(call.event.output.tool_call_id).toBe('srvtoolu_123');
     });
+
+    it('uses metadata.toolCallId when attributes.toolCallId is absent', async () => {
+      const toolSpan = createMockSpan({
+        id: 'sdk-tool-span',
+        name: "tool: 'search'",
+        type: SpanType.TOOL_CALL,
+        isRoot: true,
+        entityName: 'search',
+        input: { query: 'test' },
+        output: { results: [] },
+        attributes: { toolType: 'tool' },
+        metadata: { toolCallId: 'call_from_metadata' },
+      });
+
+      await exporter.exportTracingEvent({
+        type: TracingEventType.SPAN_STARTED,
+        exportedSpan: toolSpan,
+      });
+
+      const call = mockLogger.startSpan.mock.calls.at(-1)![0];
+      expect(call.event.input[0].tool_calls[0].id).toBe('call_from_metadata');
+      expect(call.event.output.tool_call_id).toBe('call_from_metadata');
+    });
   });
 
   describe('LLM Generation Attributes', () => {
@@ -687,7 +728,8 @@ describe('BraintrustExporter', () => {
         spanId: 'llm-span',
         name: 'gpt-4-call',
         type: 'llm',
-        // No parentSpanIds for root spans!
+        // Roots pin rootSpanId to the Mastra trace ID with no span parents
+        parentSpanIds: { parentSpanIds: [], rootSpanId: traceId },
         startTime: llmSpan.startTime.getTime() / 1000,
         event: {
           id: 'llm-span', // Row ID for logFeedback() compatibility
@@ -716,6 +758,35 @@ describe('BraintrustExporter', () => {
       });
     });
 
+    it.each([
+      ['a provider-reported charge', 'provider_reported', 0.000967, 0.000967],
+      ['a zero bring-your-own-key charge', 'provider_reported', 0, undefined],
+      ['a Mastra price estimate', 'estimated', 0.000967, undefined],
+    ])('should price the span in Braintrust with %s', async (_, source, estimatedCost, expected) => {
+      const llmSpan = createMockSpan({
+        id: 'priced-llm',
+        name: 'llm',
+        type: SpanType.MODEL_GENERATION,
+        isRoot: true,
+        attributes: {
+          model: 'zai/glm-4.7-flash',
+          usage: { inputTokens: 13780, outputTokens: 6 },
+        },
+      });
+      await exporter.exportTracingEvent({ type: TracingEventType.SPAN_STARTED, exportedSpan: llmSpan });
+
+      llmSpan.endTime = new Date();
+      llmSpan.attributes = {
+        ...llmSpan.attributes,
+        costContext: { estimatedCost, costUnit: 'USD', costMetadata: { source } },
+      };
+      await exporter.exportTracingEvent({ type: TracingEventType.SPAN_ENDED, exportedSpan: llmSpan });
+
+      const logged = mockSpan.log.mock.calls.at(-1)[0];
+      expect(logged.metrics.estimated_cost).toBe(expected);
+      expect(logged.metadata.costContext.estimatedCost).toBe(estimatedCost);
+    });
+
     it('should handle minimal LLM generation attributes', async () => {
       const traceId = 'trace-id';
 
@@ -741,7 +812,8 @@ describe('BraintrustExporter', () => {
         name: 'simple-llm',
         type: 'llm',
         startTime: llmSpan.startTime.getTime() / 1000,
-        // No parentSpanIds for root spans!
+        // Roots pin rootSpanId to the Mastra trace ID with no span parents
+        parentSpanIds: { parentSpanIds: [], rootSpanId: traceId },
         event: {
           id: 'minimal-llm', // Row ID for logFeedback() compatibility
           metadata: {
@@ -866,20 +938,15 @@ describe('BraintrustExporter', () => {
     const toolCallSpan = createMockSpan({
       id: 'tool-call-span',
       traceId,
-      name: 'calculator',
+      name: "tool: 'calculator'",
       type: SpanType.TOOL_CALL,
       isRoot: false,
-      // Input contains the tool call details (including toolCallId for matching)
-      input: {
-        toolCallId: 'tc-1',
-        toolName: 'calculator',
-        args: { a: 2, b: 2 },
-      },
-      // Output contains the tool result
+      entityName: 'calculator',
+      input: { a: 2, b: 2 },
       output: {
         result: 4,
       },
-      attributes: { toolId: 'calculator', success: true },
+      attributes: { toolCallId: 'tc-1', success: true },
     });
     toolCallSpan.parentSpanId = modelStep0Span.id;
 
@@ -967,6 +1034,196 @@ describe('BraintrustExporter', () => {
             ],
           },
           { role: 'tool', content: '{"result":4}', tool_call_id: 'tc-1' },
+          { role: 'assistant', content: 'The answer is 4.' },
+        ],
+      }),
+    );
+  });
+
+  it('should reconstruct LLM output with MCP tool results for Thread view', async () => {
+    const traceId = 'mcp-step-output-reconstruction-trace';
+
+    const llmSpan = createMockSpan({
+      id: 'mcp-model-gen-span',
+      traceId,
+      name: 'gpt-4-call',
+      type: SpanType.MODEL_GENERATION,
+      isRoot: true,
+      input: [{ role: 'user', content: 'List the files in /tmp' }],
+      output: {
+        text: 'There are 2 files.',
+      },
+      attributes: { model: 'gpt-4', provider: 'openai' },
+    });
+
+    const modelStep0Span = createMockSpan({
+      id: 'mcp-model-step-0-span',
+      traceId,
+      name: 'Model Step 0',
+      type: SpanType.MODEL_STEP,
+      isRoot: false,
+      input: {},
+      output: {
+        text: '',
+        toolCalls: [{ toolCallId: 'mcp-tc-1', toolName: 'list_files', args: { path: '/tmp' } }],
+      },
+      attributes: { stepIndex: 0 },
+    });
+    modelStep0Span.parentSpanId = llmSpan.id;
+
+    const mcpToolCallSpan = createMockSpan({
+      id: 'mcp-tool-call-span',
+      traceId,
+      name: "mcp_tool: 'list_files' on 'filesystem-server'",
+      type: SpanType.MCP_TOOL_CALL,
+      isRoot: false,
+      entityName: 'list_files',
+      input: { path: '/tmp' },
+      output: {
+        files: ['a.txt', 'b.txt'],
+      },
+      attributes: { mcpServer: 'filesystem-server', toolCallId: 'mcp-tc-1', success: true },
+    });
+    mcpToolCallSpan.parentSpanId = modelStep0Span.id;
+
+    const modelStep1Span = createMockSpan({
+      id: 'mcp-model-step-1-span',
+      traceId,
+      name: 'Model Step 1',
+      type: SpanType.MODEL_STEP,
+      isRoot: false,
+      input: {},
+      output: {
+        text: 'There are 2 files.',
+        toolCalls: [],
+      },
+      attributes: { stepIndex: 1 },
+    });
+    modelStep1Span.parentSpanId = llmSpan.id;
+
+    await exporter.exportTracingEvent({ type: TracingEventType.SPAN_STARTED, exportedSpan: llmSpan });
+    await exporter.exportTracingEvent({ type: TracingEventType.SPAN_STARTED, exportedSpan: modelStep0Span });
+    await exporter.exportTracingEvent({ type: TracingEventType.SPAN_STARTED, exportedSpan: mcpToolCallSpan });
+    await exporter.exportTracingEvent({
+      type: TracingEventType.SPAN_ENDED,
+      exportedSpan: { ...mcpToolCallSpan, endTime: new Date() },
+    });
+    await exporter.exportTracingEvent({
+      type: TracingEventType.SPAN_ENDED,
+      exportedSpan: { ...modelStep0Span, endTime: new Date() },
+    });
+    await exporter.exportTracingEvent({ type: TracingEventType.SPAN_STARTED, exportedSpan: modelStep1Span });
+    await exporter.exportTracingEvent({
+      type: TracingEventType.SPAN_ENDED,
+      exportedSpan: { ...modelStep1Span, endTime: new Date() },
+    });
+
+    mockSpan.log.mockClear();
+
+    await exporter.exportTracingEvent({
+      type: TracingEventType.SPAN_ENDED,
+      exportedSpan: { ...llmSpan, endTime: new Date() },
+    });
+
+    expect(mockSpan.log).toHaveBeenCalledWith(
+      expect.objectContaining({
+        output: [
+          {
+            role: 'assistant',
+            content: '',
+            tool_calls: [
+              {
+                id: 'mcp-tc-1',
+                type: 'function',
+                function: { name: 'list_files', arguments: '{"path":"/tmp"}' },
+              },
+            ],
+          },
+          { role: 'tool', content: '{"files":["a.txt","b.txt"]}', tool_call_id: 'mcp-tc-1' },
+          { role: 'assistant', content: 'There are 2 files.' },
+        ],
+      }),
+    );
+  });
+
+  it('should resolve toolCallId from metadata when absent from attributes', async () => {
+    const traceId = 'metadata-tool-call-id-trace';
+
+    const llmSpan = createMockSpan({
+      id: 'meta-model-gen-span',
+      traceId,
+      name: 'gpt-4-call',
+      type: SpanType.MODEL_GENERATION,
+      isRoot: true,
+      input: [{ role: 'user', content: 'What is 2+2?' }],
+      output: { text: 'The answer is 4.' },
+      attributes: { model: 'gpt-4', provider: 'openai' },
+    });
+
+    const modelStepSpan = createMockSpan({
+      id: 'meta-model-step-span',
+      traceId,
+      name: 'Model Step 0',
+      type: SpanType.MODEL_STEP,
+      isRoot: false,
+      input: {},
+      output: {
+        text: '',
+        toolCalls: [{ toolCallId: 'meta-tc-1', toolName: 'calculator', args: { a: 2, b: 2 } }],
+      },
+      attributes: { stepIndex: 0 },
+    });
+    modelStepSpan.parentSpanId = llmSpan.id;
+
+    // Agent SDK tool spans carry toolCallId in metadata rather than attributes
+    const toolCallSpan = createMockSpan({
+      id: 'meta-tool-call-span',
+      traceId,
+      name: "tool: 'calculator'",
+      type: SpanType.TOOL_CALL,
+      isRoot: false,
+      entityName: 'calculator',
+      input: { a: 2, b: 2 },
+      output: { result: 4 },
+      attributes: { toolType: 'tool' },
+      metadata: { toolCallId: 'meta-tc-1' },
+    });
+    toolCallSpan.parentSpanId = modelStepSpan.id;
+
+    await exporter.exportTracingEvent({ type: TracingEventType.SPAN_STARTED, exportedSpan: llmSpan });
+    await exporter.exportTracingEvent({ type: TracingEventType.SPAN_STARTED, exportedSpan: modelStepSpan });
+    await exporter.exportTracingEvent({ type: TracingEventType.SPAN_STARTED, exportedSpan: toolCallSpan });
+    await exporter.exportTracingEvent({
+      type: TracingEventType.SPAN_ENDED,
+      exportedSpan: { ...toolCallSpan, endTime: new Date() },
+    });
+    await exporter.exportTracingEvent({
+      type: TracingEventType.SPAN_ENDED,
+      exportedSpan: { ...modelStepSpan, endTime: new Date() },
+    });
+
+    mockSpan.log.mockClear();
+
+    await exporter.exportTracingEvent({
+      type: TracingEventType.SPAN_ENDED,
+      exportedSpan: { ...llmSpan, endTime: new Date() },
+    });
+
+    expect(mockSpan.log).toHaveBeenCalledWith(
+      expect.objectContaining({
+        output: [
+          {
+            role: 'assistant',
+            content: '',
+            tool_calls: [
+              {
+                id: 'meta-tc-1',
+                type: 'function',
+                function: { name: 'calculator', arguments: '{"a":2,"b":2}' },
+              },
+            ],
+          },
+          { role: 'tool', content: '{"result":4}', tool_call_id: 'meta-tc-1' },
           { role: 'assistant', content: 'The answer is 4.' },
         ],
       }),
@@ -1740,7 +1997,8 @@ describe('BraintrustExporter', () => {
         spanId: 'event-span',
         name: 'user-feedback',
         type: 'task',
-        // No parentSpanIds for root spans!
+        // Roots pin rootSpanId to the Mastra trace ID with no span parents
+        parentSpanIds: { parentSpanIds: [], rootSpanId: traceId },
         startTime: eventSpan.startTime.getTime() / 1000,
         event: {
           id: 'event-span', // Row ID for logFeedback() compatibility
@@ -2154,7 +2412,7 @@ describe('BraintrustExporter', () => {
   });
 
   describe('Span Nesting (SDK handles parent-child relationships)', () => {
-    it('should NOT set parentSpanIds - SDK startSpan() chain handles nesting', async () => {
+    it('should pin root rootSpanId and let the SDK startSpan() chain handle child nesting', async () => {
       // Create root span
       const rootSpan = createMockSpan({
         id: 'root-span-id',
@@ -2169,9 +2427,9 @@ describe('BraintrustExporter', () => {
         exportedSpan: rootSpan,
       });
 
-      // Root span should not have parentSpanIds
+      // Root span pins rootSpanId to the Mastra trace ID with no span parents
       const rootStartSpanCall = mockLogger.startSpan.mock.calls[0][0];
-      expect(rootStartSpanCall.parentSpanIds).toBeUndefined();
+      expect(rootStartSpanCall.parentSpanIds).toEqual({ parentSpanIds: [], rootSpanId: rootSpan.traceId });
 
       vi.clearAllMocks();
 
@@ -2194,6 +2452,76 @@ describe('BraintrustExporter', () => {
       // Child span should also not have parentSpanIds - SDK handles it via startSpan() chain
       const childStartSpanCall = mockSpan.startSpan.mock.calls[0][0];
       expect(childStartSpanCall.parentSpanIds).toBeUndefined();
+    });
+
+    it('should link a resumed root span to its persisted parent', async () => {
+      // A workflow resumed after suspend: core restores the trace ID and
+      // parent span ID from the snapshot and marks it with resumedFromSpanId
+      const resumedRoot = createMockSpan({
+        id: 'resumed-root-id',
+        name: 'workflow-run-resumed',
+        type: SpanType.WORKFLOW_RUN,
+        isRoot: true,
+        attributes: {},
+        parentSpanId: 'suspended-span-id',
+        metadata: { resumed: true, resumedFromSpanId: 'suspended-span-id' },
+        traceId: 'persisted-trace-id',
+      });
+
+      await exporter.exportTracingEvent({
+        type: TracingEventType.SPAN_STARTED,
+        exportedSpan: resumedRoot,
+      });
+
+      const startSpanCall = mockLogger.startSpan.mock.calls[0][0];
+      expect(startSpanCall.parentSpanIds).toEqual({
+        spanId: 'suspended-span-id',
+        rootSpanId: 'persisted-trace-id',
+      });
+    });
+
+    it('should link a run nested with nestUnderParent to its parent', async () => {
+      const nestedRoot = createMockSpan({
+        id: 'judge-root-id',
+        name: 'agent-run',
+        type: SpanType.AGENT_RUN,
+        isRoot: true,
+        attributes: {},
+        traceId: 'turn-trace-id',
+      });
+      nestedRoot.externalParentSpanId = 'turn-span-id';
+      nestedRoot.nestedUnderParent = true;
+
+      await exporter.exportTracingEvent({
+        type: TracingEventType.SPAN_STARTED,
+        exportedSpan: nestedRoot,
+      });
+
+      const startSpanCall = mockLogger.startSpan.mock.calls[0][0];
+      expect(startSpanCall.parentSpanIds).toEqual({ spanId: 'turn-span-id', rootSpanId: 'turn-trace-id' });
+    });
+
+    it('should not link a root span whose parent was never exported to Braintrust', async () => {
+      // A root under an ambient OTEL parent (via the bridge) has a
+      // parentSpanId, but that span only exists in the OTEL backend —
+      // linking to it would leave the Braintrust trace without a root
+      const bridgedRoot = createMockSpan({
+        id: 'bridged-root-id',
+        name: 'agent-run',
+        type: SpanType.AGENT_RUN,
+        isRoot: true,
+        attributes: {},
+        parentSpanId: 'ambient-otel-span-id',
+        traceId: 'otel-trace-id',
+      });
+
+      await exporter.exportTracingEvent({
+        type: TracingEventType.SPAN_STARTED,
+        exportedSpan: bridgedRoot,
+      });
+
+      const startSpanCall = mockLogger.startSpan.mock.calls[0][0];
+      expect(startSpanCall.parentSpanIds).toEqual({ parentSpanIds: [], rootSpanId: 'otel-trace-id' });
     });
   });
 
@@ -2366,6 +2694,7 @@ describe('BraintrustExporter with braintrustLogger parameter', () => {
     // Set up mock logger
     mockLogger = {
       startSpan: vi.fn(),
+      logFeedback: vi.fn(),
     };
 
     // Set up mock external span (simulating logger.traced() or Eval context)
@@ -2418,7 +2747,8 @@ describe('BraintrustExporter with braintrustLogger parameter', () => {
       name: 'root-agent',
       type: 'task',
       startTime: rootSpan.startTime.getTime() / 1000,
-      // No parentSpanIds for root spans!
+      // Roots pin rootSpanId to the Mastra trace ID with no span parents
+      parentSpanIds: { parentSpanIds: [], rootSpanId: rootSpan.traceId },
       event: {
         id: 'root-span-id', // Row ID for logFeedback() compatibility
         metadata: {
@@ -2838,6 +3168,154 @@ describe('BraintrustExporter with braintrustLogger parameter', () => {
   });
 });
 
+describe('BraintrustExporter flush and shutdown', () => {
+  // Braintrust's SDK only enqueues rows; flush()/shutdown() must wait for its background logger.
+  function deferred() {
+    let resolve!: () => void;
+    const promise = new Promise<void>(r => {
+      resolve = r;
+    });
+    return { promise, resolve };
+  }
+
+  async function settled(promise: Promise<unknown>): Promise<boolean> {
+    let done = false;
+    void promise.then(() => {
+      done = true;
+    });
+    await new Promise(r => setImmediate(r));
+    return done;
+  }
+
+  let mockSpan: any;
+  let mockLogger: any;
+
+  beforeEach(() => {
+    vi.clearAllMocks();
+    // Earlier suites leave currentSpan() returning an ambient span
+    vi.mocked(currentSpan).mockReturnValue(undefined as any);
+    mockSpan = { id: 'mockSpan', startSpan: vi.fn(), log: vi.fn(), end: vi.fn() };
+    mockSpan.startSpan.mockReturnValue(mockSpan);
+    mockLogger = {
+      startSpan: vi.fn().mockReturnValue(mockSpan),
+      logFeedback: vi.fn(),
+      flush: vi.fn(),
+    };
+  });
+
+  it('flush() waits for the logger flush to finish', async () => {
+    const gate = deferred();
+    mockLogger.flush.mockReturnValue(gate.promise);
+    const exporter = new TestBraintrustExporter({ braintrustLogger: mockLogger });
+
+    await exporter.exportTracingEvent({
+      type: TracingEventType.SPAN_STARTED,
+      exportedSpan: createMockSpan({
+        id: 'root',
+        name: 'root',
+        type: SpanType.AGENT_RUN,
+        isRoot: true,
+        attributes: {},
+      }),
+    });
+
+    const flushing = exporter.flush();
+    expect(await settled(flushing)).toBe(false);
+    expect(mockLogger.flush).toHaveBeenCalledTimes(1);
+
+    gate.resolve();
+    await flushing;
+  });
+
+  it('flush() waits for the lazily created logger', async () => {
+    const gate = deferred();
+    mockLogger.flush.mockReturnValue(gate.promise);
+    vi.mocked(initLogger).mockResolvedValue(mockLogger);
+    const exporter = new TestBraintrustExporter({ apiKey: 'test-api-key' });
+
+    await exporter.exportTracingEvent({
+      type: TracingEventType.SPAN_STARTED,
+      exportedSpan: createMockSpan({
+        id: 'root',
+        name: 'root',
+        type: SpanType.AGENT_RUN,
+        isRoot: true,
+        attributes: {},
+      }),
+    });
+
+    const flushing = exporter.flush();
+    expect(await settled(flushing)).toBe(false);
+
+    gate.resolve();
+    await flushing;
+    expect(mockLogger.flush).toHaveBeenCalledTimes(1);
+  });
+
+  it('shutdown() flushes after writing abort rows for open spans', async () => {
+    const gate = deferred();
+    mockLogger.flush.mockReturnValue(gate.promise);
+    const exporter = new TestBraintrustExporter({ braintrustLogger: mockLogger });
+
+    await exporter.exportTracingEvent({
+      type: TracingEventType.SPAN_STARTED,
+      exportedSpan: createMockSpan({
+        id: 'root',
+        name: 'root',
+        type: SpanType.AGENT_RUN,
+        isRoot: true,
+        attributes: {},
+      }),
+    });
+
+    const stopping = exporter.shutdown();
+    expect(await settled(stopping)).toBe(false);
+
+    expect(mockSpan.log).toHaveBeenCalledWith(expect.objectContaining({ error: 'Observability is shutting down.' }));
+    expect(mockSpan.end).toHaveBeenCalled();
+    expect(mockLogger.flush).toHaveBeenCalledTimes(1);
+    expect(mockLogger.flush.mock.invocationCallOrder[0]).toBeGreaterThan(mockSpan.end.mock.invocationCallOrder[0]);
+
+    gate.resolve();
+    await stopping;
+  });
+
+  it('flush() waits for the ambient external span', async () => {
+    const gate = deferred();
+    const mockExternalSpan = {
+      id: 'external-span-id',
+      startSpan: vi.fn().mockReturnValue(mockSpan),
+      log: vi.fn(),
+      end: vi.fn(),
+      flush: vi.fn().mockReturnValue(gate.promise),
+    };
+    vi.mocked(currentSpan).mockReturnValue(mockExternalSpan as any);
+    const exporter = new TestBraintrustExporter({ braintrustLogger: mockLogger });
+
+    await exporter.exportTracingEvent({
+      type: TracingEventType.SPAN_STARTED,
+      exportedSpan: createMockSpan({
+        id: 'root',
+        name: 'root',
+        type: SpanType.AGENT_RUN,
+        isRoot: true,
+        attributes: {},
+      }),
+    });
+
+    const flushing = exporter.flush();
+    expect(await settled(flushing)).toBe(false);
+    expect(mockExternalSpan.flush).toHaveBeenCalledTimes(1);
+
+    gate.resolve();
+    await flushing;
+
+    // Later flushes keep covering the same ambient span
+    await exporter.flush();
+    expect(mockExternalSpan.flush).toHaveBeenCalledTimes(2);
+  });
+});
+
 // Helper function to create mock spans
 function createMockSpan({
   id,
@@ -2853,6 +3331,7 @@ function createMockSpan({
   traceId,
   entityName,
   entityId,
+  parentSpanId,
 }: {
   id: string;
   name: string;
@@ -2867,6 +3346,7 @@ function createMockSpan({
   traceId?: string;
   entityName?: string;
   entityId?: string;
+  parentSpanId?: string;
 }): AnyExportedSpan {
   const mockSpan = {
     id,
@@ -2886,7 +3366,7 @@ function createMockSpan({
     get isRootSpan() {
       return isRoot;
     },
-    parentSpanId: isRoot ? undefined : 'parent-id',
+    parentSpanId: parentSpanId ?? (isRoot ? undefined : 'parent-id'),
     isEvent: false,
   } as AnyExportedSpan;
 

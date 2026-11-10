@@ -3,21 +3,20 @@ import { z } from 'zod/v4';
 import { MockMemory } from '../../../../memory';
 import { createTool } from '../../../../tools';
 import { createSharedAgent, runLoopScenario, useLoopScenarioAimock, describeForAllEngines } from '../aimock-scenario';
-import { randomUUID } from 'node:crypto';
 
 /**
  * Automatic tool resumption with `autoResumeSuspendedTools`.
  *
- * When a tool has `requireApproval: true` and the agent has
- * `defaultOptions: { autoResumeSuspendedTools: true }`, the agent will
- * automatically resume a suspended tool on the next user message in the
- * same thread. The second call to `agent.stream()` on the same agent+memory
- * detects the suspended state and auto-resumes.
+ * When a tool suspends for data and the agent has
+ * `defaultOptions: { autoResumeSuspendedTools: true }`, the agent can
+ * automatically resume it from the next user message in the same thread.
+ * Approval suspensions are intentionally excluded because consent must arrive
+ * through the explicit approval APIs.
  *
  * Regression classes:
- * - Tool with `requireApproval: true` emits `tool-call-approval` chunk
- * - `autoResumeSuspendedTools` detects suspended tool in memory on next call
- * - Tool executes with `resumeData: { approved: true }` injected by the loop
+ * - A data-bearing tool suspension is persisted in memory
+ * - `autoResumeSuspendedTools` detects it on the next call
+ * - The model supplies schema-valid `resumeData` from the user's message
  * - Final output reflects the resumed tool's result
  */
 describeForAllEngines(
@@ -33,13 +32,21 @@ describeForAllEngines(
         id: 'find-user',
         description: 'Finds a user by name',
         inputSchema: z.object({
+          query: z.string(),
+        }),
+        suspendSchema: z.object({
+          message: z.string(),
+        }),
+        resumeSchema: z.object({
           name: z.string(),
         }),
-        requireApproval: true,
-        execute: async inputData => {
+        execute: async (_inputData, context) => {
+          if (!context?.agent?.resumeData) {
+            return context?.agent?.suspend({ message: 'Which user should I find?' });
+          }
           toolExecuted = true;
-          toolInputName = inputData.name;
-          return { name: inputData.name, email: `${inputData.name.toLowerCase()}@test.com` };
+          toolInputName = context.agent.resumeData.name;
+          return { name: toolInputName, email: `${toolInputName.toLowerCase()}@test.com` };
         },
       });
 
@@ -54,10 +61,10 @@ describeForAllEngines(
         engine,
       });
 
-      const threadId = randomUUID();
-      const resourceId = randomUUID();
+      const threadId = globalThis.crypto.randomUUID();
+      const resourceId = globalThis.crypto.randomUUID();
 
-      // First call: model calls the tool, loop suspends for approval
+      // First call: model calls the tool, which suspends for the user's name
       const { chunks } = await runLoopScenario({
         engine,
         llm: getMock(),
@@ -72,7 +79,7 @@ describeForAllEngines(
               {
                 id: 'call-1',
                 name: 'find-user',
-                arguments: { name: 'Dero Israel' },
+                arguments: { query: 'user by name' },
               },
             ],
           });
@@ -80,9 +87,10 @@ describeForAllEngines(
         collectChunks: true,
       });
 
-      // Assert: tool-call-approval chunk emitted (tool suspended)
-      const approvalChunks = chunks!.filter(c => c.type === 'tool-call-approval');
-      expect(approvalChunks.length).toBeGreaterThan(0);
+      // Assert: the tool suspended for data rather than approval.
+      const suspendedChunks = chunks!.filter(c => c.type === 'tool-call-suspended');
+      expect(suspendedChunks.length).toBeGreaterThan(0);
+      expect(chunks!.some(c => c.type === 'tool-call-approval')).toBe(false);
 
       // Tool should NOT have executed yet (suspended before execution)
       expect(toolExecuted).toBe(false);
@@ -94,7 +102,7 @@ describeForAllEngines(
         engine,
         llm: getMock(),
         sharedAgent: shared,
-        prompt: 'Yes, approve it',
+        prompt: 'The user is Dero Israel',
         memory: sharedMemory,
         threadId,
         resourceId,
@@ -108,7 +116,7 @@ describeForAllEngines(
                 {
                   id: 'call-2',
                   name: 'find-user',
-                  arguments: { name: 'Dero Israel', resumeData: { approved: true } },
+                  arguments: { query: 'user by name', resumeData: { name: 'Dero Israel' } },
                 },
               ],
             },
@@ -139,6 +147,110 @@ describeForAllEngines(
       expect(text.length).toBeGreaterThan(0);
     });
 
+    // #26673: the model re-calls a plain tool under a new id and names the original call via
+    // `suspendedToolCallId`. The original suspension must be cleared so later turns stop asking
+    // the model to resume it.
+    it('clears the original suspension when a plain tool is auto-resumed under a new toolCallId', async () => {
+      const askUserTool = createTool({
+        id: 'ask-user',
+        description: 'Asks the user a question',
+        inputSchema: z.object({ question: z.string() }),
+        suspendSchema: z.object({ question: z.string() }),
+        resumeSchema: z.object({ answer: z.string() }),
+        execute: async (inputData, context) => {
+          if (!context?.agent?.resumeData) {
+            return context?.agent?.suspend({ question: inputData.question });
+          }
+          return { answer: context.agent.resumeData.answer };
+        },
+      });
+
+      const sharedMemory = new MockMemory();
+      const shared = await createSharedAgent(getMock(), {
+        tools: { askUserTool },
+        memory: sharedMemory,
+        defaultOptions: { autoResumeSuspendedTools: true },
+        engine,
+      });
+      const threadId = globalThis.crypto.randomUUID();
+      const resourceId = globalThis.crypto.randomUUID();
+
+      const first = await runLoopScenario({
+        engine,
+        llm: getMock(),
+        sharedAgent: shared,
+        prompt: 'Book a room for me',
+        memory: sharedMemory,
+        threadId,
+        resourceId,
+        fixtures: llm => {
+          llm.onMessage(/book/i, {
+            toolCalls: [{ id: 'call-book', name: 'ask-user', arguments: { question: 'Which color?' } }],
+          });
+        },
+        collectChunks: true,
+      });
+      expect(first.chunks!.some(c => c.type === 'tool-call-suspended')).toBe(true);
+
+      const second = await runLoopScenario({
+        engine,
+        llm: getMock(),
+        sharedAgent: shared,
+        prompt: 'Blue please',
+        memory: sharedMemory,
+        threadId,
+        resourceId,
+        fixtures: llm => {
+          llm.on(
+            { endpoint: 'chat', hasToolResult: false },
+            {
+              toolCalls: [
+                {
+                  id: 'call-book-2',
+                  name: 'ask-user',
+                  arguments: {
+                    question: 'Which color?',
+                    suspendedToolCallId: 'call-book',
+                    resumeData: { answer: 'blue' },
+                  },
+                },
+              ],
+            },
+          );
+          llm.on({ endpoint: 'chat', toolCallId: 'call-book-2', hasToolResult: true }, { content: 'Booked in blue.' });
+        },
+        collectChunks: true,
+      });
+
+      const acks = second.chunks!.filter(c => c.type === 'tool-call-resumed');
+      expect(acks.map(c => (c as any).payload.toolCallId)).toEqual(['call-book']);
+      const result = second.chunks!.find(c => c.type === 'tool-result') as any;
+      expect(result?.payload.result).toEqual({ answer: 'blue' });
+
+      const { messages } = await sharedMemory.recall({ threadId, resourceId });
+      const remaining = messages.flatMap(m => Object.keys((m.content.metadata as any)?.suspendedTools ?? {}));
+      expect(remaining).toEqual([]);
+
+      const third = await runLoopScenario({
+        engine,
+        llm: getMock(),
+        sharedAgent: shared,
+        prompt: 'Thanks, anything else?',
+        memory: sharedMemory,
+        threadId,
+        resourceId,
+        fixtures: llm => {
+          llm.on({ endpoint: 'chat' }, { content: 'Nothing else.' });
+        },
+      });
+      const lastRequest = third.requests[third.requests.length - 1];
+      const systemText = (lastRequest?.body?.messages ?? [])
+        .filter((m: any) => m.role === 'system')
+        .map((m: any) => (typeof m.content === 'string' ? m.content : JSON.stringify(m.content)))
+        .join('\n');
+      expect(systemText).not.toContain('suspended tools');
+    });
+
     it('does NOT auto-resume when autoResumeSuspendedTools is false', async () => {
       let toolExecuted = false;
 
@@ -165,8 +277,8 @@ describeForAllEngines(
         engine,
       });
 
-      const threadId = randomUUID();
-      const resourceId = randomUUID();
+      const threadId = globalThis.crypto.randomUUID();
+      const resourceId = globalThis.crypto.randomUUID();
 
       // First call: tool suspends
       const { chunks } = await runLoopScenario({

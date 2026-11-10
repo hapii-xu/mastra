@@ -1,9 +1,9 @@
 import { Combobox } from '@mastra/playground-ui/components/Combobox';
 import type { ComboboxProps } from '@mastra/playground-ui/components/Combobox';
+import { useLinkComponent } from '@mastra/playground-ui/lib/framework';
 import { toast } from '@mastra/playground-ui/utils/toast';
+import { useAgents } from '@mastra/react/hooks/agents';
 import { useEffect } from 'react';
-import { useAgents } from '../hooks/use-agents';
-import { useLinkComponent } from '@/lib/framework';
 
 export interface AgentComboboxProps {
   value?: string;
@@ -15,18 +15,24 @@ export interface AgentComboboxProps {
   disabled?: boolean;
   variant?: ComboboxProps['variant'];
   size?: ComboboxProps['size'];
+  popupWidth?: ComboboxProps['popupWidth'];
+  'aria-label'?: string;
+  align?: ComboboxProps['align'];
 }
 
 export function AgentCombobox({
   value,
   onValueChange,
-  placeholder = 'Select an agent...',
-  searchPlaceholder = 'Search agents...',
+  placeholder = 'Select an agent',
+  searchPlaceholder = 'Search agents',
   emptyText = 'No agents found.',
   className,
   disabled = false,
   variant,
   size,
+  popupWidth,
+  'aria-label': ariaLabel,
+  align,
 }: AgentComboboxProps) {
   const { data: agents = {}, isLoading, isError, error } = useAgents();
   const { navigate, paths } = useLinkComponent();
@@ -63,6 +69,9 @@ export function AgentCombobox({
       disabled={disabled || isLoading || isError}
       variant={variant}
       size={size}
+      popupWidth={popupWidth}
+      aria-label={ariaLabel}
+      align={align}
     />
   );
 }

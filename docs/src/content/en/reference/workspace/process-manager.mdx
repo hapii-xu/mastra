@@ -1,6 +1,6 @@
 ---
 title: "Reference: SandboxProcessManager | Workspace"
-description: "API reference for SandboxProcessManager and ProcessHandle, the base classes for background process management in sandboxes."
+description: "Abstract base class for managing background processes in sandboxes. Provides methods to spawn processes, list them, get handles by PID, and kill them."
 packages:
   - "@mastra/core"
 ---
@@ -11,7 +11,7 @@ packages:
 
 Abstract base class for managing background processes in sandboxes. Provides methods to spawn processes, list them, get handles by PID, and kill them.
 
-[`BlaxelSandbox`](/reference/workspace/blaxel-sandbox), [`DaytonaSandbox`](/reference/workspace/daytona-sandbox), [`E2BSandbox`](/reference/workspace/e2b-sandbox), [`ModalSandbox`](/reference/workspace/modal-sandbox), and [`LocalSandbox`](/reference/workspace/local-sandbox) all include built-in process managers. You don't need to instantiate this class directly unless you're building a custom sandbox provider.
+[`BlaxelSandbox`](/integrations/sandboxes/blaxel), [`DaytonaSandbox`](/integrations/sandboxes/daytona), [`E2BSandbox`](/integrations/sandboxes/e2b), [`ModalSandbox`](/integrations/sandboxes/modal), and [`LocalSandbox`](/reference/workspace/local-sandbox) all include built-in process managers. You don't need to instantiate this class directly unless you're building a custom sandbox provider.
 
 ## Usage example
 
@@ -86,7 +86,8 @@ const handle = await sandbox.processes.spawn('npm run dev', {
           {
             name: 'cwd',
             type: 'string',
-            description: 'Working directory for the process.',
+            description:
+              "Working directory for the process. Defaults to the sandbox's configured `workingDirectory`, then the provider default.",
             isOptional: true,
           },
           {
@@ -107,6 +108,13 @@ const handle = await sandbox.processes.spawn('npm run dev', {
             description: 'Signal to abort the process. When aborted, the process is killed.',
             isOptional: true,
           },
+          {
+            name: 'stdinMode',
+            type: "'pipe' | 'ignore'",
+            description:
+              "How stdin is wired. `'pipe'` (default) opens a writable stdin for `sendStdin()` and `writer`. `'ignore'` closes stdin so commands that read it see immediate EOF. Honored by the local, Docker, and E2B providers.",
+            isOptional: true,
+          },
         ],
       },
     ],
@@ -120,6 +128,8 @@ const handle = await sandbox.processes.spawn('npm run dev', {
 
 List all tracked processes. Returns info about each process including PID, running state, and exit code.
 
+A process that has exited stays in the list until something reads it with `get(pid)`, so a finished command's output can still be read.
+
 ```typescript
 const procs = await sandbox.processes.list()
 for (const proc of procs) {
@@ -129,17 +139,39 @@ for (const proc of procs) {
 
 **Returns:** `Promise<ProcessInfo[]>`
 
-### `get(pid)`
+### `get(pid, options?)`
 
 Get a handle to a process by PID. Returns `undefined` if the process isn't found or has already been dismissed.
 
+Reading a process that has exited dismisses it: later calls return `undefined` and it leaves `list()`. Pass `{ release: false }` to read it and leave it available, so one reader can look at a finished process's output without taking it from another, such as the agent that started it.
+
 ```typescript
-const handle = await sandbox.processes.get(1234)
+const handle = await sandbox.processes.get('1234')
 if (handle) {
   console.log(handle.stdout)
   await handle.kill()
 }
+
+// Read without dismissing an exited process
+const peek = await sandbox.processes.get('1234', { release: false })
 ```
+
+<PropertiesTable
+  content={[
+  {
+    name: 'pid',
+    type: 'string',
+    description: 'Process ID.',
+  },
+  {
+    name: 'options.release',
+    type: 'boolean',
+    description: 'Whether reading an exited process dismisses it. Defaults to `true`.',
+    isOptional: true,
+    defaultValue: 'true',
+  },
+]}
+/>
 
 **Returns:** `Promise<ProcessHandle | undefined>`
 
@@ -161,7 +193,7 @@ Information about a tracked process, returned by `list()`.
   content={[
   {
     name: 'pid',
-    type: 'number',
+    type: 'string',
     description: 'Process ID.',
   },
   {
@@ -188,9 +220,9 @@ Information about a tracked process, returned by `list()`.
 
 ## `ProcessHandle`
 
-Handle to a spawned background process. Provides methods to read output, send stdin, wait for completion, and kill the process.
+Handle to a spawned background process. Provides methods to read output, send or close stdin, wait for completion, and kill the process.
 
-You don't create `ProcessHandle` instances directly — they're returned by `spawn()` and `get()`.
+You don't create `ProcessHandle` instances directly. They're returned by `spawn()` and `get()`.
 
 ### Usage example
 
@@ -208,8 +240,9 @@ console.log(handle.exitCode) // undefined while running
 // Wait for completion
 const result = await handle.wait()
 
-// Send stdin
+// Send stdin and signal EOF
 await handle.sendStdin('input data\n')
+await handle.closeStdin()
 
 // Kill the process
 await handle.kill()
@@ -221,7 +254,7 @@ await handle.kill()
   content={[
   {
     name: 'pid',
-    type: 'number',
+    type: 'string',
     description: 'Process ID.',
   },
   {
@@ -252,7 +285,8 @@ await handle.kill()
   {
     name: 'writer',
     type: 'Writable',
-    description: 'Writable stream to stdin. Useful for protocols like LSP or JSON-RPC that communicate over stdio.',
+    description:
+      'Writable stream to stdin. Ending the stream calls closeStdin(). Useful for protocols like LSP or JSON-RPC that communicate over stdio.',
   },
 ]}
 />
@@ -373,6 +407,21 @@ await handle.sendStdin('console.log("hello")\n')
 
 **Returns:** `Promise<void>`
 
+#### `closeStdin()`
+
+Close the process's stdin to signal end-of-file (EOF). Use this after sending all input to commands that read until stdin closes. An exited process or an unavailable stdin causes a throw. Providers without a stdin close primitive throw `UnsupportedStdinCloseError`.
+
+```typescript
+const handle = await sandbox.processes.spawn('cat')
+await handle.sendStdin('input data\n')
+await handle.closeStdin()
+const result = await handle.wait()
+```
+
+Calling `handle.writer.end()` also closes stdin. On providers without stdin close support, `writer.end()` finishes the stream without an error.
+
+**Returns:** `Promise<void>`
+
 ## Stream interop
 
 `ProcessHandle` exposes `reader` and `writer` properties for integration with Node.js stream-based protocols like LSP or JSON-RPC:
@@ -436,8 +485,8 @@ When a process manager is provided, `MastraSandbox` automatically creates a defa
 
 ## Related
 
-- [Sandbox](/docs/workspace/sandbox)
+- [Sandbox](/docs/sandbox/overview)
 - [WorkspaceSandbox interface](/reference/workspace/sandbox)
 - [LocalSandbox reference](/reference/workspace/local-sandbox)
-- [E2BSandbox reference](/reference/workspace/e2b-sandbox)
-- [DaytonaSandbox reference](/reference/workspace/daytona-sandbox)
+- [E2BSandbox reference](/integrations/sandboxes/e2b)
+- [DaytonaSandbox reference](/integrations/sandboxes/daytona)

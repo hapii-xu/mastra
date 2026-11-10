@@ -1,16 +1,29 @@
+import { Agent } from '@mastra/core/agent';
+import { createDurableAgent } from '@mastra/core/agent/durable';
+import { EventEmitterPubSub } from '@mastra/core/events';
 import { Mastra } from '@mastra/core/mastra';
 import { RequestContext } from '@mastra/core/request-context';
 import { MockStore } from '@mastra/core/storage';
+import { createTool } from '@mastra/core/tools';
 import { createStep, createWorkflow } from '@mastra/core/workflows';
 import type { Workflow } from '@mastra/core/workflows';
-import { describe, it, expect, vi, beforeEach } from 'vitest';
+import {
+  createStep as createEventedStep,
+  createWorkflow as createEventedWorkflow,
+} from '@mastra/core/workflows/evented';
+import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
 import { z } from 'zod/v4';
+import { MASTRA_RESOURCE_ID_KEY } from '../constants';
 import { HTTPException } from '../http-exception';
+import { listWorkflowRunsQuerySchema } from '../schemas/workflows';
 import { checkRouteFGA } from '../server-adapter';
+import { WORKFLOWS_ROUTES } from '../server-adapter/routes/workflows';
 import { getWorkflowInfo } from '../utils';
 import { createTestServerContext } from './test-utils';
 import {
   LIST_WORKFLOWS_ROUTE,
+  LIST_WORKFLOW_RUN_COUNTS_ROUTE,
+  __setWorkflowRunCountsNow,
   GET_WORKFLOW_BY_ID_ROUTE,
   START_ASYNC_WORKFLOW_ROUTE,
   GET_WORKFLOW_RUN_BY_ID_ROUTE,
@@ -24,6 +37,8 @@ import {
   CANCEL_WORKFLOW_RUN_ROUTE,
   LIST_WORKFLOW_RUNS_ROUTE,
   STREAM_WORKFLOW_ROUTE,
+  TIME_TRAVEL_WORKFLOW_ROUTE,
+  EXECUTE_WORKFLOW_STEP_ROUTE,
 } from './workflows';
 
 function createMockWorkflow(name: string) {
@@ -235,6 +250,42 @@ describe('vNext Workflow Handlers', () => {
       expect(workflow.stepCount).toBeUndefined();
     });
 
+    it("should stamp origin: 'code' for statically declared workflows", async () => {
+      const result = await LIST_WORKFLOWS_ROUTE.handler({ ...createTestServerContext({ mastra: mockMastra }) });
+      expect(result['test-workflow']?.origin).toBe('code');
+      expect(result['reusable-workflow']?.origin).toBe('code');
+    });
+
+    it("should stamp origin: 'dynamic' for workflows registered via addDynamicWorkflow", async () => {
+      const echoTool = createTool({
+        id: 'echo',
+        description: 'echoes input',
+        inputSchema: z.object({}),
+        outputSchema: z.object({ result: z.string() }),
+        execute: async () => ({ result: 'ok' }),
+      });
+      const mastraForStored = new Mastra({
+        logger: false,
+        workflows: { 'test-workflow': mockWorkflow },
+        tools: { echo: echoTool } as any,
+        storage: new MockStore(),
+      });
+
+      await mastraForStored.addDynamicWorkflow({
+        id: 'stored-only',
+        inputSchema: { type: 'object', properties: {}, required: [] },
+        outputSchema: { type: 'object', properties: { result: { type: 'string' } }, required: ['result'] },
+        graph: [{ type: 'step', step: { id: 'echo' } }] as any,
+      });
+
+      const result = await LIST_WORKFLOWS_ROUTE.handler({
+        ...createTestServerContext({ mastra: mastraForStored }),
+      });
+      expect(result['stored-only']?.origin).toBe('dynamic');
+      // Code-defined workflows keep their 'code' origin in the same response.
+      expect(result['test-workflow']?.origin).toBe('code');
+    });
+
     it('should return no workflows when FGA is configured and no user is present', async () => {
       const filterAccessible = vi.fn();
       vi.spyOn(mockMastra, 'getServer').mockReturnValue({ fga: { filterAccessible } } as any);
@@ -245,6 +296,225 @@ describe('vNext Workflow Handlers', () => {
 
       expect(result).toEqual({});
       expect(filterAccessible).not.toHaveBeenCalled();
+    });
+  });
+
+  describe('LIST_WORKFLOW_RUN_COUNTS_ROUTE', () => {
+    let fakeNow: number;
+
+    beforeEach(() => {
+      // Deterministic clock: the cache is WeakMap-keyed per Mastra instance
+      // (isolated by the fresh mockMastra each test), and TTL is tested by
+      // advancing this value instead of waiting on the wall clock.
+      fakeNow = 1_000_000;
+      __setWorkflowRunCountsNow(() => fakeNow);
+    });
+
+    afterEach(() => {
+      __setWorkflowRunCountsNow();
+    });
+
+    const persistRun = async (
+      mastra: Mastra,
+      workflowName: string,
+      runId: string,
+      status: string,
+      resourceId?: string,
+    ) => {
+      const store = await mastra.getStorage()!.getStore('workflows');
+      await store!.persistWorkflowSnapshot({
+        workflowName,
+        runId,
+        resourceId,
+        snapshot: { status, resourceId } as any,
+      });
+    };
+
+    it('counts running and suspended runs grouped by registry key', async () => {
+      await persistRun(mockMastra, 'test-workflow', 'run-1', 'running');
+      await persistRun(mockMastra, 'test-workflow', 'run-2', 'running');
+      await persistRun(mockMastra, 'test-workflow', 'run-3', 'suspended');
+      await persistRun(mockMastra, 'test-workflow', 'run-4', 'success');
+
+      const result = await LIST_WORKFLOW_RUN_COUNTS_ROUTE.handler({
+        ...createTestServerContext({ mastra: mockMastra }),
+      } as any);
+
+      expect(result).toEqual({
+        'test-workflow': { running: 2, suspended: 1 },
+        'reusable-workflow': { running: 0, suspended: 0 },
+      });
+    });
+
+    it('maps run rows to the registry key when it differs from the workflow id', async () => {
+      const camelMastra = new Mastra({
+        logger: false,
+        workflows: { testWorkflowKey: createMockWorkflow('kebab-flow-id') },
+        storage: new MockStore(),
+      });
+      await persistRun(camelMastra, 'kebab-flow-id', 'run-1', 'suspended');
+
+      const result = await LIST_WORKFLOW_RUN_COUNTS_ROUTE.handler({
+        ...createTestServerContext({ mastra: camelMastra }),
+      } as any);
+
+      expect(result).toEqual({ testWorkflowKey: { running: 0, suspended: 1 } });
+    });
+
+    it('ignores run rows whose workflow is not registered', async () => {
+      await persistRun(mockMastra, 'ghost-flow', 'run-1', 'running');
+
+      const result = await LIST_WORKFLOW_RUN_COUNTS_ROUTE.handler({
+        ...createTestServerContext({ mastra: mockMastra }),
+      } as any);
+
+      expect(result).toEqual({
+        'test-workflow': { running: 0, suspended: 0 },
+        'reusable-workflow': { running: 0, suspended: 0 },
+      });
+    });
+
+    it('returns zero counts when storage is not configured', async () => {
+      const storagelessMastra = new Mastra({
+        logger: false,
+        workflows: { 'test-workflow': createMockWorkflow('test-workflow') },
+      });
+
+      const result = await LIST_WORKFLOW_RUN_COUNTS_ROUTE.handler({
+        ...createTestServerContext({ mastra: storagelessMastra }),
+      } as any);
+
+      expect(result).toEqual({ 'test-workflow': { running: 0, suspended: 0 } });
+    });
+
+    it('serves cached counts within the TTL window and refreshes after expiry', async () => {
+      await persistRun(mockMastra, 'test-workflow', 'run-1', 'running');
+
+      const first = await LIST_WORKFLOW_RUN_COUNTS_ROUTE.handler({
+        ...createTestServerContext({ mastra: mockMastra }),
+      } as any);
+      expect(first['test-workflow'].running).toEqual(1);
+
+      await persistRun(mockMastra, 'test-workflow', 'run-2', 'running');
+
+      // Within the TTL the cached map is served, so the new run is invisible.
+      fakeNow += 4_000;
+      const second = await LIST_WORKFLOW_RUN_COUNTS_ROUTE.handler({
+        ...createTestServerContext({ mastra: mockMastra }),
+      } as any);
+      expect(second['test-workflow'].running).toEqual(1);
+
+      // Past the TTL the counts must refresh — an infinite cache is a regression.
+      fakeNow += 2_000;
+      const third = await LIST_WORKFLOW_RUN_COUNTS_ROUTE.handler({
+        ...createTestServerContext({ mastra: mockMastra }),
+      } as any);
+      expect(third['test-workflow'].running).toEqual(2);
+    });
+
+    it('scopes counts to the reserved request-context resource id and bypasses the cache', async () => {
+      await persistRun(mockMastra, 'test-workflow', 'run-a', 'running', 'tenant-a');
+      await persistRun(mockMastra, 'test-workflow', 'run-b', 'running', 'tenant-b');
+      await persistRun(mockMastra, 'test-workflow', 'run-c', 'suspended', 'tenant-b');
+
+      const scopedContext = new RequestContext();
+      scopedContext.set(MASTRA_RESOURCE_ID_KEY, 'tenant-a');
+
+      const scoped = await LIST_WORKFLOW_RUN_COUNTS_ROUTE.handler({
+        ...createTestServerContext({ mastra: mockMastra }),
+        requestContext: scopedContext,
+      } as any);
+      expect(scoped['test-workflow']).toEqual({ running: 1, suspended: 0 });
+
+      // Unscoped request right after: must not be served the scoped map, and
+      // the scoped request must not have been served a cached unscoped map.
+      const unscoped = await LIST_WORKFLOW_RUN_COUNTS_ROUTE.handler({
+        ...createTestServerContext({ mastra: mockMastra }),
+      } as any);
+      expect(unscoped['test-workflow']).toEqual({ running: 2, suspended: 1 });
+    });
+
+    it('returns an empty map when FGA is configured and no user is present, without touching storage', async () => {
+      const filterAccessible = vi.fn();
+      vi.spyOn(mockMastra, 'getServer').mockReturnValue({ fga: { filterAccessible } } as any);
+      const getStorage = vi.spyOn(mockMastra, 'getStorage');
+
+      const result = await LIST_WORKFLOW_RUN_COUNTS_ROUTE.handler({
+        ...createTestServerContext({ mastra: mockMastra }),
+      } as any);
+
+      expect(result).toEqual({});
+      expect(filterAccessible).not.toHaveBeenCalled();
+      expect(getStorage).not.toHaveBeenCalled();
+    });
+
+    it('filters counts to FGA-accessible workflows for the requesting user', async () => {
+      await persistRun(mockMastra, 'test-workflow', 'run-1', 'running');
+      await persistRun(mockMastra, 'reusable-workflow', 'run-2', 'suspended');
+
+      const filterAccessible = vi.fn().mockResolvedValue([{ id: 'test-workflow' }]);
+      vi.spyOn(mockMastra, 'getServer').mockReturnValue({ fga: { filterAccessible } } as any);
+
+      const requestContext = new RequestContext();
+      requestContext.set('user', { id: 'user-1' });
+
+      const result = await LIST_WORKFLOW_RUN_COUNTS_ROUTE.handler({
+        ...createTestServerContext({ mastra: mockMastra }),
+        requestContext,
+      } as any);
+
+      expect(result).toEqual({ 'test-workflow': { running: 1, suspended: 0 } });
+      expect(filterAccessible).toHaveBeenCalledWith(
+        { id: 'user-1' },
+        expect.arrayContaining([{ id: 'test-workflow' }, { id: 'reusable-workflow' }]),
+        'workflow',
+        'workflows:read',
+      );
+    });
+
+    it('does not serve or fill the shared cache for FGA-filtered requests', async () => {
+      await persistRun(mockMastra, 'test-workflow', 'run-1', 'running');
+
+      const requestContext = new RequestContext();
+      requestContext.set('user', { id: 'user-1' });
+      const filterAccessible = vi.fn().mockResolvedValue([{ id: 'test-workflow' }]);
+      const getServerSpy = vi.spyOn(mockMastra, 'getServer').mockReturnValue({ fga: { filterAccessible } } as any);
+
+      const fgaResult = await LIST_WORKFLOW_RUN_COUNTS_ROUTE.handler({
+        ...createTestServerContext({ mastra: mockMastra }),
+        requestContext,
+      } as any);
+      expect(fgaResult).toEqual({ 'test-workflow': { running: 1, suspended: 0 } });
+
+      // FGA off again: the filtered map must not come back from the cache.
+      getServerSpy.mockReturnValue({} as any);
+      const openResult = await LIST_WORKFLOW_RUN_COUNTS_ROUTE.handler({
+        ...createTestServerContext({ mastra: mockMastra }),
+      } as any);
+      expect(openResult['reusable-workflow']).toEqual({ running: 0, suspended: 0 });
+    });
+
+    it('counts a genuinely suspended run produced by a real execution', async () => {
+      const run = await reusableWorkflow.createRun({ runId: 'suspend-run' });
+      await run.start({ inputData: {} });
+
+      const result = await LIST_WORKFLOW_RUN_COUNTS_ROUTE.handler({
+        ...createTestServerContext({ mastra: mockMastra }),
+      } as any);
+
+      expect(result['reusable-workflow'].suspended).toEqual(1);
+    });
+
+    it('registers the static run-counts path before the parameterized workflow route', () => {
+      const paths = WORKFLOWS_ROUTES.map(route => `${route.method} ${route.path}`);
+      const countsIndex = paths.indexOf('GET /workflows/run-counts');
+      const paramIndex = paths.indexOf('GET /workflows/:workflowId');
+
+      expect(countsIndex).toBeGreaterThan(-1);
+      expect(paramIndex).toBeGreaterThan(-1);
+      // Routes register sequentially; the param route would capture
+      // "run-counts" as a workflowId if it came first.
+      expect(countsIndex).toBeLessThan(paramIndex);
     });
   });
 
@@ -340,9 +610,51 @@ describe('vNext Workflow Handlers', () => {
 
       expect(result.steps['test-step'].status).toEqual('success');
     });
+
+    it('should return a client error when workflow input is invalid', async () => {
+      const step = createStep({
+        id: 'number-step',
+        inputSchema: z.object({ value: z.number() }),
+        outputSchema: z.object({ value: z.number() }),
+        execute: async ({ inputData }) => inputData,
+      });
+      const workflow = createWorkflow({
+        id: 'number-workflow',
+        inputSchema: z.object({ value: z.number() }),
+        outputSchema: z.object({ value: z.number() }),
+      })
+        .then(step)
+        .commit();
+      const mastra = new Mastra({
+        logger: false,
+        workflows: { 'number-workflow': workflow },
+        storage: new MockStore(),
+      });
+
+      await expect(
+        START_ASYNC_WORKFLOW_ROUTE.handler({
+          ...createTestServerContext({ mastra }),
+          workflowId: 'number-workflow',
+          inputData: { value: 'not-a-number' },
+        } as any),
+      ).rejects.toMatchObject({
+        status: 400,
+        message: expect.stringContaining('expected number'),
+      });
+    });
   });
 
   describe('GET_WORKFLOW_RUN_BY_ID_ROUTE', () => {
+    it('should describe a fields example that the query schema accepts', () => {
+      const example = GET_WORKFLOW_RUN_BY_ID_ROUTE.openapi?.description?.match(/\?fields=([\w,]+)/)?.[1];
+      expect(example).toBeDefined();
+      expect(GET_WORKFLOW_RUN_BY_ID_ROUTE.queryParamSchema!.safeParse({ fields: example }).success).toBe(true);
+      // status and metadata are always included and are not selectable fields
+      expect(
+        GET_WORKFLOW_RUN_BY_ID_ROUTE.queryParamSchema!.safeParse({ fields: 'status,result,metadata' }).success,
+      ).toBe(false);
+    });
+
     it('should throw error when workflowId is not provided', async () => {
       await expect(
         GET_WORKFLOW_RUN_BY_ID_ROUTE.handler({
@@ -555,6 +867,47 @@ describe('vNext Workflow Handlers', () => {
       expect(result).toEqual({ message: 'Workflow run started' });
     });
 
+    it('should not leave an unhandled rejection when run.start() rejects', async () => {
+      const run = await mockWorkflow.createRun({
+        runId: 'test-run-reject',
+      });
+      await run.start({ inputData: {} });
+
+      // Plain function, not vi.fn(): vitest mocks track settled results by
+      // attaching a handler to returned promises, which would prevent the
+      // rejection from ever being reported as unhandled.
+      const createRunSpy = vi.spyOn(mockWorkflow, 'createRun').mockResolvedValue({
+        start: () => Promise.reject(new Error('invalid workflow input')),
+      } as any);
+
+      const unhandled: unknown[] = [];
+      const onUnhandled = (reason: unknown) => {
+        unhandled.push(reason);
+      };
+      process.on('unhandledRejection', onUnhandled);
+
+      try {
+        const result = await START_WORKFLOW_RUN_ROUTE.handler({
+          mastra: mockMastra,
+          workflowId: 'test-workflow',
+          runId: 'test-run-reject',
+          inputData: { bad: true },
+          tracingOptions,
+        } as any);
+
+        expect(result).toEqual({ message: 'Workflow run started' });
+
+        // Let the rejected promise settle; .catch on the route must swallow it.
+        await new Promise(resolve => setImmediate(resolve));
+        await new Promise(resolve => setImmediate(resolve));
+
+        expect(unhandled).toEqual([]);
+      } finally {
+        process.off('unhandledRejection', onUnhandled);
+        createRunSpy.mockRestore();
+      }
+    });
+
     it('should preserve resourceId when starting workflow run after server restart', async () => {
       const resourceId = 'user-start-test';
 
@@ -754,6 +1107,92 @@ describe('vNext Workflow Handlers', () => {
       const runAfterResume = await freshWorkflow.getWorkflowRunById('test-run-with-resource');
       expect(runAfterResume?.resourceId).toBe(resourceId);
     });
+
+    it('should not leave an unhandled rejection when run.resume() rejects', async () => {
+      const run = await reusableWorkflow.createRun({
+        runId: 'test-run-resume-reject',
+      });
+      await run.start({ inputData: {} });
+
+      // Plain function, not vi.fn(): vitest mocks track settled results by
+      // attaching a handler to returned promises, which would prevent the
+      // rejection from ever being reported as unhandled.
+      const createRunSpy = vi.spyOn(reusableWorkflow, 'createRun').mockResolvedValue({
+        resume: () => Promise.reject(new Error('resume failed')),
+      } as any);
+
+      const unhandled: unknown[] = [];
+      const onUnhandled = (reason: unknown) => {
+        unhandled.push(reason);
+      };
+      process.on('unhandledRejection', onUnhandled);
+
+      try {
+        const result = await RESUME_WORKFLOW_ROUTE.handler({
+          ...createTestServerContext({ mastra: mockMastra }),
+          workflowId: reusableWorkflow.name,
+          runId: 'test-run-resume-reject',
+          step: 'test-step',
+          resumeData: { test: 'data' },
+          tracingOptions,
+        } as any);
+
+        expect(result).toEqual({ message: 'Workflow run resumed' });
+
+        // Let the rejected promise settle; .catch on the route must swallow it.
+        await new Promise(resolve => setImmediate(resolve));
+        await new Promise(resolve => setImmediate(resolve));
+
+        expect(unhandled).toEqual([]);
+      } finally {
+        process.off('unhandledRejection', onUnhandled);
+        createRunSpy.mockRestore();
+      }
+    });
+  });
+
+  describe('TIME_TRAVEL_WORKFLOW_ROUTE', () => {
+    it('should not leave an unhandled rejection when run.timeTravel() rejects', async () => {
+      const run = await mockWorkflow.createRun({
+        runId: 'test-run-time-travel-reject',
+      });
+      await run.start({ inputData: {} });
+
+      // Plain function, not vi.fn(): vitest mocks track settled results by
+      // attaching a handler to returned promises, which would prevent the
+      // rejection from ever being reported as unhandled.
+      const createRunSpy = vi.spyOn(mockWorkflow, 'createRun').mockResolvedValue({
+        timeTravel: () => Promise.reject(new Error('time travel failed')),
+      } as any);
+
+      const unhandled: unknown[] = [];
+      const onUnhandled = (reason: unknown) => {
+        unhandled.push(reason);
+      };
+      process.on('unhandledRejection', onUnhandled);
+
+      try {
+        const result = await TIME_TRAVEL_WORKFLOW_ROUTE.handler({
+          ...createTestServerContext({ mastra: mockMastra }),
+          workflowId: 'test-workflow',
+          runId: 'test-run-time-travel-reject',
+          step: 'test-step',
+          inputData: {},
+          tracingOptions,
+        } as any);
+
+        expect(result).toEqual({ message: 'Workflow run time travel started' });
+
+        // Let the rejected promise settle; .catch on the route must swallow it.
+        await new Promise(resolve => setImmediate(resolve));
+        await new Promise(resolve => setImmediate(resolve));
+
+        expect(unhandled).toEqual([]);
+      } finally {
+        process.off('unhandledRejection', onUnhandled);
+        createRunSpy.mockRestore();
+      }
+    });
   });
 
   describe('RESUME_STREAM_WORKFLOW_ROUTE', () => {
@@ -831,6 +1270,32 @@ describe('vNext Workflow Handlers', () => {
 
       expect(result.total).toEqual(1);
     });
+
+    it('should reduce snapshots to status and timestamp in summary mode', async () => {
+      const run = await mockWorkflow.createRun({ runId: 'test-run-summary' });
+      await run.start({ inputData: {} });
+
+      const summary = await LIST_WORKFLOW_RUNS_ROUTE.handler({
+        ...createTestServerContext({ mastra: mockMastra }),
+        workflowId: 'test-workflow',
+        summary: true,
+      } as any);
+      expect(summary.total).toEqual(1);
+      expect(summary.runs[0]!.runId).toBe('test-run-summary');
+      expect(summary.runs[0]!.snapshot).toEqual({ status: 'success', timestamp: expect.any(Number) });
+
+      const full = await LIST_WORKFLOW_RUNS_ROUTE.handler({
+        ...createTestServerContext({ mastra: mockMastra }),
+        workflowId: 'test-workflow',
+      } as any);
+      expect(full.runs[0]!.snapshot).toMatchObject({ status: 'success', context: expect.any(Object) });
+    });
+
+    it('should parse the summary query param without treating "false" as true', () => {
+      expect(listWorkflowRunsQuerySchema.parse({ summary: 'false' }).summary).toBe(false);
+      expect(listWorkflowRunsQuerySchema.parse({ summary: 'true' }).summary).toBe(true);
+      expect(listWorkflowRunsQuerySchema.parse({}).summary).toBeUndefined();
+    });
   });
 
   describe('OBSERVE_STREAM_WORKFLOW_ROUTE', () => {
@@ -905,6 +1370,74 @@ describe('vNext Workflow Handlers', () => {
       const runAfter = await freshWorkflow.getWorkflowRunById('test-run-cancel-resource');
       expect(runAfter?.resourceId).toBe(resourceId);
     });
+
+    it('should settle an evented run owned by another instance as canceled', async () => {
+      const storage = new MockStore();
+      const pubsub = new EventEmitterPubSub();
+      let markEntered!: () => void;
+      const entered = new Promise<void>(resolve => (markEntered = resolve));
+
+      const buildEventedWorkflow = () =>
+        createEventedWorkflow({ id: 'evented-cancel', inputSchema: z.object({}), outputSchema: z.object({}) })
+          .then(
+            createEventedStep({
+              id: 'blocking',
+              inputSchema: z.object({}),
+              outputSchema: z.object({}),
+              execute: async ({ abortSignal }) => {
+                markEntered();
+                await new Promise<void>(resolve => {
+                  const timer = setTimeout(resolve, 10_000);
+                  abortSignal.addEventListener('abort', () => {
+                    clearTimeout(timer);
+                    resolve();
+                  });
+                });
+                return {};
+              },
+            }),
+          )
+          .commit();
+
+      // Two replicas sharing storage and pubsub, both running workers; the cancel request lands on the one
+      // that does not own the run.
+      const ownerMastra = new Mastra({
+        logger: false,
+        storage,
+        pubsub,
+        workflows: { 'evented-cancel': buildEventedWorkflow() },
+      });
+      const otherMastra = new Mastra({
+        logger: false,
+        storage,
+        pubsub,
+        workflows: { 'evented-cancel': buildEventedWorkflow() },
+      });
+      await ownerMastra.startWorkers();
+      await otherMastra.startWorkers();
+
+      try {
+        const run = await ownerMastra.getWorkflow('evented-cancel').createRun({ runId: 'evented-remote-cancel' });
+        const resultPromise = run.start({ inputData: {} });
+        await entered;
+
+        const response = await CANCEL_WORKFLOW_RUN_ROUTE.handler({
+          ...createTestServerContext({ mastra: otherMastra }),
+          workflowId: 'evented-cancel',
+          runId: 'evented-remote-cancel',
+        });
+        expect(response).toEqual({ message: 'Workflow run cancelled' });
+
+        const result = await Promise.race([
+          resultPromise,
+          new Promise<{ status: string }>(resolve => setTimeout(() => resolve({ status: 'timed out' }), 5_000)),
+        ]);
+        expect(result.status).toBe('canceled');
+      } finally {
+        await otherMastra.stopWorkers();
+        await ownerMastra.stopWorkers();
+      }
+    }, 15_000);
   });
 
   describe('STREAM_WORKFLOW_ROUTE', () => {
@@ -926,6 +1459,47 @@ describe('vNext Workflow Handlers', () => {
       // Verify resourceId is stored
       const storedRun = await mockWorkflow.getWorkflowRunById('test-run-stream-resource');
       expect(storedRun?.resourceId).toBe(resourceId);
+    });
+
+    it('should return 409 when the run already finished', async () => {
+      vi.spyOn(mockWorkflow, 'getWorkflowRunById').mockResolvedValue({
+        runId: 'test-run-finished',
+        workflowName: 'test-workflow',
+        status: 'success',
+        resourceId: undefined,
+      } as any);
+
+      const createRunSpy = vi.spyOn(mockWorkflow, 'createRun');
+
+      await expect(
+        STREAM_WORKFLOW_ROUTE.handler({
+          mastra: mockMastra,
+          workflowId: 'test-workflow',
+          runId: 'test-run-finished',
+          inputData: {},
+        } as any),
+      ).rejects.toMatchObject({ status: 409 });
+
+      // The run is never re-created, so it can never be re-executed.
+      expect(createRunSpy).not.toHaveBeenCalled();
+    });
+
+    it('should still stream when the stored run is not finished', async () => {
+      vi.spyOn(mockWorkflow, 'getWorkflowRunById').mockResolvedValue({
+        runId: 'test-run-suspended',
+        workflowName: 'test-workflow',
+        status: 'suspended',
+        resourceId: undefined,
+      } as any);
+
+      const stream = await STREAM_WORKFLOW_ROUTE.handler({
+        mastra: mockMastra,
+        workflowId: 'test-workflow',
+        runId: 'test-run-suspended',
+        inputData: {},
+      } as any);
+
+      expect(stream).toBeDefined();
     });
   });
 
@@ -1057,5 +1631,138 @@ describe('vNext Workflow Handlers', () => {
 
       expect(capturedOptions.forEachIndex).toBe(2);
     });
+  });
+
+  describe('EXECUTE_WORKFLOW_STEP_ROUTE', () => {
+    it('executes a nested workflow step resolved through its parent workflow', async () => {
+      const double = createStep({
+        id: 'double',
+        inputSchema: z.object({ n: z.number() }),
+        outputSchema: z.object({ n: z.number() }),
+        execute: async ({ inputData }) => ({ n: inputData.n * 2 }),
+      });
+      const inner = createWorkflow({
+        id: 'inner',
+        inputSchema: z.object({ n: z.number() }),
+        outputSchema: z.object({ n: z.number() }),
+      })
+        .then(double)
+        .commit();
+      const outer = createWorkflow({
+        id: 'outer',
+        inputSchema: z.object({ n: z.number() }),
+        outputSchema: z.object({ n: z.number() }),
+      })
+        .then(inner)
+        .commit();
+      const mastra = new Mastra({ logger: false, storage: new MockStore(), workflows: { outer } });
+      const body = EXECUTE_WORKFLOW_STEP_ROUTE.bodySchema!.parse({
+        stepId: 'double',
+        executionPath: [0],
+        parentWorkflow: { workflowId: 'outer', runId: 'run-1', executionPath: [0] },
+        stepResults: {},
+        state: {},
+        requestContext: {},
+        input: { n: 2 },
+      });
+
+      const result = await EXECUTE_WORKFLOW_STEP_ROUTE.handler({
+        ...createTestServerContext({ mastra }),
+        workflowId: 'inner',
+        runId: 'run-1',
+        ...body,
+      } as any);
+
+      expect(result).toMatchObject({ status: 'success', output: { n: 4 } });
+    });
+
+    it('validates the nested parent workflow chain', () => {
+      const parse = (parentWorkflow: unknown) =>
+        EXECUTE_WORKFLOW_STEP_ROUTE.bodySchema!.safeParse({
+          stepId: 'double',
+          executionPath: [0],
+          parentWorkflow,
+          stepResults: {},
+          state: {},
+          requestContext: {},
+        }).success;
+
+      expect(
+        parse({
+          workflowId: 'inner',
+          runId: 'run-1',
+          executionPath: [1],
+          parentWorkflow: { workflowId: 'outer', runId: 'run-1', executionPath: [0] },
+        }),
+      ).toBe(true);
+      expect(parse({ workflowId: 'outer', runId: 'run-1', executionPath: [-1] })).toBe(false);
+      expect(
+        parse({ workflowId: 'inner', runId: 'run-1', executionPath: [0], parentWorkflow: { workflowId: 'outer' } }),
+      ).toBe(false);
+    });
+  });
+});
+
+describe('hidden internal workflows', () => {
+  const LOOP_ID = 'durable-agentic-loop';
+  const NOTIFICATION_DISPATCH_ID = '__mastra_notification_dispatcher';
+
+  function createMastraWithDurableAgent(workflows: Record<string, Workflow<any, any, any, any, any, any>> = {}) {
+    const agent = new Agent({ id: 'durable', name: 'durable', instructions: 'test', model: 'openai/gpt-4o-mini' });
+    return new Mastra({
+      logger: false,
+      storage: new MockStore(),
+      workflows,
+      agents: { durable: createDurableAgent({ agent }) as unknown as Agent },
+    });
+  }
+
+  const executionRoutes = [
+    ['GET_WORKFLOW_BY_ID_ROUTE', GET_WORKFLOW_BY_ID_ROUTE, {}],
+    ['CREATE_WORKFLOW_RUN_ROUTE', CREATE_WORKFLOW_RUN_ROUTE, { runId: 'run-1' }],
+    ['START_ASYNC_WORKFLOW_ROUTE', START_ASYNC_WORKFLOW_ROUTE, { inputData: {} }],
+    ['START_WORKFLOW_RUN_ROUTE', START_WORKFLOW_RUN_ROUTE, { runId: 'run-1', inputData: {} }],
+    ['STREAM_WORKFLOW_ROUTE', STREAM_WORKFLOW_ROUTE, { runId: 'run-1', inputData: {} }],
+    ['RESUME_ASYNC_WORKFLOW_ROUTE', RESUME_ASYNC_WORKFLOW_ROUTE, { runId: 'run-1', step: 'x', resumeData: {} }],
+    ['RESUME_WORKFLOW_ROUTE', RESUME_WORKFLOW_ROUTE, { runId: 'run-1', step: 'x', resumeData: {} }],
+  ] as const;
+
+  it('core still resolves the hidden loop workflow internally', () => {
+    const mastra = createMastraWithDurableAgent();
+    expect(mastra.getWorkflowById(LOOP_ID)).toBeDefined();
+    expect(mastra.getWorkflowById(NOTIFICATION_DISPATCH_ID)).toBeDefined();
+    expect(Object.keys(mastra.listWorkflows())).not.toContain(LOOP_ID);
+  });
+
+  for (const workflowId of [LOOP_ID, NOTIFICATION_DISPATCH_ID]) {
+    for (const [name, route, params] of executionRoutes) {
+      it(`${name} returns 404 for hidden workflow "${workflowId}"`, async () => {
+        const mastra = createMastraWithDurableAgent();
+        await expect(
+          (route.handler as any)({ ...createTestServerContext({ mastra }), workflowId, ...params }),
+        ).rejects.toMatchObject({ status: 404, message: 'Workflow not found' });
+      });
+    }
+  }
+
+  it('still resolves user workflows alongside a durable agent', async () => {
+    const mastra = createMastraWithDurableAgent({ 'user-workflow': createMockWorkflow('user-workflow') });
+    const result = await CREATE_WORKFLOW_RUN_ROUTE.handler({
+      ...createTestServerContext({ mastra }),
+      workflowId: 'user-workflow',
+      runId: 'run-1',
+    } as any);
+    expect(result).toEqual({ runId: 'run-1' });
+  });
+
+  it('keeps a user workflow registered under the loop id resolvable', async () => {
+    const userWorkflow = createMockWorkflow(LOOP_ID);
+    const mastra = createMastraWithDurableAgent({ [LOOP_ID]: userWorkflow });
+    const result = await CREATE_WORKFLOW_RUN_ROUTE.handler({
+      ...createTestServerContext({ mastra }),
+      workflowId: LOOP_ID,
+      runId: 'run-1',
+    } as any);
+    expect(result).toEqual({ runId: 'run-1' });
   });
 });

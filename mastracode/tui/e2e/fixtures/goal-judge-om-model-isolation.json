@@ -14,6 +14,20 @@
       "match": {
         "endpoint": "chat",
         "model": "gpt-5.4-mini",
+        "userMessage": "Extract structured data from the observations you made"
+      },
+      "response": {
+        "content": {
+          "capture": {
+            "nodes": []
+          }
+        }
+      }
+    },
+    {
+      "match": {
+        "endpoint": "chat",
+        "model": "gpt-5.4-mini",
         "userMessage": "Prepare the goal judge OM isolation result",
         "sequenceIndex": 0
       },
@@ -64,8 +78,7 @@
       "match": {
         "endpoint": "chat",
         "model": "gpt-5.4-mini",
-        "userMessage": "Prepare the goal judge OM isolation result",
-        "sequenceIndex": 2
+        "userMessage": "I approve the goal judge OM isolation result."
       },
       "response": {
         "content": "Follow-up main response received; the approved goal is complete."

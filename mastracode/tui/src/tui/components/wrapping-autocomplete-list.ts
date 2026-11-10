@@ -1,14 +1,17 @@
 /**
  * Drop-in replacement for pi-tui's `SelectList` used by the editor's
  * slash-command / autocomplete dropdown. Behaves like `SelectList` (same
- * prefix, primary column, and description styling) but word-wraps long
- * descriptions across multiple terminal rows instead of truncating them on a
- * single line. Continuation rows are indented under the description column so
- * the full command/skill description stays readable without widening the
- * terminal.
+ * prefix, primary column, and description styling) but word-wraps the
+ * highlighted item's long description across multiple terminal rows instead
+ * of truncating it on a single line. Continuation rows are indented under the
+ * description column so the full description stays readable without widening
+ * the terminal. Non-highlighted items keep to a single row (description
+ * truncated with an ellipsis) so the dropdown stays compact and scannable
+ * even when many items have long descriptions.
  *
  * Arrow keys move item-to-item (not row-to-row), so navigation stays
- * predictable regardless of how many rows a description wraps onto.
+ * predictable regardless of how many rows the highlighted description wraps
+ * onto.
  */
 
 import { getKeybindings, truncateToWidth, visibleWidth, wrapTextWithAnsi } from '@earendil-works/pi-tui';
@@ -28,12 +31,14 @@ const normalizeToSingleLine = (text: string): string => text.replace(/[\r\n]+/g,
 const clamp = (value: number, min: number, max: number): number => Math.max(min, Math.min(value, max));
 
 export class WrappingAutocompleteList implements Component {
-  private items: SelectItem[];
   private filteredItems: SelectItem[];
   private selectedIndex = 0;
   private maxVisible: number;
   private theme: SelectListTheme;
   private layout: WrappingAutocompleteListLayout;
+  // Item index for each row of the last render (-1 for non-item rows), so a
+  // click on any wrapped row of an item resolves to that item.
+  private rowItems: number[] = [];
 
   onSelect?: (item: SelectItem) => void;
   onCancel?: () => void;
@@ -45,16 +50,10 @@ export class WrappingAutocompleteList implements Component {
     theme: SelectListTheme,
     layout: WrappingAutocompleteListLayout = {},
   ) {
-    this.items = items;
     this.filteredItems = items;
     this.maxVisible = maxVisible;
     this.theme = theme;
     this.layout = layout;
-  }
-
-  setFilter(filter: string): void {
-    this.filteredItems = this.items.filter(item => item.value.toLowerCase().startsWith(filter.toLowerCase()));
-    this.selectedIndex = 0;
   }
 
   setSelectedIndex(index: number): void {
@@ -69,9 +68,11 @@ export class WrappingAutocompleteList implements Component {
 
   render(width: number): string[] {
     const lines: string[] = [];
+    this.rowItems = [];
 
     if (this.filteredItems.length === 0) {
       lines.push(this.theme.noMatch('  No matching commands'));
+      this.rowItems.push(-1);
       return lines;
     }
 
@@ -89,15 +90,35 @@ export class WrappingAutocompleteList implements Component {
       const description = item.description ? normalizeToSingleLine(item.description) : undefined;
       for (const row of this.renderItem(item, isSelected, width, description, primaryColumnWidth)) {
         lines.push(row);
+        this.rowItems.push(i);
       }
     }
 
     if (startIndex > 0 || endIndex < this.filteredItems.length) {
       const scrollText = `  (${this.selectedIndex + 1}/${this.filteredItems.length})`;
       lines.push(this.theme.scrollInfo(truncateToWidth(scrollText, width - 2, '')));
+      this.rowItems.push(-1);
     }
 
     return lines;
+  }
+
+  /** Item index rendered at `row` of the last render, if that row belongs to an item. */
+  itemIndexAtRow(row: number): number | undefined {
+    const index = this.rowItems[row];
+    return index === undefined || index < 0 ? undefined : index;
+  }
+
+  /** First row and row count of `index` in the last render (the highlighted item can wrap). */
+  rowsOfItem(index: number): { first: number; count: number } | undefined {
+    const first = this.rowItems.indexOf(index);
+    if (first < 0) return undefined;
+    return { first, count: this.rowItems.lastIndexOf(index) - first + 1 };
+  }
+
+  /** Number of rows produced by the last render. */
+  get renderedRowCount(): number {
+    return this.rowItems.length;
   }
 
   handleInput(keyData: string): void {
@@ -137,23 +158,24 @@ export class WrappingAutocompleteList implements Component {
       const remainingWidth = width - descriptionStart - 2; // -2 for safety, mirrors SelectList
 
       if (remainingWidth > MIN_DESCRIPTION_WIDTH) {
-        // Wrap the description across rows instead of truncating it. The first
-        // row keeps the primary column; continuation rows indent under the
-        // description column so the wrapped text aligns.
+        if (!isSelected) {
+          // Non-highlighted items stay on a single row so the dropdown remains
+          // compact; long descriptions are truncated with an ellipsis.
+          const truncatedDescription = truncateToWidth(description, remainingWidth, '…');
+          return [prefix + truncatedValue + this.theme.description(spacing + truncatedDescription)];
+        }
+
+        // Wrap the highlighted item's description across rows instead of
+        // truncating it. The first row keeps the primary column; continuation
+        // rows indent under the description column so the wrapped text aligns.
         const wrapped = wrapTextWithAnsi(description, remainingWidth);
         const continuationIndent = ' '.repeat(descriptionStart);
 
         return wrapped.map((chunk, index) => {
           if (index === 0) {
-            if (isSelected) {
-              return this.theme.selectedText(`${prefix}${truncatedValue}${spacing}${chunk}`);
-            }
-            return prefix + truncatedValue + this.theme.description(spacing + chunk);
+            return this.theme.selectedText(`${prefix}${truncatedValue}${spacing}${chunk}`);
           }
-          if (isSelected) {
-            return this.theme.selectedText(`${continuationIndent}${chunk}`);
-          }
-          return this.theme.description(continuationIndent + chunk);
+          return this.theme.selectedText(`${continuationIndent}${chunk}`);
         });
       }
     }

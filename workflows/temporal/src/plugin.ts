@@ -2,9 +2,16 @@ import { readFileSync } from 'node:fs';
 import { writeFile } from 'node:fs/promises';
 import path from 'node:path';
 import { fileURLToPath, pathToFileURL } from 'node:url';
+import { RequestContext } from '@mastra/core/di';
+import { MastraError, getErrorFromUnknown } from '@mastra/core/error';
+import { toStandardSchema } from '@mastra/core/schema';
+import type { PublicSchema } from '@mastra/core/schema';
+import { validateStepInput, validateStepRequestContext } from '@mastra/core/workflows';
+import { ApplicationFailure, CancelledFailure } from '@temporalio/activity';
 import type { WorkerOptions, WorkerPlugin } from '@temporalio/worker';
 import type { TemporalActivityBinding } from './transforms/activities';
 import { buildTemporalActivitiesModule } from './transforms/activities';
+import type { StepFailureDetails } from './transforms/temporal-workflow-runtime';
 import { buildTemporalWorkflowModule } from './transforms/workflows';
 
 const CACHE_PATH = 'node_modules/.mastra';
@@ -24,12 +31,118 @@ function getActivityBindingsPath(outputDir: string): string {
   return path.join(outputDir, ACTIVITY_BINDINGS_FILE_NAME);
 }
 
+interface ActivityParams extends Record<string, unknown> {
+  inputData?: unknown;
+  requestContext?: Record<string, unknown>;
+  validateInputs?: boolean;
+}
+
+type GeneratedActivity = (params: ActivityParams) => Promise<unknown>;
+
+interface GeneratedStep {
+  execute: GeneratedActivity;
+  inputSchema?: PublicSchema;
+  requestContextSchema?: PublicSchema;
+}
+
+type GeneratedActivitiesModule = Record<string, GeneratedActivity | GeneratedStep | undefined>;
+
+/**
+ * Temporal reduces a thrown error to its class name and message, so the step's own fields go in
+ * the failure's `details` for start() to rebuild the result a local run returns.
+ */
+function toStepFailureDetails(error: unknown): StepFailureDetails {
+  const serialized = getErrorFromUnknown(error, { serializeStack: false }).toJSON();
+  let details: StepFailureDetails['error'];
+  try {
+    // The default payload converter throws on fields JSON cannot hold, such as a BigInt.
+    details = JSON.parse(JSON.stringify(serialized));
+  } catch {
+    details = { name: serialized.name, message: serialized.message };
+  }
+
+  // Matched by name because `instanceof` misses a TripWire from another copy of @mastra/core.
+  if (error instanceof Error && error.name === 'TripWire') {
+    const { options, processorId } = error as Error & {
+      options?: { retry?: boolean; metadata?: Record<string, unknown> };
+      processorId?: string;
+    };
+
+    return {
+      error: details,
+      tripwire: { reason: error.message, retry: options?.retry, metadata: options?.metadata, processorId },
+    };
+  }
+
+  return { error: details };
+}
+
+/** Fails as Temporal's own conversion would (same type, message and retries), plus the details. */
+async function runStep(execute: () => Promise<unknown>): Promise<unknown> {
+  try {
+    return await execute();
+  } catch (error) {
+    // A step's own ApplicationFailure and Temporal's cancellation pass through unchanged.
+    if (error instanceof ApplicationFailure || error instanceof CancelledFailure) {
+      throw error;
+    }
+
+    throw ApplicationFailure.fromError(error, { details: [toStepFailureDetails(error)] });
+  }
+}
+
+/**
+ * Activities queued by a Workflow built before `validateInputs` existed carry no flag and run
+ * unchecked. A mismatch is non-retryable because a retry gets the same input.
+ */
+async function checkStepParams(
+  stepId: string,
+  { inputSchema, requestContextSchema }: GeneratedStep,
+  { validateInputs, ...params }: ActivityParams,
+): Promise<ActivityParams> {
+  if (validateInputs !== true) {
+    return params;
+  }
+
+  const [input, requestContext] = await Promise.all([
+    validateStepInput({
+      prevOutput: params.inputData,
+      step: { inputSchema: inputSchema && toStandardSchema(inputSchema) },
+      validateInputs: true,
+    }),
+    validateStepRequestContext({
+      requestContext: new RequestContext(Object.entries(params.requestContext ?? {})),
+      step: { id: stepId, requestContextSchema: requestContextSchema && toStandardSchema(requestContextSchema) },
+      validateInputs: true,
+    }),
+  ]);
+
+  // Input errors win, as in Mastra's step handler.
+  const error = input.validationError ?? requestContext.validationError;
+
+  if (error) {
+    throw ApplicationFailure.create({
+      type: error instanceof MastraError ? error.id : error.name,
+      message: error.message,
+      nonRetryable: true,
+      cause: error,
+      details: [toStepFailureDetails(error)],
+    });
+  }
+
+  return { ...params, inputData: input.inputData };
+}
+
 export class MastraPlugin implements WorkerPlugin {
   #prebuildPath: string | null = null;
-  #compiledActivitiesModules = new Map<string, Promise<Record<string, unknown>>>();
+  #prebuildPromise: Promise<ReturnType<typeof this.getTemporalWorkerOptions>> | null = null;
+  #compiledActivitiesModules = new Map<string, Promise<GeneratedActivitiesModule>>();
   name = 'Mastra';
 
-  constructor() {}
+  constructor(
+    private readonly entryFile: string,
+    private readonly projectRoot: string = process.cwd(),
+  ) {}
 
   async #bundleMastra(entryFile: string, projectRoot: string, outputDirectory: string): Promise<string> {
     const { BuildBundler } = await import('./mastra-deployer');
@@ -44,6 +157,9 @@ export class MastraPlugin implements WorkerPlugin {
     return path.join(outputDirectory, 'output', 'index.mjs');
   }
 
+  /**
+   * @deprecated Please use the constructor params instead.
+   */
   async prebuild({
     entryFile,
     projectRoot = process.cwd(),
@@ -51,6 +167,10 @@ export class MastraPlugin implements WorkerPlugin {
     entryFile: string;
     projectRoot?: string;
   }): Promise<ReturnType<typeof this.getTemporalWorkerOptions>> {
+    return this.#prebuild(entryFile, projectRoot);
+  }
+
+  async #prebuild(entryFile: string, projectRoot: string): Promise<ReturnType<typeof this.getTemporalWorkerOptions>> {
     const temporalOutputDir = path.resolve(projectRoot, CACHE_PATH);
     const compiledEntryPath = await this.#bundleMastra(entryFile, projectRoot, temporalOutputDir);
 
@@ -79,15 +199,15 @@ export class MastraPlugin implements WorkerPlugin {
     }
   }
 
-  #loadCompiledActivitiesModule(activitiesModulePath: string): Promise<Record<string, unknown>> {
+  #loadCompiledActivitiesModule(activitiesModulePath: string): Promise<GeneratedActivitiesModule> {
     const cachedModule = this.#compiledActivitiesModules.get(activitiesModulePath);
     if (cachedModule) {
       return cachedModule;
     }
 
-    const modulePromise = import(`${pathToFileURL(activitiesModulePath).href}?t=${Date.now()}`) as Promise<
-      Record<string, unknown>
-    >;
+    const modulePromise = import(
+      `${pathToFileURL(activitiesModulePath).href}?t=${Date.now()}`
+    ) as Promise<GeneratedActivitiesModule>;
 
     this.#compiledActivitiesModules.set(activitiesModulePath, modulePromise);
     return modulePromise;
@@ -96,22 +216,29 @@ export class MastraPlugin implements WorkerPlugin {
   #generateActivityBindings(
     activityBindings: TemporalActivityBinding[],
     compiledActivitiesPath: string,
-  ): Record<string, (...args: unknown[]) => Promise<unknown>> {
-    const generatedActivities: Record<string, (...args: unknown[]) => Promise<unknown>> = {};
+  ): Record<string, GeneratedActivity> {
+    const generatedActivities: Record<string, GeneratedActivity> = {};
     for (const binding of activityBindings) {
       if (generatedActivities[binding.stepId]) {
         continue;
       }
 
-      generatedActivities[binding.stepId] = async (...args: unknown[]) => {
+      generatedActivities[binding.stepId] = async params => {
         const activityModule = await this.#loadCompiledActivitiesModule(compiledActivitiesPath);
         const activity = activityModule[binding.exportName];
 
-        if (typeof activity !== 'function') {
+        // Mappings are plain functions, and so are steps generated by an older plugin version.
+        // Those steps run unchecked.
+        if (typeof activity === 'function') {
+          return runStep(() => activity(params));
+        }
+
+        if (typeof activity?.execute !== 'function') {
           throw new Error(`Unable to load activity '${binding.exportName}' from ${compiledActivitiesPath}`);
         }
 
-        return activity(...args);
+        const checkedParams = await checkStepParams(binding.stepId, activity, params);
+        return runStep(() => activity.execute(checkedParams));
       };
     }
 
@@ -137,15 +264,23 @@ export class MastraPlugin implements WorkerPlugin {
     };
   }
 
-  configureWorker(options: WorkerOptions): WorkerOptions {
+  async configureWorker(options: WorkerOptions): Promise<WorkerOptions> {
     const augmentedOptions = Object.assign({}, options);
-    if (this.#prebuildPath) {
-      Object.assign(augmentedOptions, this.getTemporalWorkerOptions(this.#prebuildPath));
-    } else {
-      if (!options.workflowsPath || !options.activities) {
-        throw new Error('MastraPlugin.prebuild() must be called before use');
-      }
+    if (!this.#prebuildPath) {
+      this.#prebuildPromise ??= this.#prebuild(this.entryFile, this.projectRoot).catch(error => {
+        this.#prebuildPromise = null;
+        throw error;
+      });
+      await this.#prebuildPromise;
     }
+
+    const generatedOptions = this.getTemporalWorkerOptions(this.#prebuildPath!);
+    Object.assign(augmentedOptions, generatedOptions, {
+      activities: {
+        ...options.activities,
+        ...generatedOptions.activities,
+      },
+    });
 
     return augmentedOptions;
   }

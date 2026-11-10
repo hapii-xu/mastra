@@ -34,8 +34,14 @@ export { runLiveKitWorker } from './run';
 export type { RunLiveKitWorkerOptions } from './run';
 export { chatContextToMessages } from './messages';
 export type { VoiceTurnMessage } from './messages';
+// The `voice.Agent` subclass `createLiveKitWorker()` builds for every session. Exported so callers
+// who own their own `voice.AgentSession` (including `@livekit/agents` `voice.testing`) can construct
+// the same agent without standing up the worker.
+export { MastraVoiceAgent, createMastraVoiceAgent } from './bridge';
 export type {
+  MastraStreamOptions,
   MastraVoiceAgentMemory,
+  MastraVoiceAgentOptions,
   VoiceReplyGenerator,
   VoiceToolCall,
   VoiceTurnCompleteContext,
@@ -49,3 +55,19 @@ export type {
 // remote Mastra server). The `MastraLLM` plugin does not — import it from `@mastra/livekit/plugin`.
 export { createRemoteAgentReplyGenerator } from './remote';
 export type { RemoteMastraAgentOptions, RemoteAgentReplyGeneratorOptions } from './remote';
+
+export { observeVoiceSession, mastraLLMNode } from './speech';
+export type { ObserveVoiceSessionOptions } from './speech';
+export { VOICE_TEXT_FLUSH } from './turn-metrics';
+export type {
+  VoiceReplyChunk,
+  VoiceOutcome,
+  VoiceTurnIdentity,
+  VoiceToolTiming,
+  VoiceGenerationMetrics,
+  VoiceSpeechMetrics,
+  VoiceTurnMetrics,
+  VoiceTurnMetricsHook,
+  VoiceSpeechResult,
+  VoiceSpeechCompleteHook,
+} from './turn-metrics';

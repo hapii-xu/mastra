@@ -17,8 +17,8 @@ function getRequestContextValue(requestContext: unknown, key: string): unknown {
 }
 
 /**
- * Subset of the real `HarnessRequestContext` shape (see
- * packages/core/src/harness/types.ts). The mode is a string property
+ * Subset of the `AgentControllerRequestContext` the controller sets under the
+ * `controller` request-context key. The mode is a string property
  * (`session.modeId`) and live state is read via `session.state.get()`.
  */
 interface PlanModeGuardHarness {
@@ -30,7 +30,7 @@ interface PlanModeGuardHarness {
 
 function getHarnessContext(context: unknown): PlanModeGuardHarness | undefined {
   const requestContext = (context as { requestContext?: unknown } | undefined)?.requestContext;
-  const harness = getRequestContextValue(requestContext, 'harness');
+  const harness = getRequestContextValue(requestContext, 'controller');
   return harness && typeof harness === 'object' ? (harness as PlanModeGuardHarness) : undefined;
 }
 
@@ -49,44 +49,93 @@ function getHarnessProjectPath(harness: PlanModeGuardHarness | undefined): strin
   return typeof projectPath === 'string' ? projectPath : undefined;
 }
 
+function getHarnessFactoryProjectId(harness: PlanModeGuardHarness | undefined): string | undefined {
+  const factoryProjectId = getHarnessState(harness)?.factoryProjectId;
+  return typeof factoryProjectId === 'string' ? factoryProjectId : undefined;
+}
+
 function getToolInputPath(input: unknown): string | undefined {
   const toolPath = (input as { path?: unknown } | undefined)?.path;
   return typeof toolPath === 'string' ? toolPath : undefined;
 }
 
-const PLAN_DIR_HINT = `${getLocalPlansRelativeDir()}/`;
+/** Plan-mode write guard; `plansDir` is the host-configured plans directory, if any. */
+export function createPlanModePlanFileWriteGuard(plansDir?: string) {
+  return (hookContext: WorkspaceToolHookContext) => guardPlanFileWrite(hookContext, plansDir);
+}
 
-export function guardPlanModePlanFileWrites({ workspaceToolName, input, context }: WorkspaceToolHookContext) {
+export const guardPlanModePlanFileWrites = createPlanModePlanFileWriteGuard();
+
+function guardPlanFileWrite({ workspaceToolName, input, context }: WorkspaceToolHookContext, plansDir?: string) {
   if (!PLAN_MODE_WRITE_TOOL_NAMES.has(workspaceToolName)) return;
 
   const harness = getHarnessContext(context);
   if (getHarnessModeId(harness) !== 'plan') return;
 
+  const factoryProjectId = getHarnessFactoryProjectId(harness);
+  const planOptions = { factoryProjectId, plansDir };
+  const planDirHint = `${getLocalPlansRelativeDir(planOptions)}/`;
   const projectPath = getHarnessProjectPath(harness);
   const inputPath = getToolInputPath(input);
   if (!projectPath || !inputPath) {
     return {
       proceed: false as const,
-      output: `Plan mode can only write plan files inside ${PLAN_DIR_HINT}.`,
+      output: `Plan mode can only write plan files inside ${planDirHint}.`,
     };
   }
 
-  // Plan mode may write any `.md` file directly inside `.mastracode/plans/`, but
-  // nothing else in the project.
-  if (isPlanFilePath(projectPath, inputPath)) return;
+  // Plan mode may write any `.md` file directly inside the configured plan directory,
+  // but nothing else in the project.
+  if (isPlanFilePath(projectPath, inputPath, planOptions)) return;
 
   return {
     proceed: false as const,
-    output: `Plan mode can only write plan files inside ${PLAN_DIR_HINT}. Refusing to edit ${inputPath}.`,
+    output: `Plan mode can only write plan files inside ${planDirHint}. Refusing to edit ${inputPath}.`,
   };
 }
 
-export const MASTRACODE_WORKSPACE_TOOLS: WorkspaceToolsConfig = {
-  ...TOOL_NAME_OVERRIDES,
-  hooks: {
-    beforeToolCall: guardPlanModePlanFileWrites,
-  },
-};
+const BACKGROUND_TOOL_CONFIG = { enabled: true, defaultDisposition: 'foreground' } as const;
+
+export function createMastraCodeWorkspaceTools(
+  backgroundToolsEnabled = false,
+  plansDir?: string,
+): WorkspaceToolsConfig {
+  const background = backgroundToolsEnabled ? BACKGROUND_TOOL_CONFIG : undefined;
+  return {
+    ...TOOL_NAME_OVERRIDES,
+    // The TUI shows this description in place of the raw command.
+    [WORKSPACE_TOOLS.SANDBOX.EXECUTE_COMMAND]: {
+      ...TOOL_NAME_OVERRIDES[WORKSPACE_TOOLS.SANDBOX.EXECUTE_COMMAND],
+      requireDescription: true,
+    },
+    [WORKSPACE_TOOLS.FILESYSTEM.READ_FILE]: {
+      ...TOOL_NAME_OVERRIDES[WORKSPACE_TOOLS.FILESYSTEM.READ_FILE],
+      ...(background ? { background } : {}),
+    },
+    [WORKSPACE_TOOLS.FILESYSTEM.LIST_FILES]: {
+      ...TOOL_NAME_OVERRIDES[WORKSPACE_TOOLS.FILESYSTEM.LIST_FILES],
+      ...(background ? { background } : {}),
+    },
+    [WORKSPACE_TOOLS.FILESYSTEM.FILE_STAT]: {
+      ...TOOL_NAME_OVERRIDES[WORKSPACE_TOOLS.FILESYSTEM.FILE_STAT],
+      ...(background ? { background } : {}),
+    },
+    [WORKSPACE_TOOLS.FILESYSTEM.GREP]: {
+      ...TOOL_NAME_OVERRIDES[WORKSPACE_TOOLS.FILESYSTEM.GREP],
+      ...(background ? { background } : {}),
+    },
+    [WORKSPACE_TOOLS.LSP.LSP_INSPECT]: {
+      ...TOOL_NAME_OVERRIDES[WORKSPACE_TOOLS.LSP.LSP_INSPECT],
+      ...(background ? { background } : {}),
+    },
+    hooks: {
+      beforeToolCall: createPlanModePlanFileWriteGuard(plansDir),
+    },
+  };
+}
+
+/** Default foreground-only configuration for consumers without Mastra Code settings. */
+export const MASTRACODE_WORKSPACE_TOOLS = createMastraCodeWorkspaceTools();
 
 export const PLAN_MODE_AVAILABLE_TOOLS: readonly string[] = [
   // Read-only exploration tools
@@ -96,7 +145,7 @@ export const PLAN_MODE_AVAILABLE_TOOLS: readonly string[] = [
   MC_TOOLS.FILE_STAT,
   MC_TOOLS.LSP_INSPECT,
   // Plan file writing. Tool hooks enforce that these can only write `.md`
-  // files inside `.mastracode/plans/` while the session is in plan mode.
+  // files inside the session's configured plan directory while in plan mode.
   MC_TOOLS.WRITE_FILE,
   MC_TOOLS.STRING_REPLACE_LSP,
   // Plan delivery tools
@@ -109,6 +158,9 @@ export const PLAN_MODE_AVAILABLE_TOOLS: readonly string[] = [
   'task_check',
   // Notification access
   MC_TOOLS.NOTIFICATION_INBOX,
+  // Read-only workflow inspection (no create/run/delete in plan mode).
+  'list-workflows',
+  'get-workflow',
 ];
 
 export const EXPLORE_MODE_AVAILABLE_TOOLS: readonly string[] = [
@@ -118,6 +170,9 @@ export const EXPLORE_MODE_AVAILABLE_TOOLS: readonly string[] = [
   MC_TOOLS.FILE_STAT,
   MC_TOOLS.LSP_INSPECT,
   'ask_user',
+  // Read-only workflow inspection (no create/run/delete in fast mode either).
+  'list-workflows',
+  'get-workflow',
 ];
 
 export const GOAL_JUDGE_READONLY_TOOLS: readonly string[] = [

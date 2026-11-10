@@ -1,6 +1,6 @@
 ---
 title: "Reference: Run.resume() | Workflows"
-description: Documentation for the `Run.resume()` method in workflows, which resumes a suspended workflow run with new data.
+description: "The .resume() method resumes a suspended workflow run with new data, allowing you to continue execution from a specific step."
 packages:
   - "@mastra/core"
 ---
@@ -37,7 +37,7 @@ if (result.status === 'suspended') {
     name: 'step',
     type: 'Step<string, any, any, TResumeSchema, any, TEngineType> | [...Step<string, any, any, any, any, TEngineType>[], Step<string, any, any, TResumeSchema, any, TEngineType>] | string | string[]',
     description:
-      'The step(s) to resume execution from. Can be a Step instance, array of Steps, step ID string, or array of step ID strings',
+      'The step(s) to resume execution from. Can be a Step instance, array of Steps, step ID string, or a step path (an array of step IDs, such as an entry of `result.suspended`)',
     isOptional: true,
   },
   {
@@ -88,6 +88,13 @@ if (result.status === 'suspended') {
       {
         parameters: [
           {
+            name: 'rootSpanName',
+            type: 'string',
+            isOptional: true,
+            description:
+              "Display name for the root span of this trace, replacing the default `workflow run: '<id>'` or `agent run: '<id>'` name. Use it to tell runs apart in trace lists.",
+          },
+          {
             name: 'metadata',
             type: 'Record<string, any>',
             isOptional: true,
@@ -132,6 +139,17 @@ if (result.status === 'suspended') {
       {
         parameters: [
           {
+            name: 'nestUnderParent',
+            type: 'boolean',
+            isOptional: true,
+            description:
+              "Set to `true` together with `parentSpanId` to attach this run as a child of that span inside the existing trace, for example an LLM judge under the run it scores. Exporters then keep the trace's own name, input, output, and tags. Leave unset when `parentSpanId` comes from your own tracing system. Ignored without a valid `traceId` and `parentSpanId`.",
+          },
+        ],
+      },
+      {
+        parameters: [
+          {
             name: 'tags',
             type: 'string[]',
             isOptional: true,
@@ -168,7 +186,7 @@ if (result.status === 'suspended') {
   content={[
   {
     name: 'result',
-    type: 'Promise<WorkflowResult<TState, TOutput, TSteps>>',
+    type: 'Promise<WorkflowResult<TState, TInput, TOutput, TSteps>>',
     description: 'A promise that resolves to the workflow execution result containing step outputs and status',
   },
   {
@@ -226,6 +244,33 @@ await run.resume({
 ```
 
 If `forEachIndex` is omitted, every suspended iteration of the step is resumed with the same `resumeData`.
+
+## Concurrent resume calls
+
+Only one `resume()` call can continue a suspension. Before it runs anything, `resume()` atomically claims the run by moving its stored status from `suspended` to `running`. If another caller already claimed it, this call throws `WORKFLOW_RESUME_ALREADY_CLAIMED` and executes no steps, so downstream steps and their side effects run once per suspension.
+
+This matters whenever a resume can be triggered more than once, such as an approval button pressed twice or a retried webhook. It also applies when several server instances react to the same event.
+
+```typescript
+try {
+  await run.resume({ step: 'approval', resumeData: { approved: true } })
+} catch (error) {
+  if (error.id === 'WORKFLOW_RESUME_ALREADY_CLAIMED') {
+    // Another caller is already continuing this run. Re-read the run state
+    // instead of resuming again.
+  }
+}
+```
+
+Over HTTP, a losing resume returns `409 Conflict`.
+
+[`timeTravel()`](./timeTravel#concurrent-time-travel-calls) claims the run the same way and throws `WORKFLOW_TIME_TRAVEL_ALREADY_CLAIMED` when it loses.
+
+:::note
+
+The claim is enforced atomically by storage adapters that report `supportsConcurrentUpdates()`. Adapters without atomic read-modify-write support (such as ClickHouse, Cloudflare D1, Cloudflare KV, Cloudflare Durable Objects, LanceDB, and Redis) can't enforce it, and the claim is also skipped when `shouldPersistSnapshot` excludes the `running` status.
+
+:::
 
 ## Related
 

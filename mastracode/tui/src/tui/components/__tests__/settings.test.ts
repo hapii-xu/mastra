@@ -100,12 +100,19 @@ function createConfig(overrides: Partial<SettingsConfig> = {}): SettingsConfig {
     thinkingLevel: 'off',
     currentModelId: 'openai/gpt-5.4-mini',
     escapeAsCancel: false,
-    quietMode: false,
-    quietModeMaxToolPreviewLines: 2,
+    mouse: { dialogs: false, input: false },
+    previewLines: 2,
     storageBackend: 'libsql',
     pgConnectionString: '',
     libsqlUrl: '',
     experimentalGithubSignals: false,
+    experimentalCrossAgentSignals: false,
+    experimentalScheduleTools: false,
+    experimentalAgent: null,
+    backgroundToolsEnabled: false,
+    webSearchProvider: 'auto',
+    tavilyKeyAvailable: false,
+    parallelKeyAvailable: false,
     ...overrides,
   };
 }
@@ -116,10 +123,15 @@ function createCallbacks(overrides: Partial<SettingsCallbacks> = {}): SettingsCa
     onYoloChange: vi.fn(),
     onThinkingLevelChange: vi.fn(),
     onEscapeAsCancelChange: vi.fn(),
-    onQuietModeChange: vi.fn(),
-    onQuietModeMaxToolPreviewLinesChange: vi.fn(),
+    onMouseChange: vi.fn(),
+    onPreviewLinesChange: vi.fn(),
     onStorageBackendChange: vi.fn(),
     onExperimentalGithubSignalsChange: vi.fn(),
+    onExperimentalCrossAgentSignalsChange: vi.fn(),
+    onExperimentalScheduleToolsChange: vi.fn(),
+    onExperimentalAgentChange: vi.fn(),
+    onBackgroundToolsChange: vi.fn(),
+    onWebSearchProviderChange: vi.fn(),
     onClose: vi.fn(),
     ...overrides,
   };
@@ -192,5 +204,168 @@ describe('SettingsComponent storage backend submenu', () => {
     expect(config.storageBackend).toBe('libsql');
     expect(config.pgConnectionString).toBe('');
     expect(done).toHaveBeenCalledWith();
+  });
+});
+
+describe('SettingsComponent experimental agent submenu', () => {
+  it.each([
+    [null, 'Off', 0, 'durable', 'Durable'],
+    ['durable', 'Durable', 1, 'evented', 'Evented'],
+    ['evented', 'Evented', 2, 'off', 'Off'],
+  ] as const)(
+    'displays and changes the saved setting from %s',
+    async (agent, label, selectedIndex, next, nextLabel) => {
+      const config = createConfig({ experimentalAgent: agent });
+      const callbacks = createCallbacks();
+      new SettingsComponent(config, callbacks);
+      const item = mocks.lastSettingsList.items.find((setting: { id: string }) => setting.id === 'experimentalAgent');
+      expect(item.label).toBe('Experimental agent');
+      expect(item.currentValue).toBe(label);
+      expect(item.description).toContain('restart required');
+      const done = vi.fn();
+      item.submenu('', done);
+      const select = mocks.selectLists.at(-1);
+      expect(select.selectedIndex).toBe(selectedIndex);
+      await select.onSelect({ value: next });
+      expect(callbacks.onExperimentalAgentChange).toHaveBeenCalledWith(next === 'off' ? null : next);
+      expect(config.experimentalAgent).toBe(next === 'off' ? null : next);
+      expect(done).toHaveBeenCalledWith(nextLabel);
+    },
+  );
+
+  it('does not change the setting when the submenu is cancelled', () => {
+    const callbacks = createCallbacks();
+    new SettingsComponent(createConfig(), callbacks);
+    const item = mocks.lastSettingsList.items.find((setting: { id: string }) => setting.id === 'experimentalAgent');
+    const done = vi.fn();
+    item.submenu('', done);
+    mocks.selectLists.at(-1).onCancel();
+    expect(callbacks.onExperimentalAgentChange).not.toHaveBeenCalled();
+    expect(done).toHaveBeenCalledWith();
+  });
+});
+
+describe('SettingsComponent background tools submenu', () => {
+  it.each([false, true])('displays and changes the saved setting from %s', async enabled => {
+    const config = createConfig({ backgroundToolsEnabled: enabled });
+    const callbacks = createCallbacks();
+    new SettingsComponent(config, callbacks);
+    const item = mocks.lastSettingsList.items.find(
+      (setting: { id: string }) => setting.id === 'backgroundToolsEnabled',
+    );
+    expect(item.label).toBe('Experimental background tools');
+    expect(item.currentValue).toBe(enabled ? 'On' : 'Off');
+    expect(item.description).toContain('restart required');
+    const done = vi.fn();
+    item.submenu('', done);
+    const select = mocks.selectLists.at(-1);
+    expect(select.selectedIndex).toBe(enabled ? 0 : 1);
+    await select.onSelect({ value: enabled ? 'off' : 'on' });
+    expect(callbacks.onBackgroundToolsChange).toHaveBeenCalledWith(!enabled);
+    expect(config.backgroundToolsEnabled).toBe(!enabled);
+    expect(done).toHaveBeenCalledWith(enabled ? 'Off' : 'On');
+  });
+
+  it('does not change the setting when the submenu is cancelled', () => {
+    const callbacks = createCallbacks();
+    new SettingsComponent(createConfig(), callbacks);
+    const item = mocks.lastSettingsList.items.find(
+      (setting: { id: string }) => setting.id === 'backgroundToolsEnabled',
+    );
+    const done = vi.fn();
+    item.submenu('', done);
+    mocks.selectLists.at(-1).onCancel();
+    expect(callbacks.onBackgroundToolsChange).not.toHaveBeenCalled();
+    expect(done).toHaveBeenCalledWith();
+  });
+});
+
+describe('SettingsComponent mouse submenu', () => {
+  const choices = [
+    { value: 'off', label: 'Off', mouse: { dialogs: false, input: false } },
+    { value: 'dialogs', label: 'Dialogs only', mouse: { dialogs: true, input: false } },
+    { value: 'input', label: 'Input box only', mouse: { dialogs: false, input: true } },
+    { value: 'all', label: 'Dialogs + input box', mouse: { dialogs: true, input: true } },
+  ];
+
+  function openMouseSubmenu(mouse: { dialogs: boolean; input: boolean }) {
+    const config = createConfig({ mouse });
+    const callbacks = createCallbacks();
+    new SettingsComponent(config, callbacks);
+    const item = mocks.lastSettingsList.items.find((setting: { id: string }) => setting.id === 'mouse');
+    const done = vi.fn();
+    item.submenu('', done);
+    return { config, callbacks, item, done, select: mocks.selectLists.at(-1) };
+  }
+
+  it.each(choices)('shows "$label" for the saved preferences and highlights it', ({ value, label, mouse }) => {
+    const { item, select } = openMouseSubmenu(mouse);
+    expect(item.currentValue).toBe(label);
+    expect(select.items[select.selectedIndex].value).toBe(value);
+  });
+
+  it.each(choices)('saves "$label" as the matching dialogs and input preferences', async ({ value, label, mouse }) => {
+    const { config, callbacks, done, select } = openMouseSubmenu({ dialogs: false, input: false });
+    await select.onSelect({ value });
+    expect(config.mouse).toEqual(mouse);
+    expect(callbacks.onMouseChange).toHaveBeenCalledWith(mouse);
+    expect(done).toHaveBeenCalledWith(label);
+  });
+
+  it('does not change the setting when the submenu is cancelled', () => {
+    const { config, callbacks, done, select } = openMouseSubmenu({ dialogs: true, input: false });
+    select.onCancel();
+    expect(callbacks.onMouseChange).not.toHaveBeenCalled();
+    expect(config.mouse).toEqual({ dialogs: true, input: false });
+    expect(done).toHaveBeenCalledWith();
+  });
+});
+
+describe('SettingsComponent web search provider submenu', () => {
+  beforeEach(() => {
+    mocks.lastSettingsList = undefined;
+    mocks.selectLists = [];
+  });
+
+  function openWebSearchSubmenu(config = createConfig(), callbacks = createCallbacks()) {
+    new SettingsComponent(config, callbacks);
+    const item = mocks.lastSettingsList?.items.find((setting: { id: string }) => setting.id === 'webSearchProvider');
+    if (!item?.submenu) throw new Error('Expected web search provider submenu');
+
+    const done = vi.fn();
+    item.submenu('', done);
+    const select = mocks.selectLists.at(-1);
+    if (!select) throw new Error('Expected provider select list');
+    return { config, callbacks, done, select };
+  }
+
+  it('always lists all providers, marking those missing their API key', () => {
+    const { select } = openWebSearchSubmenu(createConfig({ tavilyKeyAvailable: true }));
+    expect(select.items.map((i: { value: string }) => i.value)).toEqual(['auto', 'tavily', 'parallel']);
+    expect(select.items[1].label).toBe('  Tavily');
+    expect(select.items[2].label).toBe('  Parallel (unavailable)');
+    expect(select.items[2].description).toContain('PARALLEL_API_KEY');
+  });
+
+  it('persists the choice when the provider key is configured', () => {
+    const { config, callbacks, done, select } = openWebSearchSubmenu(
+      createConfig({ tavilyKeyAvailable: true, parallelKeyAvailable: true }),
+    );
+
+    select.onSelect?.({ value: 'parallel' });
+
+    expect(callbacks.onWebSearchProviderChange).toHaveBeenCalledWith('parallel');
+    expect(config.webSearchProvider).toBe('parallel');
+    expect(done).toHaveBeenCalledWith('Parallel');
+  });
+
+  it('ignores selecting a provider whose API key is missing', () => {
+    const { config, callbacks, done, select } = openWebSearchSubmenu();
+
+    select.onSelect?.({ value: 'tavily' });
+
+    expect(callbacks.onWebSearchProviderChange).not.toHaveBeenCalled();
+    expect(config.webSearchProvider).toBe('auto');
+    expect(done).not.toHaveBeenCalled();
   });
 });

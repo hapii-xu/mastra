@@ -5,19 +5,23 @@ import { join } from 'node:path';
 
 import { Box, Spacer, Text, matchesKey } from '@earendil-works/pi-tui';
 import type { TUI } from '@earendil-works/pi-tui';
-import type { StorageBackend, ThinkingLevelSetting } from '@mastra/code-sdk/onboarding/settings';
+import type { ExperimentalAgent, StorageBackend, ThinkingLevelSetting } from '@mastra/code-sdk/onboarding/settings';
 import { loadSettings, saveSettings } from '@mastra/code-sdk/onboarding/settings';
 import { SettingsComponent } from '../components/settings.js';
-import type { IToolExecutionComponent } from '../components/tool-execution-interface.js';
 import { askModalQuestion } from '../modal-question.js';
 import type { NotificationMode } from '../notify.js';
 import { showModalOverlay } from '../overlay.js';
+import { applyPreviewLinesToRenderedComponents } from '../preview-lines.js';
 import { handleApiKeysCommand } from './api-keys.js';
 import type { SlashCommandContext } from './types.js';
 
 function getCurrentModeColor(ctx: SlashCommandContext): string | undefined {
   const color = ctx.state.session.mode.resolve().metadata?.color;
   return typeof color === 'string' ? color : undefined;
+}
+
+function resolveExperimentalAgentSetting(value: unknown): ExperimentalAgent | null {
+  return value === 'durable' || value === 'evented' ? value : null;
 }
 
 function commandExists(command: string): Promise<boolean> {
@@ -175,35 +179,36 @@ async function ensureGitcrawlReady(ctx: SlashCommandContext): Promise<boolean> {
   }
 }
 
-function applyQuietModeToRenderedTools(ctx: SlashCommandContext, enabled: boolean, previewLineLimit: number): void {
-  const tools = ctx.state.allToolComponents.filter(
-    (tool): tool is IToolExecutionComponent => typeof tool.setQuietModeDisplay === 'function',
-  );
-
-  tools.forEach(tool => {
-    tool.setCompactToolModeColor?.(getCurrentModeColor(ctx));
-    tool.setQuietModeDisplay?.(enabled ? 'quiet' : 'normal');
-    tool.setQuietPreviewLineLimit?.(previewLineLimit);
-  });
-
-  ctx.state.ui.requestRender();
-}
-
 export async function handleSettingsCommand(ctx: SlashCommandContext): Promise<void> {
   const state = ctx.state.session.state.get() as any;
   const globalSettings = loadSettings();
   const config = {
     notifications: (state?.notifications ?? 'off') as NotificationMode,
     yolo: state?.yolo === true,
-    thinkingLevel: (state?.thinkingLevel ?? 'off') as string,
+    thinkingLevel: (state?.thinkingLevel ?? globalSettings.preferences.thinkingLevel) as string,
     currentModelId: ctx.state.session.model.get() ?? '',
     escapeAsCancel: ctx.state.editor.escapeEnabled,
-    quietMode: globalSettings.preferences.quietMode,
-    quietModeMaxToolPreviewLines: globalSettings.preferences.quietModeMaxToolPreviewLines,
+    mouse: { dialogs: globalSettings.preferences.mouseDialogs, input: globalSettings.preferences.mouseInput },
+    previewLines: globalSettings.preferences.previewLines,
     storageBackend: globalSettings.storage.backend,
     pgConnectionString: globalSettings.storage.pg?.connectionString ?? '',
     libsqlUrl: globalSettings.storage.libsql?.url ?? '',
     experimentalGithubSignals: globalSettings.signals.experimentalGithubSignals,
+    experimentalCrossAgentSignals: globalSettings.signals.experimentalCrossAgentSignals,
+    experimentalScheduleTools: globalSettings.signals.experimentalScheduleTools,
+    experimentalKnowledge: globalSettings.signals.experimentalKnowledge,
+    experimentalAgent: resolveExperimentalAgentSetting(globalSettings.experimentalAgent),
+    backgroundToolsEnabled: globalSettings.backgroundTools?.enabled ?? false,
+    // Display an explicit provider choice as Auto while its API key is missing,
+    // matching the runtime resolver's fallback. The saved preference is kept so
+    // the choice comes back when the key does.
+    webSearchProvider:
+      (globalSettings.preferences.webSearchProvider === 'tavily' && !process.env.TAVILY_API_KEY) ||
+      (globalSettings.preferences.webSearchProvider === 'parallel' && !process.env.PARALLEL_API_KEY)
+        ? 'auto'
+        : globalSettings.preferences.webSearchProvider,
+    tavilyKeyAvailable: !!process.env.TAVILY_API_KEY,
+    parallelKeyAvailable: !!process.env.PARALLEL_API_KEY,
   };
 
   return new Promise<void>(resolve => {
@@ -216,7 +221,9 @@ export async function handleSettingsCommand(ctx: SlashCommandContext): Promise<v
         await ctx.state.session.state.set({ yolo: enabled } as any);
       },
       onThinkingLevelChange: async level => {
-        await ctx.state.session.state.set({ thinkingLevel: level } as any);
+        // Global default only — session overrides are managed via /think.
+        // Resolution happens at request time, so this applies immediately to
+        // any session without its own override.
         const current = loadSettings();
         current.preferences.thinkingLevel = level as ThinkingLevelSetting;
         saveSettings(current);
@@ -226,21 +233,21 @@ export async function handleSettingsCommand(ctx: SlashCommandContext): Promise<v
         await ctx.state.session.state.set({ escapeAsCancel: enabled });
         await ctx.state.session.thread.setSetting({ key: 'escapeAsCancel', value: enabled });
       },
-      onQuietModeChange: enabled => {
+      onMouseChange: ({ dialogs, input }) => {
         const current = loadSettings();
-        current.preferences.quietMode = enabled;
-        current.onboarding.quietModePreferenceSelected = true;
+        current.preferences.mouseDialogs = dialogs;
+        current.preferences.mouseInput = input;
         saveSettings(current);
-        ctx.state.quietMode = enabled;
-        ctx.state.taskProgress?.setQuietMode(enabled);
-        applyQuietModeToRenderedTools(ctx, enabled, ctx.state.quietModeMaxToolPreviewLines);
+        ctx.state.mouseController?.setDialogMouseEnabled(dialogs);
+        ctx.state.mouseController?.setInputMouseModeEnabled(input);
       },
-      onQuietModeMaxToolPreviewLinesChange: lines => {
+      onPreviewLinesChange: lines => {
         const current = loadSettings();
-        current.preferences.quietModeMaxToolPreviewLines = lines;
+        current.preferences.previewLines = lines;
         saveSettings(current);
-        ctx.state.quietModeMaxToolPreviewLines = lines;
-        applyQuietModeToRenderedTools(ctx, ctx.state.quietMode, lines);
+        ctx.state.previewLines = lines;
+        applyPreviewLinesToRenderedComponents(ctx.state, lines, getCurrentModeColor(ctx));
+        ctx.state.ui.requestRender();
       },
       onStorageBackendChange: (backend: StorageBackend, connectionUrl?: string) => {
         const current = loadSettings();
@@ -255,7 +262,8 @@ export async function handleSettingsCommand(ctx: SlashCommandContext): Promise<v
         ctx.stop();
         const label = backend === 'pg' ? 'PostgreSQL' : 'LibSQL';
         console.info(`\nStorage backend changed to ${label}. Restarting is required.\n`);
-        process.exit(0);
+        if (ctx.exit) ctx.exit(0);
+        else process.exit(0);
       },
       onExperimentalGithubSignalsChange: async enabled => {
         if (enabled && !(await ensureGitcrawlReady(ctx))) return false;
@@ -264,6 +272,43 @@ export async function handleSettingsCommand(ctx: SlashCommandContext): Promise<v
         saveSettings(current);
         ctx.showInfo(`Experimental GitHub signals: ${enabled ? 'on' : 'off'} (restart required)`);
         return true;
+      },
+      onExperimentalCrossAgentSignalsChange: enabled => {
+        const current = loadSettings();
+        current.signals.experimentalCrossAgentSignals = enabled;
+        saveSettings(current);
+        ctx.showInfo(`Experimental cross-agent communication: ${enabled ? 'on' : 'off'} (restart required)`);
+        return true;
+      },
+      onExperimentalScheduleToolsChange: enabled => {
+        const current = loadSettings();
+        current.signals.experimentalScheduleTools = enabled;
+        saveSettings(current);
+        ctx.showInfo(`Experimental schedule tools: ${enabled ? 'on' : 'off'} (restart required)`);
+      },
+      onExperimentalKnowledgeChange: enabled => {
+        const current = loadSettings();
+        current.signals.experimentalKnowledge = enabled;
+        saveSettings(current);
+        ctx.showInfo(`Experimental Knowledge: ${enabled ? 'on' : 'off'} (restart required)`);
+      },
+      onExperimentalAgentChange: (agent: ExperimentalAgent | null) => {
+        const current = loadSettings();
+        current.experimentalAgent = agent;
+        saveSettings(current);
+        ctx.showInfo(`Experimental agent: ${agent ?? 'off'} (restart required)`);
+      },
+      onBackgroundToolsChange: enabled => {
+        const current = loadSettings();
+        current.backgroundTools = { ...current.backgroundTools, enabled };
+        saveSettings(current);
+        ctx.showInfo(`Experimental background tools: ${enabled ? 'on' : 'off'} (restart required)`);
+      },
+      onWebSearchProviderChange: provider => {
+        const current = loadSettings();
+        current.preferences.webSearchProvider = provider;
+        saveSettings(current);
+        ctx.showInfo(`Web search provider: ${provider}`);
       },
       onApiKeys: () => {
         ctx.state.ui.hideOverlay();

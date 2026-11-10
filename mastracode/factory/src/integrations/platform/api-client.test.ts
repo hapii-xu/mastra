@@ -15,9 +15,11 @@ afterEach(() => {
 });
 
 describe('PlatformApiClient', () => {
-  it('resolves config from MASTRA_SHARED_API_URL and normalizes the /v1 root', () => {
-    vi.stubEnv('MASTRA_SHARED_API_URL', 'https://platform.example.com/v1/');
+  it('resolves config from MASTRA_INTEGRATIONS_API_URL and normalizes the endpoint root', () => {
+    vi.stubEnv('MASTRA_INTEGRATIONS_API_URL', 'https://platform.example.com/');
+    vi.stubEnv('MASTRA_PLATFORM_ACCESS_TOKEN', '');
     vi.stubEnv('MASTRA_PLATFORM_SECRET_KEY', accessToken);
+    vi.stubEnv('MASTRA_PROJECT_ID', '');
 
     expect(platformApiClientConfigFromEnv()).toEqual({
       baseUrl: 'https://platform.example.com',
@@ -25,20 +27,111 @@ describe('PlatformApiClient', () => {
     });
   });
 
-  it('defaults shared API config to platform.mastra.ai and requires a secret key', () => {
-    vi.stubEnv('MASTRA_SHARED_API_URL', '');
-    vi.stubEnv('MASTRA_PLATFORM_SECRET_KEY', accessToken);
-    expect(platformApiClientConfigFromEnv()).toMatchObject({ baseUrl: 'https://platform.mastra.ai' });
-
-    vi.stubEnv('MASTRA_PLATFORM_SECRET_KEY', '');
+  it('strips a trailing /v1 from MASTRA_INTEGRATIONS_API_URL so versioned paths do not duplicate', () => {
+    vi.stubEnv('MASTRA_INTEGRATIONS_API_URL', 'https://platform.example.com/v1');
     vi.stubEnv('MASTRA_PLATFORM_ACCESS_TOKEN', '');
-    expect(() => platformApiClientConfigFromEnv()).toThrow(/MASTRA_PLATFORM_SECRET_KEY/);
+    vi.stubEnv('MASTRA_PLATFORM_SECRET_KEY', accessToken);
+    vi.stubEnv('MASTRA_PROJECT_ID', '');
+
+    expect(platformApiClientConfigFromEnv()).toEqual({
+      baseUrl: 'https://platform.example.com',
+      accessToken,
+    });
   });
 
-  it('requires MASTRA_PLATFORM_SECRET_KEY even when the deprecated access token is set', () => {
+  it('defaults config to integrations.mastra.ai and requires a platform credential', () => {
+    vi.stubEnv('MASTRA_INTEGRATIONS_API_URL', '');
+    vi.stubEnv('MASTRA_PLATFORM_ACCESS_TOKEN', '');
+    vi.stubEnv('MASTRA_PLATFORM_SECRET_KEY', accessToken);
+    expect(platformApiClientConfigFromEnv()).toMatchObject({ baseUrl: 'https://integrations.mastra.ai' });
+
     vi.stubEnv('MASTRA_PLATFORM_SECRET_KEY', '');
-    vi.stubEnv('MASTRA_PLATFORM_ACCESS_TOKEN', 'legacy-token');
-    expect(() => platformApiClientConfigFromEnv()).toThrow(/MASTRA_PLATFORM_SECRET_KEY/);
+    expect(() => platformApiClientConfigFromEnv()).toThrow(/MASTRA_PLATFORM_ACCESS_TOKEN/);
+  });
+
+  it('resolves to the US integrations replica when MASTRA_PLATFORM_REGION is us', () => {
+    vi.stubEnv('MASTRA_INTEGRATIONS_API_URL', '');
+    vi.stubEnv('MASTRA_PLATFORM_SECRET_KEY', accessToken);
+    vi.stubEnv('MASTRA_PLATFORM_REGION', 'us');
+    expect(platformApiClientConfigFromEnv()).toMatchObject({ baseUrl: 'https://integrations.us.mastra.ai' });
+  });
+
+  it('resolves to the EU integrations replica when MASTRA_PLATFORM_REGION is EU (case-insensitive, trimmed)', () => {
+    vi.stubEnv('MASTRA_INTEGRATIONS_API_URL', '');
+    vi.stubEnv('MASTRA_PLATFORM_SECRET_KEY', accessToken);
+    vi.stubEnv('MASTRA_PLATFORM_REGION', '  EU  ');
+    expect(platformApiClientConfigFromEnv()).toMatchObject({ baseUrl: 'https://integrations.eu.mastra.ai' });
+  });
+
+  it('falls back to the global integrations default for unknown MASTRA_PLATFORM_REGION values', () => {
+    vi.stubEnv('MASTRA_INTEGRATIONS_API_URL', '');
+    vi.stubEnv('MASTRA_PLATFORM_SECRET_KEY', accessToken);
+    vi.stubEnv('MASTRA_PLATFORM_REGION', 'apac');
+    expect(platformApiClientConfigFromEnv()).toMatchObject({ baseUrl: 'https://integrations.mastra.ai' });
+  });
+
+  it('prefers an explicit MASTRA_INTEGRATIONS_API_URL over MASTRA_PLATFORM_REGION', () => {
+    vi.stubEnv('MASTRA_INTEGRATIONS_API_URL', 'https://staging.integrations.example.com/');
+    vi.stubEnv('MASTRA_PLATFORM_SECRET_KEY', accessToken);
+    vi.stubEnv('MASTRA_PLATFORM_REGION', 'us');
+    expect(platformApiClientConfigFromEnv()).toMatchObject({ baseUrl: 'https://staging.integrations.example.com' });
+  });
+
+  it('ignores MASTRA_SHARED_API_URL: the platform API override never reroutes integrations', () => {
+    vi.stubEnv('MASTRA_INTEGRATIONS_API_URL', '');
+    vi.stubEnv('MASTRA_SHARED_API_URL', 'https://platform.example.com/v1');
+    vi.stubEnv('MASTRA_PLATFORM_SECRET_KEY', accessToken);
+    expect(platformApiClientConfigFromEnv()).toMatchObject({ baseUrl: 'https://integrations.mastra.ai' });
+
+    vi.stubEnv('MASTRA_PLATFORM_REGION', 'us');
+    expect(platformApiClientConfigFromEnv()).toMatchObject({ baseUrl: 'https://integrations.us.mastra.ai' });
+  });
+
+  it('prefers the platform-injected MASTRA_PLATFORM_ACCESS_TOKEN over MASTRA_PLATFORM_SECRET_KEY', () => {
+    vi.stubEnv('MASTRA_PLATFORM_ACCESS_TOKEN', 'injected-token');
+    vi.stubEnv('MASTRA_PLATFORM_SECRET_KEY', 'sk_scaffolded');
+    expect(platformApiClientConfigFromEnv()).toMatchObject({ accessToken: 'injected-token' });
+  });
+
+  it('accepts MASTRA_PLATFORM_ACCESS_TOKEN alone', () => {
+    vi.stubEnv('MASTRA_PLATFORM_ACCESS_TOKEN', 'injected-token');
+    vi.stubEnv('MASTRA_PLATFORM_SECRET_KEY', '');
+    expect(platformApiClientConfigFromEnv()).toMatchObject({ accessToken: 'injected-token' });
+  });
+
+  it('reads MASTRA_PROJECT_ID into the config for proxy activity attribution', () => {
+    vi.stubEnv('MASTRA_PLATFORM_ACCESS_TOKEN', accessToken);
+    vi.stubEnv('MASTRA_PROJECT_ID', '  proj_123  ');
+    expect(platformApiClientConfigFromEnv()).toMatchObject({ projectId: 'proj_123' });
+
+    vi.stubEnv('MASTRA_PROJECT_ID', '');
+    expect(platformApiClientConfigFromEnv()).not.toHaveProperty('projectId');
+  });
+
+  it('sends x-mastra-project-id only when a projectId is configured', async () => {
+    const fetchImpl = vi
+      .fn<typeof fetch>()
+      .mockImplementation(
+        async () =>
+          new Response(JSON.stringify({ ok: true }), { status: 200, headers: { 'content-type': 'application/json' } }),
+      );
+    const scoped = new PlatformApiClient({
+      baseUrl: 'https://platform.example.com',
+      accessToken,
+      projectId: 'proj_123',
+      fetchImpl,
+    });
+
+    await scoped.request('GET', '/v2/connections/a1b/proxy/api/v4/user');
+
+    expect(fetchImpl).toHaveBeenCalledWith(
+      expect.any(String),
+      expect.objectContaining({ headers: expect.objectContaining({ 'x-mastra-project-id': 'proj_123' }) }),
+    );
+
+    await client(fetchImpl).request('GET', '/v2/connections/a1b/proxy/api/v4/user');
+
+    expect(fetchImpl.mock.calls[1]?.[1]?.headers).not.toHaveProperty('x-mastra-project-id');
   });
 
   it('uses bearer authentication without ambient cookie credentials', async () => {

@@ -2,123 +2,188 @@ import type { AgentControllerRequestContext } from '@mastra/core/agent-controlle
 import type { RequestContext } from '@mastra/core/request-context';
 import { createTool } from '@mastra/core/tools';
 import { z } from 'zod';
-import type {
-  ProjectRepository,
-  ProjectSourceControlConnection,
-  SourceControlInstallation,
-  SourceControlRepository,
-} from '../../storage/domains/source-control/base.js';
+import { getFactoryAuthOrgId, getFactoryAuthUserFromContext, getFactoryAuthUserId } from '../../auth.js';
+import { findEnvironmentRepository, resolveSessionRepositories } from '../../session/environment-repositories.js';
+import type { EnvironmentRepository } from '../../session/environment-repositories.js';
+import { runsPullRequestCreate } from '../../session/shell-commands.js';
+import type { SourceControlInstallation, SourceControlSession } from '../../storage/domains/source-control/base.js';
+import type { IntegrationTools } from '../base.js';
 import type { GithubIntegration } from './integration.js';
 import { getGithubPat } from './pat.js';
 import { subscribeToPullRequest, unsubscribeFromPullRequest } from './subscriptions.js';
-import { getRegisteredGithubPatKind, injectGithubToken } from './token-refresh.js';
+import { getGithubRefreshTarget, getRegisteredGithubPatKind, requireGithubTokenInjector } from './token-refresh.js';
 
-type RepositorySessionState = { factoryProjectId?: string; projectRepositoryId?: string };
+type RepositorySessionState = { factoryProjectId?: string };
 
 /**
- * Minimal shape of the host-authenticated user placed on the request context
- * under the `user` key. Mirrors the host's auth user without importing it:
- * `workosId` (stable external id) wins over the row `id`, and `organizationId`
- * scopes org tenancy.
+ * The host-authenticated user placed on the request context under the `user`
+ * key, read through the host's own normalizer. A local mirror of that shape
+ * used to live here; it silently missed the provider shapes the normalizer
+ * knows about, which turned every subscription tool into a no-op for those
+ * users instead of an error anybody could see.
  */
-interface SessionAuthUser {
-  workosId?: string;
-  id?: string;
-  organizationId?: string;
+function sessionUserId(requestContext: RequestContext): string | undefined {
+  return getFactoryAuthUserId(getFactoryAuthUserFromContext(requestContext));
 }
 
-function sessionUserId(user: SessionAuthUser | undefined): string | undefined {
-  return user?.workosId ?? user?.id;
-}
-
-function sessionOrgId(user: SessionAuthUser | undefined): string | undefined {
-  return user?.organizationId;
+function sessionOrgId(requestContext: RequestContext): string | undefined {
+  return getFactoryAuthOrgId(getFactoryAuthUserFromContext(requestContext));
 }
 
 const pullRequestInputSchema = z.object({
   pullRequest: z.union([z.number().int().positive(), z.string().min(1)]),
 });
 
+const TRIAGE_COMMENT_MARKER = '<!-- mastra-factory-triage -->';
+const triageCommentInputSchema = z.object({
+  issueNumber: z.number().int().positive(),
+  body: z.string().startsWith(TRIAGE_COMMENT_MARKER),
+});
+
+const triageCommentLocks = new Map<string, Promise<void>>();
+
+async function serializeTriageComment<T>(key: string, operation: () => Promise<T>): Promise<T> {
+  const previous = triageCommentLocks.get(key) ?? Promise.resolve();
+  let release: (() => void) | undefined;
+  const current = new Promise<void>(resolve => {
+    release = resolve;
+  });
+  const queued = previous.then(() => current);
+  triageCommentLocks.set(key, queued);
+  await previous;
+  try {
+    return await operation();
+  } finally {
+    release!();
+    if (triageCommentLocks.get(key) === queued) triageCommentLocks.delete(key);
+  }
+}
+
+/**
+ * The session a subscription request comes from: its factory row when the
+ * session was created through a factory entry point (null for a controller
+ * session that only carries `factoryProjectId`), and every repository it may
+ * target, the environment list plus its own link.
+ */
 interface SessionTarget {
   context: AgentControllerRequestContext<RepositorySessionState>;
-  projectRepository: ProjectRepository;
-  connection: ProjectSourceControlConnection;
-  installation: SourceControlInstallation;
-  repository: SourceControlRepository;
+  session: SourceControlSession | null;
+  repositories: EnvironmentRepository[];
   orgId: string;
   userId: string;
 }
 
-function parsePullRequest(value: number | string, expectedRepo: string): number {
-  if (typeof value === 'number') return value;
-  if (/^\d+$/.test(value)) return Number(value);
-  const match = value.match(/^https:\/\/github\.com\/([^/]+\/[^/]+)\/pull\/(\d+)\/?$/i);
-  if (!match || match[1]!.toLowerCase() !== expectedRepo.toLowerCase()) {
-    throw new Error(`Pull request must belong to ${expectedRepo}.`);
-  }
-  return Number(match[2]);
+/** One pull request of one environment repository, with the installation that reaches it. */
+interface PullRequestTarget extends EnvironmentRepository {
+  installation: SourceControlInstallation;
+  number: number;
+}
+
+const PULL_REQUEST_URL = /^https:\/\/github\.com\/([^/]+\/[^/]+)\/pull\/(\d+)\/?$/i;
+
+function parsePullRequest(value: string): { slug: string; number: number } | undefined {
+  const match = value.trim().match(PULL_REQUEST_URL);
+  return match ? { slug: match[1]!, number: Number(match[2]) } : undefined;
+}
+
+/** The link the session is filed under, when the environment still carries it. */
+function ownRepository(target: SessionTarget): EnvironmentRepository | undefined {
+  const ownId = target.session?.projectRepositoryId;
+  return ownId ? target.repositories.find(candidate => candidate.link.id === ownId) : undefined;
 }
 
 /**
  * Whether the current request comes from a session that GitHub subscriptions
- * can ever apply to: an authenticated org user on a GitHub-project session
- * with an active thread. Mirrors the gate in `resolveSessionTarget` without
- * throwing, for passive callers that should no-op instead of erroring.
+ * can ever apply to: an authenticated org user on a factory session with an
+ * active thread. Mirrors the gate in `resolveSessionTarget` without throwing,
+ * for passive callers that should no-op instead of erroring.
  */
 function isGithubProjectSession(requestContext: RequestContext): boolean {
   const context = requestContext.get('controller') as AgentControllerRequestContext<RepositorySessionState> | undefined;
-  const user = requestContext.get('user') as SessionAuthUser | undefined;
   return Boolean(
-    context?.threadId && context.getState().projectRepositoryId && sessionOrgId(user) && sessionUserId(user),
+    context?.threadId &&
+    context.getState().factoryProjectId &&
+    sessionOrgId(requestContext) &&
+    sessionUserId(requestContext),
   );
 }
 
 async function resolveSessionTarget(requestContext: RequestContext, github: GithubIntegration): Promise<SessionTarget> {
   const context = requestContext.get('controller') as AgentControllerRequestContext<RepositorySessionState> | undefined;
-  const user = requestContext.get('user') as SessionAuthUser | undefined;
-  const orgId = sessionOrgId(user);
-  const userId = sessionUserId(user);
-  const projectRepositoryId = context?.getState().projectRepositoryId;
-  if (!context || !context.threadId || !projectRepositoryId || !orgId || !userId) {
+  const orgId = sessionOrgId(requestContext);
+  const userId = sessionUserId(requestContext);
+  const factoryProjectId = context?.getState().factoryProjectId;
+  if (!context || !context.threadId || !factoryProjectId || !orgId || !userId) {
     throw new Error('GitHub subscriptions require an authenticated repository session with an active thread.');
   }
-
-  const projectRepository = await github.sourceControlStorage.projectRepositories.get({
-    orgId,
-    id: projectRepositoryId,
+  const sourceControl = github.sourceControlStorage;
+  const session = await sourceControl.sessions.getBySessionId(context.sessionId);
+  if (session && (session.orgId !== orgId || (session.factoryProjectId && session.factoryProjectId !== factoryProjectId))) {
+    throw new Error('The active session does not belong to this Factory.');
+  }
+  const repositories = await resolveSessionRepositories({
+    sourceControl,
+    session: session ?? { orgId, factoryProjectId, projectRepositoryId: null },
   });
-  if (!projectRepository) throw new Error('Project repository not found for this organization.');
-  const connection = await github.sourceControlStorage.connections.get({ orgId, id: projectRepository.connectionId });
-  if (!connection) throw new Error('Source-control connection not found for this organization.');
-  const repository = await github.sourceControlStorage.repositories.get({ orgId, id: projectRepository.repositoryId });
-  if (!repository) throw new Error('Repository not found for this organization.');
-  const installation = await github.sourceControlStorage.installations.get({ orgId, id: connection.installationId });
+  return { context, session, repositories, orgId, userId };
+}
+
+/**
+ * The environment repository a pull request reference names. A canonical URL
+ * resolves against every repository the session may target; a bare number
+ * only against the link the session is filed under.
+ */
+async function resolvePullRequest(
+  target: SessionTarget,
+  value: number | string,
+  github: GithubIntegration,
+): Promise<PullRequestTarget> {
+  let repository: EnvironmentRepository | undefined;
+  let number: number;
+  if (typeof value === 'number' || /^\d+$/.test(value.trim())) {
+    repository = ownRepository(target);
+    if (!repository) {
+      throw new Error('Pass the full pull request URL: this session is not filed under a single repository.');
+    }
+    number = Number(value);
+  } else {
+    const parsed = parsePullRequest(value);
+    if (!parsed) throw new Error('Pull request must be a number or a canonical GitHub pull request URL.');
+    repository = findEnvironmentRepository(target.repositories, parsed.slug);
+    if (!repository) throw new Error(`Pull request ${value.trim()} is not in a repository linked to this Factory.`);
+    number = parsed.number;
+  }
+  const installation = await github.sourceControlStorage.installations.get({
+    orgId: target.orgId,
+    id: repository.connection.installationId,
+  });
   if (!installation) throw new Error('Source-control installation not found for this organization.');
-  return { context, projectRepository, connection, installation, repository, orgId, userId };
+  return { ...repository, installation, number };
 }
 
-async function verifyPullRequest(target: SessionTarget, pullRequest: number, github: GithubIntegration) {
-  const [owner, repo] = target.repository.slug.split('/');
+/** Confirm the pull request lives in the repository its reference named; returns its head ref. */
+async function verifyPullRequest(pullRequest: PullRequestTarget, github: GithubIntegration): Promise<string> {
+  const [owner, repo] = pullRequest.repository.slug.split('/');
   if (!owner || !repo) throw new Error('GitHub repository is invalid.');
-  const octokit = github.getInstallationOctokit(Number(target.installation.externalId));
-  const { data } = await octokit.pulls.get({ owner, repo, pull_number: pullRequest });
-  if (String(data.base.repo.id) !== target.repository.externalId)
+  const octokit = github.getInstallationOctokit(Number(pullRequest.installation.externalId));
+  const { data } = await octokit.pulls.get({ owner, repo, pull_number: pullRequest.number });
+  if (String(data.base.repo.id) !== pullRequest.repository.externalId)
     throw new Error('Pull request repository does not match the active project repository.');
+  return data.head.ref;
 }
 
-async function subscriptionInput(target: SessionTarget, pullRequestNumber: number) {
+function subscriptionInput(target: SessionTarget, pullRequest: PullRequestTarget) {
   return {
     orgId: target.orgId,
-    installationExternalId: target.installation.externalId,
-    projectRepositoryId: target.projectRepository.id,
-    repositoryExternalId: target.repository.externalId,
-    repositorySlug: target.repository.slug,
-    changeRequestId: String(pullRequestNumber),
+    installationExternalId: pullRequest.installation.externalId,
+    projectRepositoryId: pullRequest.link.id,
+    repositoryExternalId: pullRequest.repository.externalId,
+    repositorySlug: pullRequest.repository.slug,
+    changeRequestId: String(pullRequest.number),
     sessionId: target.context.session.id,
     ownerId: target.context.session.ownerId,
-    resourceId: target.connection.factoryProjectId,
+    resourceId: pullRequest.connection.factoryProjectId,
     threadId: target.context.threadId!,
-    sessionScope: target.context.scope,
     source: 'explicit-tool' as const,
     subscribedByUserId: target.userId,
   };
@@ -136,10 +201,34 @@ export async function subscribeCurrentSessionToPullRequest(
   // "this session cannot subscribe" as an error.
   if (source === 'auto-gh-pr-create' && !isGithubProjectSession(requestContext)) return undefined;
   const target = await resolveSessionTarget(requestContext, github);
-  const number = parsePullRequest(pullRequest, target.repository.slug);
-  await verifyPullRequest(target, number, github);
-  await subscribeToPullRequest({ ...(await subscriptionInput(target, number)), source }, github.integrationStorage);
-  return number;
+  // A URL outside the environment on the auto path is the agent opening a PR
+  // somewhere this Factory does not follow: observed, never subscribed.
+  if (source === 'auto-gh-pr-create' && typeof pullRequest === 'string') {
+    const parsed = parsePullRequest(pullRequest);
+    if (parsed && !findEnvironmentRepository(target.repositories, parsed.slug)) {
+      console.warn("[GitHub] Pull request URL is not in this Factory's environment; not subscribing", {
+        url: pullRequest.trim(),
+      });
+      return undefined;
+    }
+  }
+  const resolved = await resolvePullRequest(target, pullRequest, github);
+  const headRef = await verifyPullRequest(resolved, github);
+  await subscribeToPullRequest({ ...subscriptionInput(target, resolved), source }, github.integrationStorage);
+  // The session-repository row is the per-repository record of what this
+  // session opened, so only a pull request from the session's own branch
+  // lands there; subscribing to someone else's pull request leaves it alone.
+  // An existing row keeps the branch its push wrote.
+  if (target.session && headRef === target.session.branch) {
+    await github.sourceControlStorage.sessionRepositories.upsert({
+      sessionId: target.session.sessionId,
+      projectRepositoryId: resolved.link.id,
+      changeRequestId: String(resolved.number),
+      changeRequestUrl: `https://github.com/${resolved.repository.slug}/pull/${resolved.number}`,
+      fallbackBranch: headRef,
+    });
+  }
+  return resolved.number;
 }
 
 export async function unsubscribeCurrentSessionFromPullRequest(
@@ -148,13 +237,42 @@ export async function unsubscribeCurrentSessionFromPullRequest(
   github: GithubIntegration,
 ) {
   const target = await resolveSessionTarget(requestContext, github);
-  const number = parsePullRequest(pullRequest, target.repository.slug);
-  await unsubscribeFromPullRequest(await subscriptionInput(target, number), github.integrationStorage);
-  return number;
+  const resolved = await resolvePullRequest(target, pullRequest, github);
+  await unsubscribeFromPullRequest(subscriptionInput(target, resolved), github.integrationStorage);
+  return resolved.number;
+}
+
+export async function upsertFactoryTriageComment(
+  requestContext: RequestContext,
+  input: { issueNumber: number; body: string },
+  github: GithubIntegration,
+) {
+  const target = await resolveSessionTarget(requestContext, github);
+  const own = ownRepository(target);
+  if (!own) throw new Error('The triage handoff needs a session filed under a single repository.');
+  const installation = await github.sourceControlStorage.installations.get({
+    orgId: target.orgId,
+    id: own.connection.installationId,
+  });
+  if (!installation) throw new Error('Source-control installation not found for this organization.');
+  const installationId = Number(installation.externalId);
+  if (!Number.isSafeInteger(installationId) || installationId <= 0) throw new Error('GitHub installation is invalid.');
+  return serializeTriageComment(`${installationId}:${own.repository.externalId}:${input.issueNumber}`, () =>
+    github.upsertFactoryTriageComment({
+      installationId,
+      repository: own.repository.slug,
+      issueNumber: input.issueNumber,
+      body: input.body,
+    }),
+  );
 }
 
 export async function refreshGithubToken(requestContext: RequestContext, github: GithubIntegration): Promise<void> {
-  const target = await resolveSessionTarget(requestContext, github);
+  const inject = requireGithubTokenInjector(requestContext);
+  // The workspace resolver records the target only after authorizing the
+  // caller against the GitHub-backed session that owns this sandbox.
+  const target = getGithubRefreshTarget(requestContext);
+  if (!target) throw new Error('The active session is not backed by a GitHub workspace.');
   // `GH_TOKEN` feeds the `gh` CLI, so a configured org PAT wins over a minted
   // installation token (which 403s on integration-restricted endpoints). The
   // workspace records which PAT kind the sandbox was provisioned with, so a
@@ -165,25 +283,28 @@ export async function refreshGithubToken(requestContext: RequestContext, github:
     getRegisteredGithubPatKind(requestContext),
   );
   if (pat) {
-    injectGithubToken(requestContext, pat);
+    inject(pat);
+    return;
+  }
+  // The boot's own minter keeps the environment scope (and the agent's note
+  // about it) in step with what `gh` reaches after a refresh.
+  if (target.mint) {
+    inject(await target.mint());
     return;
   }
   const access = await github.versionControl.getRepositoryAccess({
     orgId: target.orgId,
-    repositoryId: target.repository.id,
+    repositoryId: target.repositoryId,
   });
   const token = access.authorization?.token;
   if (!token) throw new Error('Repository access did not include a bearer token for the Factory session.');
-  injectGithubToken(requestContext, token);
+  inject(token);
 }
 
 export function createGithubSubscriptionTools(requestContext: RequestContext, github: GithubIntegration) {
-  const context = requestContext.get('controller') as AgentControllerRequestContext<RepositorySessionState> | undefined;
-  const user = requestContext.get('user') as SessionAuthUser | undefined;
-  if (!context?.getState().projectRepositoryId || !sessionOrgId(user) || !sessionUserId(user)) return {};
-
-  return {
-    github_refresh_token: createTool({
+  const tools: IntegrationTools = {};
+  if (getGithubRefreshTarget(requestContext)) {
+    tools.github_refresh_token = createTool({
       id: 'github_refresh_token',
       description:
         'Refresh GitHub CLI authentication in the active Factory sandbox. Use this after a gh command fails because authentication is expired, invalid, or missing. It installs a fresh GH_TOKEN for subsequent sandbox commands. After this tool succeeds, retry the failed gh command. Takes no arguments and never returns the token.',
@@ -192,11 +313,23 @@ export function createGithubSubscriptionTools(requestContext: RequestContext, gi
         await refreshGithubToken(requestContext, github);
         return { refreshed: true };
       },
+    });
+  }
+  if (!isGithubProjectSession(requestContext)) return tools;
+
+  return {
+    ...tools,
+    github_upsert_factory_triage_comment: createTool({
+      id: 'github_upsert_factory_triage_comment',
+      description:
+        'Create or update this Factory App’s canonical triage handoff comment on an issue in the active repository. Use this for every marked pending or final Factory triage handoff; never use gh to create or edit that handoff.',
+      inputSchema: triageCommentInputSchema,
+      execute: async input => upsertFactoryTriageComment(requestContext, input, github),
     }),
     github_subscribe_pr: createTool({
       id: 'github_subscribe_pr',
       description:
-        'Subscribe this thread to GitHub pull request activity. You usually do not need this tool: successful gh pr create commands subscribe automatically. Use it for an existing PR or to recover when automatic subscription did not occur. Closed or merged PRs are unsubscribed automatically. Accepts a PR number or canonical URL for the active project.',
+        'Subscribe this thread to GitHub pull request activity. You usually do not need this tool: successful gh pr create commands subscribe automatically. Use it for an existing PR or to recover when automatic subscription did not occur. Closed or merged PRs are unsubscribed automatically. Accepts a canonical PR URL for any repository in this Factory; a bare PR number only when this session is filed under a single repository, so pass the URL when the Factory has more than one.',
       inputSchema: pullRequestInputSchema,
       execute: async ({ pullRequest }) => {
         const number = await subscribeCurrentSessionToPullRequest(requestContext, pullRequest, 'explicit-tool', github);
@@ -206,7 +339,7 @@ export function createGithubSubscriptionTools(requestContext: RequestContext, gi
     github_unsubscribe_pr: createTool({
       id: 'github_unsubscribe_pr',
       description:
-        'Manually unsubscribe this thread from GitHub pull request activity. You usually do not need this tool because closed or merged PRs are unsubscribed automatically. Use it to stop notifications before then. Accepts a PR number or canonical URL for the active project.',
+        'Manually unsubscribe this thread from GitHub pull request activity. You usually do not need this tool because closed or merged PRs are unsubscribed automatically. Use it to stop notifications before then. Accepts a canonical PR URL for any repository in this Factory, or a bare PR number when this session is filed under a single repository.',
       inputSchema: pullRequestInputSchema,
       execute: async ({ pullRequest }) => {
         const number = await unsubscribeCurrentSessionFromPullRequest(requestContext, pullRequest, github);
@@ -216,23 +349,7 @@ export function createGithubSubscriptionTools(requestContext: RequestContext, gi
   };
 }
 
-export function stripHeredocBodies(command: string): string {
-  const lines = command.split('\n');
-  const executableLines: string[] = [];
-  let delimiter: string | undefined;
-
-  for (const line of lines) {
-    if (delimiter) {
-      if (line.trim() === delimiter) delimiter = undefined;
-      continue;
-    }
-    executableLines.push(line);
-    const heredoc = line.match(/<<-?\s*(['"]?)([A-Za-z_][A-Za-z0-9_]*)\1/);
-    delimiter = heredoc?.[2];
-  }
-
-  return executableLines.join('\n');
-}
+const GITHUB_PULL_REQUEST_URL = /^https:\/\/github\.com\/[^\s/]+\/[^\s/]+\/pull\/\d+\/?$/;
 
 export function parseCreatedPullRequest(context: {
   toolName: string;
@@ -240,14 +357,16 @@ export function parseCreatedPullRequest(context: {
   output?: unknown;
   error?: unknown;
 }) {
-  if (context.toolName !== 'execute_command' || context.error) return undefined;
-  const command = (context.input as { command?: unknown } | undefined)?.command;
-  if (
-    typeof command !== 'string' ||
-    !/(?:^|\n|;|&&|\|\|)\s*gh\s+pr\s+create(?:\s|$)/.test(stripHeredocBodies(command))
-  ) {
-    return undefined;
+  if (context.error) return undefined;
+  // The provider-neutral change-request tool reports the created PR directly;
+  // subscribe on it exactly as on a successful `gh pr create`.
+  if (context.toolName === 'source_control_create_change_request') {
+    const url = (context.output as { url?: unknown } | undefined)?.url;
+    return typeof url === 'string' && GITHUB_PULL_REQUEST_URL.test(url) ? url.replace(/\/$/, '') : undefined;
   }
+  if (context.toolName !== 'execute_command') return undefined;
+  const command = (context.input as { command?: unknown } | undefined)?.command;
+  if (typeof command !== 'string' || !runsPullRequestCreate(command)) return undefined;
   const output = context.output as { stdout?: unknown; result?: unknown } | undefined;
   const stdout = typeof context.output === 'string' ? context.output : (output?.stdout ?? output?.result);
   if (typeof stdout !== 'string') return undefined;

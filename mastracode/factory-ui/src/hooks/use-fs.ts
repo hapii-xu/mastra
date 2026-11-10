@@ -1,0 +1,201 @@
+import { skipToken, useQuery } from '@tanstack/react-query';
+
+import { useApiConfig } from '../api/config';
+import { queryKeys } from '../api/keys';
+import type {
+  ArtifactListing,
+  DirectoryListing,
+  WorkspaceChangePatches,
+  WorkspaceChanges,
+  WorkspaceChangesScope,
+  WorkspaceFile,
+  WorkspaceTreeListing,
+  WorkspaceRenderedListing,
+} from '../api/types';
+
+/** A builder returns undefined while a required param is missing, which is what turns its query into a skipToken below. */
+function directoryListingUrl(path: string | undefined) {
+  if (!path) return '/web/fs/list';
+  return `/web/fs/list?${new URLSearchParams({ path })}`;
+}
+
+function artifactListingUrl(path: string | undefined) {
+  if (!path) return undefined;
+  return `/web/artifacts/list?${new URLSearchParams({ path })}`;
+}
+
+function workspaceRenderedListingUrl(workspacePath: string | undefined, root: string | undefined) {
+  if (!workspacePath || !root) return undefined;
+  return `/web/workspace/rendered/list?${new URLSearchParams({ workspacePath, root })}`;
+}
+
+function workspaceFileUrl(workspacePath: string | undefined, path: string | undefined) {
+  if (!workspacePath || !path) return undefined;
+  return `/web/workspace/file?${new URLSearchParams({ workspacePath, path })}`;
+}
+
+export function isPlanReadablePath(path: string | undefined): path is string {
+  return Boolean(path?.startsWith('.artifacts/'));
+}
+
+/**
+ * Resolve a submitted plan `path` to a workspace-relative `.artifacts/…` path the
+ * session file route accepts. Relative `.artifacts/*` paths pass through; an
+ * absolute path (e.g. `/leadrvision/.artifacts/plans/issue.md`) is normalized
+ * against the authoritative `rootPath` from `/web/workspace/rendered/list`
+ * (the confined absolute `.artifacts` root). Traversal, wrong-root, backslash,
+ * and NUL inputs are rejected rather than guessed — including for relative
+ * `.artifacts/*` paths — though the backend still enforces its own
+ * `assertRelativePath`/symlink guards.
+ */
+export function normalizePlanPath(path: string | undefined, rootPath: string | undefined): string | undefined {
+  if (!path) return undefined;
+  // Reject malformed inputs before any pass-through so relative and absolute
+  // paths share the same traversal/backslash/NUL guards.
+  if (path.includes('\\') || path.includes('\0')) return undefined;
+  if (path.split('/').includes('..')) return undefined;
+  if (path.startsWith('.artifacts/')) return path;
+  // Only absolute posix paths are normalization candidates.
+  if (!path.startsWith('/')) return undefined;
+  if (!rootPath) return undefined;
+  const base = rootPath.endsWith('/') ? rootPath.slice(0, -1) : rootPath;
+  if (path !== base && !path.startsWith(`${base}/`)) return undefined;
+  const remainder = path.slice(base.length).replace(/^\/+/, '');
+  const relative = remainder ? `.artifacts/${remainder}` : '.artifacts';
+  return isPlanReadablePath(relative) ? relative : undefined;
+}
+
+function planFileUrl(workspacePath: string | undefined, path: string | undefined) {
+  if (!workspacePath || !isPlanReadablePath(path)) return undefined;
+  // The session file route only approves `.artifacts/*` reads without a thread
+  // file listing; Factory plans always live under `.artifacts/plans/`.
+  return `/web/workspace/file?${new URLSearchParams({ workspacePath, path })}`;
+}
+
+function workspaceChangesUrl(workspacePath: string | undefined) {
+  if (!workspacePath) return undefined;
+  return `/web/workspace/changes?${new URLSearchParams({ workspacePath })}`;
+}
+
+function workspacePatchesUrl(workspacePath: string | undefined, scope: WorkspaceChangesScope) {
+  if (!workspacePath) return undefined;
+  return `/web/workspace/changes/patches?${new URLSearchParams({ workspacePath, scope })}`;
+}
+
+/**
+ * Server-driven directory listing for the project picker (mirrors
+ * `GET /web/fs/list`). The browser can't read absolute filesystem paths, so
+ * the server enumerates directories confined to its configured root. An absent
+ * `path` lists the root; the cache is keyed by `path` so navigating between
+ * folders yields distinct entries and React Query dedupes revisits.
+ */
+export function useDirectoryListing(path: string | undefined) {
+  const { client } = useApiConfig();
+  const url = directoryListingUrl(path);
+  return useQuery<DirectoryListing>({
+    queryKey: queryKeys.fsList(path),
+    placeholderData: previousData => previousData,
+    queryFn: () => client.get<DirectoryListing>(url),
+  });
+}
+
+export function useArtifactListing(path: string | undefined) {
+  const { client } = useApiConfig();
+  const url = artifactListingUrl(path);
+  return useQuery<ArtifactListing>({
+    queryKey: queryKeys.artifactsList(path),
+    queryFn: url ? () => client.get<ArtifactListing>(url) : skipToken,
+  });
+}
+
+export function useWorkspaceRenderedListing(
+  workspacePath: string | undefined,
+  renderedRoot: string | undefined,
+  { enabled = true }: { enabled?: boolean } = {},
+) {
+  const { client } = useApiConfig();
+  const url = workspaceRenderedListingUrl(workspacePath, renderedRoot);
+  return useQuery<WorkspaceRenderedListing>({
+    queryKey: queryKeys.workspaceRenderedList(workspacePath, renderedRoot),
+    enabled,
+    queryFn: url ? () => client.get<WorkspaceRenderedListing>(url) : skipToken,
+  });
+}
+
+/**
+ * One directory of a session's checkouts, read live from its sandbox (`''` is
+ * the top level). Each open folder is its own query, so a refresh or a tool
+ * call only refetches what is on screen.
+ */
+export function useWorkspaceTree(
+  workspacePath: string | undefined,
+  path: string,
+  { enabled = true }: { enabled?: boolean } = {},
+) {
+  const { client } = useApiConfig();
+  const url = workspacePath ? `/web/workspace/tree?${new URLSearchParams({ workspacePath, path })}` : undefined;
+  return useQuery<WorkspaceTreeListing>({
+    queryKey: queryKeys.workspaceTree(workspacePath, path),
+    enabled,
+    queryFn: url ? () => client.get<WorkspaceTreeListing>(url) : skipToken,
+  });
+}
+
+export function useWorkspaceFile<TData = WorkspaceFile>(
+  workspacePath: string | undefined,
+  filePath: string | undefined,
+  { enabled = true, select }: { enabled?: boolean; select?: (file: WorkspaceFile) => TData } = {},
+) {
+  const { client } = useApiConfig();
+  const url = workspaceFileUrl(workspacePath, filePath);
+  return useQuery<WorkspaceFile, Error, TData>({
+    queryKey: queryKeys.workspaceFile(workspacePath, filePath),
+    enabled,
+    queryFn: url ? () => client.get<WorkspaceFile>(url) : skipToken,
+    select,
+  });
+}
+
+/**
+ * Read a submitted plan's markdown from the session workspace. Keyed by
+ * `toolCallId` so a plan resubmission (same path, new tool call) fetches the
+ * revised file instead of replaying the previous submission from cache.
+ */
+export function usePlanFile(
+  workspacePath: string | undefined,
+  path: string | undefined,
+  toolCallId: string | undefined,
+  { enabled = true }: { enabled?: boolean } = {},
+) {
+  const { client } = useApiConfig();
+  const url = planFileUrl(workspacePath, path);
+  return useQuery<WorkspaceFile>({
+    queryKey: queryKeys.planFile(workspacePath, path, toolCallId),
+    enabled,
+    queryFn: url ? () => client.get<WorkspaceFile>(url) : skipToken,
+  });
+}
+
+export function useWorkspaceChanges(workspacePath: string | undefined, { enabled = true }: { enabled?: boolean } = {}) {
+  const { client } = useApiConfig();
+  const url = workspaceChangesUrl(workspacePath);
+  return useQuery<WorkspaceChanges>({
+    queryKey: queryKeys.workspaceChanges(workspacePath),
+    enabled,
+    queryFn: url ? () => client.get<WorkspaceChanges>(url) : skipToken,
+  });
+}
+
+export function useWorkspacePatches(
+  workspacePath: string | undefined,
+  scope: WorkspaceChangesScope,
+  { enabled = true }: { enabled?: boolean } = {},
+) {
+  const { client } = useApiConfig();
+  const url = workspacePatchesUrl(workspacePath, scope);
+  return useQuery<WorkspaceChangePatches>({
+    queryKey: queryKeys.workspacePatches(workspacePath, scope),
+    enabled,
+    queryFn: url ? () => client.get<WorkspaceChangePatches>(url) : skipToken,
+  });
+}

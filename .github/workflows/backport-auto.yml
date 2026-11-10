@@ -15,10 +15,11 @@ jobs:
       github.repository == 'mastra-ai/mastra' && 
       github.event.pull_request.merged == true && 
       contains(github.event.pull_request.labels.*.name, 'cherry')
-    runs-on: starsling-ubuntu-24.04
+    runs-on: starsling-ubuntu-26.04
     steps:
       - name: Initial checkout
         uses: actions/checkout@e8d4307400f9427dba7cb98e488d6ab85f1cec5f
+        timeout-minutes: 20
         with:
           # Use default GITHUB_TOKEN for initial checkout
           # This is needed to access the .github/actions/app-auth action
@@ -38,10 +39,13 @@ jobs:
 
       - name: Re-checkout with app token
         uses: actions/checkout@e8d4307400f9427dba7cb98e488d6ab85f1cec5f
+        timeout-minutes: 20
         with:
           token: ${{ steps.app-auth.outputs.token }}
           persist-credentials: true
           fetch-depth: 0
+          # Partial clone: full history without every historical file version.
+          filter: blob:none
 
       - name: Setup pnpm and Node.js
         uses: ./.github/actions/setup-pnpm-node

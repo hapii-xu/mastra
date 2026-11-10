@@ -4,7 +4,12 @@ import { describe, expect, it, vi } from 'vitest';
 
 import type { MastraSandbox } from '../mastra-sandbox';
 import type { CommandResult } from '../types';
-import { ProcessHandle } from './process-handle';
+import {
+  ProcessHandle,
+  ProcessOutputLimitError,
+  RetainedOutputBuffer,
+  UnsupportedStdinCloseError,
+} from './process-handle';
 import { SandboxProcessManager } from './process-manager';
 import type { SpawnProcessOptions } from './types';
 
@@ -17,13 +22,14 @@ class TestProcessHandle extends ProcessHandle {
     this.resolveWait = resolve;
   });
 
-  constructor(options?: SpawnProcessOptions) {
+  constructor(options?: SpawnProcessOptions & { retainedOutputHardLimitBytes?: number }) {
     super(options);
   }
 
   async wait(_options?: {
     onStdout?: (data: string) => void;
     onStderr?: (data: string) => void;
+    abortSignal?: AbortSignal;
   }): Promise<CommandResult> {
     return this.waitPromise;
   }
@@ -34,6 +40,8 @@ class TestProcessHandle extends ProcessHandle {
   }
 
   async sendStdin(): Promise<void> {}
+
+  async closeStdin(): Promise<void> {}
 
   finish(): void {
     this.exitCode = 0;
@@ -51,9 +59,26 @@ class TestProcessHandle extends ProcessHandle {
   }
 }
 
+/** Mirrors providers that never override `closeStdin()`. */
+class NoStdinCloseProcessHandle extends ProcessHandle {
+  readonly pid = 'no-close-pid';
+  exitCode: number | undefined;
+
+  async wait(): Promise<CommandResult> {
+    throw new Error('not used');
+  }
+
+  async kill(): Promise<boolean> {
+    return true;
+  }
+
+  async sendStdin(): Promise<void> {}
+}
+
 class TestProcessManager extends SandboxProcessManager {
   spawnCalls = 0;
   ensureRunningCalls = 0;
+  private readonly handle = new TestProcessHandle();
 
   constructor() {
     super();
@@ -61,12 +86,14 @@ class TestProcessManager extends SandboxProcessManager {
       ensureRunning: async () => {
         this.ensureRunningCalls += 1;
       },
-    } as MastraSandbox;
+    } as unknown as MastraSandbox;
   }
 
   async spawn(_command: string, options?: SpawnProcessOptions): Promise<ProcessHandle> {
     this.spawnCalls += 1;
-    return new TestProcessHandle(options);
+    const handle = options ? new TestProcessHandle(options) : this.handle;
+    this._tracked.set(handle.pid, handle);
+    return handle;
   }
 
   async list(): Promise<[]> {
@@ -125,6 +152,16 @@ describe('ProcessHandle output retention', () => {
     expect(manager.spawnCalls).toBe(0);
   });
 
+  it('makes a reused process ID visible after its previous handle was released', async () => {
+    const manager = new TestProcessManager();
+    const previousHandle = await manager.spawn('first');
+    manager.release(previousHandle.pid);
+
+    const reusedHandle = await manager.spawn('second');
+
+    await expect(manager.get(reusedHandle.pid)).resolves.toBe(reusedHandle);
+  });
+
   it('retains everything when maxRetainedBytes is Infinity', () => {
     const handle = new TestProcessHandle({ maxRetainedBytes: Infinity });
 
@@ -135,6 +172,48 @@ describe('ProcessHandle output retention', () => {
     expect(handle.stdout).toBe(Array.from({ length: 150 }, (_, index) => `${index},`).join(''));
     expect(handle.stdoutTruncated).toBe(false);
     expect(handle.stdoutDroppedBytes).toBe(0);
+  });
+
+  it('stops retaining a keep-everything buffer once it would pass the hard limit', () => {
+    // The real limit is 256 MiB; a small one exercises the same path, including compaction past 128 chunks.
+    const buffer = new RetainedOutputBuffer(Infinity, 100);
+
+    for (let index = 0; index < 200; index += 1) {
+      buffer.append('0123456789');
+    }
+
+    expect(buffer.overflowed).toBe(true);
+    expect(buffer.toString()).toBe('0123456789'.repeat(10));
+    expect(buffer.dropped).toBe(1900);
+  });
+
+  it('keeps trimming a finite limit below the hard limit instead of overflowing', () => {
+    const buffer = new RetainedOutputBuffer(5, 100);
+
+    for (let index = 0; index < 200; index += 1) {
+      buffer.append('abcdefgh');
+    }
+
+    expect(buffer.overflowed).toBe(false);
+    expect(buffer.toString()).toBe('defgh');
+  });
+
+  it('kills the process and rejects wait() when keep-everything output passes the hard limit', async () => {
+    const handle = new TestProcessHandle({ maxRetainedBytes: Infinity, retainedOutputHardLimitBytes: 100 });
+    const kill = vi.spyOn(handle, 'kill');
+    const streamed: string[] = [];
+    const waiting = handle.wait({ onStdout: data => streamed.push(data) });
+
+    for (let index = 0; index < 20; index += 1) {
+      expect(() => handle.emitStdout('0123456789')).not.toThrow();
+    }
+    handle.finish();
+
+    await expect(waiting).rejects.toThrow(ProcessOutputLimitError);
+    await expect(handle.wait()).rejects.toThrow(/stdout exceeded 100 bytes/);
+    expect(kill).toHaveBeenCalledTimes(1);
+    // Streaming listeners still see every chunk; only retention stops.
+    expect(streamed).toHaveLength(20);
   });
 
   it('handles a single chunk larger than the retention limit', () => {
@@ -266,5 +345,157 @@ describe('ProcessHandle output retention', () => {
 
     expect(handle.stdout).toBe('');
     expect(chunks.join('')).toBe('hello world');
+  });
+
+  it('closes stdin when the writer stream ends', async () => {
+    const handle = new TestProcessHandle();
+    const sendStdin = vi.spyOn(handle, 'sendStdin');
+    const closeStdin = vi.spyOn(handle, 'closeStdin');
+
+    await new Promise<void>((resolve, reject) => {
+      handle.writer.end('final input', err => (err ? reject(err) : resolve()));
+    });
+
+    expect(sendStdin).toHaveBeenCalledWith('final input');
+    expect(closeStdin).toHaveBeenCalledTimes(1);
+  });
+
+  it('rejects closeStdin by default so providers opt in to stdin closure', async () => {
+    const handle = new NoStdinCloseProcessHandle();
+
+    await expect(handle.closeStdin()).rejects.toBeInstanceOf(UnsupportedStdinCloseError);
+  });
+
+  it('finishes the writer stream when the provider cannot close stdin', async () => {
+    const handle = new TestProcessHandle();
+    vi.spyOn(handle, 'closeStdin').mockRejectedValue(
+      new UnsupportedStdinCloseError('provider does not support closing stdin'),
+    );
+
+    await new Promise<void>((resolve, reject) => {
+      handle.writer.end('final input', err => (err ? reject(err) : resolve()));
+    });
+  });
+
+  it('surfaces non-unsupported closeStdin failures through the writer stream', async () => {
+    const handle = new TestProcessHandle();
+    vi.spyOn(handle, 'closeStdin').mockRejectedValue(new Error('stream already destroyed'));
+
+    const writer = handle.writer;
+    const errored = once(writer, 'error');
+    writer.end('final input');
+
+    const [error] = (await errored) as [Error];
+    expect(error.message).toBe('stream already destroyed');
+  });
+});
+
+describe('ProcessHandle wait abortSignal', () => {
+  it('kills the process when the signal aborts during a blocking wait', async () => {
+    const handle = new TestProcessHandle();
+    const kill = vi.spyOn(handle, 'kill');
+    const controller = new AbortController();
+
+    const waiting = handle.wait({ abortSignal: controller.signal });
+    expect(kill).not.toHaveBeenCalled();
+
+    controller.abort();
+    expect(kill).toHaveBeenCalledTimes(1);
+
+    // The wait still settles through the normal exit path.
+    handle.finish();
+    const result = await waiting;
+    expect(result.exitCode).toBe(0);
+  });
+
+  it('kills immediately when the signal is already aborted', async () => {
+    const handle = new TestProcessHandle();
+    const kill = vi.spyOn(handle, 'kill');
+    const controller = new AbortController();
+    controller.abort();
+
+    const waiting = handle.wait({ abortSignal: controller.signal });
+    expect(kill).toHaveBeenCalledTimes(1);
+
+    handle.finish();
+    await waiting;
+  });
+
+  it('removes the abort listener once the wait settles', async () => {
+    const handle = new TestProcessHandle();
+    const kill = vi.spyOn(handle, 'kill');
+    const controller = new AbortController();
+
+    const waiting = handle.wait({ abortSignal: controller.signal });
+    handle.finish();
+    await waiting;
+
+    // Aborting after the wait resolved must not kill a process the caller
+    // is no longer waiting on.
+    controller.abort();
+    expect(kill).not.toHaveBeenCalled();
+  });
+
+  it('records that an abort killed the process', async () => {
+    const handle = new TestProcessHandle();
+    const controller = new AbortController();
+
+    const waiting = handle.wait({ abortSignal: controller.signal });
+    controller.abort();
+    handle.finish();
+    await waiting;
+
+    expect(handle.killedByAbort).toBe(true);
+  });
+
+  it('does not record an abort kill when the process exited before the kill landed', async () => {
+    const handle = new TestProcessHandle();
+    vi.spyOn(handle, 'kill').mockResolvedValue(false);
+    const controller = new AbortController();
+
+    const waiting = handle.wait({ abortSignal: controller.signal });
+    controller.abort();
+    handle.finish();
+    await waiting;
+
+    expect(handle.killedByAbort).toBe(false);
+  });
+
+  it('keeps the abort record when spawn and wait abort listeners fire together', async () => {
+    const handle = new TestProcessHandle();
+    // Mirrors providers whose kill() leaves exitCode unset while in flight, so a
+    // second kill() reports the process as already gone.
+    const kill = vi.spyOn(handle, 'kill').mockResolvedValueOnce(true).mockResolvedValue(false);
+
+    await Promise.all([handle.killForAbort(), handle.killForAbort()]);
+
+    expect(kill).toHaveBeenCalledTimes(1);
+    expect(handle.killedByAbort).toBe(true);
+  });
+
+  it('lets a later abort retry after an abort kill throws', async () => {
+    const handle = new TestProcessHandle();
+    const kill = vi.spyOn(handle, 'kill').mockRejectedValueOnce(new Error('transport down'));
+
+    await expect(handle.killForAbort()).rejects.toThrow('transport down');
+    expect(handle.killedByAbort).toBe(false);
+
+    await handle.killForAbort();
+    expect(kill).toHaveBeenCalledTimes(2);
+    expect(handle.killedByAbort).toBe(true);
+  });
+
+  it('does not record an abort kill for a direct kill()', async () => {
+    const handle = new TestProcessHandle();
+    await handle.kill();
+    expect(handle.killedByAbort).toBe(false);
+  });
+
+  it('a wait without a signal is unaffected', async () => {
+    const handle = new TestProcessHandle();
+    const waiting = handle.wait();
+    handle.finish();
+    const result = await waiting;
+    expect(result.success).toBe(true);
   });
 });

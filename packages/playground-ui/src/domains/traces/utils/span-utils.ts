@@ -1,6 +1,18 @@
-import type { SpanRecord } from '@mastra/core/storage';
+import type { SpanRecord } from '../types';
+import { getSignalInputPreview } from './span-signal';
+import { toDate } from '@/utils/date-format';
 
 type MessageLike = { role?: string; content?: unknown };
+
+export function getSpanDurationMs(
+  startedAt: Date | string | null | undefined,
+  endedAt: Date | string | null | undefined,
+): number | undefined {
+  const startedAtMs = toDate(startedAt)?.getTime();
+  const endedAtMs = toDate(endedAt)?.getTime();
+  if (startedAtMs === undefined || endedAtMs === undefined || endedAtMs < startedAtMs) return undefined;
+  return endedAtMs - startedAtMs;
+}
 
 /**
  * Extract a truncated text preview from a span's input field.
@@ -37,11 +49,16 @@ export function getInputPreview(input: unknown, maxLength = 100): string {
       })
       .filter(Boolean);
 
-    const joined = userMessages.join(' | ');
+    const joined = userMessages.join('; ');
     if (joined.length > maxLength) {
       return joined.slice(0, maxLength) + '…';
     }
     return joined;
+  }
+
+  const signalPreview = getSignalInputPreview(input);
+  if (signalPreview !== undefined) {
+    return signalPreview.length > maxLength ? signalPreview.slice(0, maxLength) + '…' : signalPreview;
   }
 
   if (typeof input === 'string') {

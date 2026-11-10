@@ -1,6 +1,6 @@
 ---
 title: "Reference: MastraModelOutput | Streaming"
-description: "Complete reference for MastraModelOutput - the stream object returned by agent.stream() with streaming and promise-based access to model outputs."
+description: "The MastraModelOutput class is returned by .stream() and provides both streaming and promise-based access to model outputs."
 packages:
   - "@mastra/core"
 ---
@@ -9,7 +9,7 @@ import PropertiesTable from "@site/src/components/PropertiesTable";
 
 # MastraModelOutput
 
-The `MastraModelOutput` class is returned by [.stream()](./stream) and provides both streaming and promise-based access to model outputs. It supports structured output generation, tool calls, reasoning, and comprehensive usage tracking.
+The `MastraModelOutput` class is returned by [.stream()](./stream) and provides both streaming and promise-based access to model outputs. It supports structured output generation, tool calls, reasoning, and detailed usage tracking.
 
 ```typescript
 // MastraModelOutput is returned by agent.stream()
@@ -106,15 +106,15 @@ These properties resolve to final values after the stream completes:
   },
   {
     name: 'reasoning',
-    type: 'Promise<string>',
+    type: 'Promise<ReasoningChunk[]>',
     description:
-      "Complete reasoning text for models that support reasoning (like OpenAI's o1 series). Returns empty string for models without reasoning capability.",
+      "Reasoning parts for models that support reasoning (like OpenAI's o1 series). Resolves to an empty array for models without reasoning capability. Use 'reasoningText' for the reasoning as a single string.",
   },
   {
     name: 'reasoningText',
     type: 'Promise<string | undefined>',
     description:
-      "Alternative access to reasoning content. May be undefined for models that don't support reasoning, while 'reasoning' returns empty string.",
+      "Complete reasoning text, joined from all reasoning parts. Resolves to undefined for models that don't produce reasoning.",
   },
   {
     name: 'toolCalls',
@@ -312,9 +312,8 @@ These properties resolve to final values after the stream completes:
   content={[
   {
     name: 'error',
-    type: 'string | Error | { message: string; stack: string; } | undefined',
-    description:
-      'Error information if the stream encountered an error. Undefined if no errors occurred. Can be a string message, Error object, or serialized error with stack trace.',
+    type: 'Error | undefined',
+    description: 'Error object if the stream encountered an error. Undefined if no errors occurred.',
   },
 ]}
 />
@@ -360,9 +359,14 @@ These properties resolve to final values after the stream completes:
           },
           {
             name: 'reasoning',
+            type: 'ReasoningChunk[]',
+            description: 'Reasoning parts. Empty array if the model produced no reasoning',
+          },
+          {
+            name: 'reasoningText',
             type: 'string',
             isOptional: true,
-            description: 'Reasoning text if available',
+            description: 'Combined reasoning text if available',
           },
           {
             name: 'finishReason',
@@ -441,22 +445,20 @@ const user = await stream.object
 console.log('Final:', user) // { name: "John", age: 30, email: "john@example.com" }
 ```
 
-````
-
 ### Tool Calls and Results
 
 ```typescript
 const stream = await agent.stream("What's the weather in NYC?", {
-  tools: { weather: weatherTool }
-});
+  tools: { weather: weatherTool },
+})
 
 // Monitor tool calls
-const toolCalls = await stream.toolCalls;
-const toolResults = await stream.toolResults;
+const toolCalls = await stream.toolCalls
+const toolResults = await stream.toolResults
 
-console.log("Tools called:", toolCalls);
-console.log("Results:", toolResults);
-````
+console.log('Tools called:', toolCalls)
+console.log('Results:', toolResults)
+```
 
 ### Complete Output Access
 
@@ -467,7 +469,7 @@ const output = await stream.getFullOutput()
 console.log({
   text: output.text,
   usage: output.usage,
-  reasoning: output.reasoning,
+  reasoningText: output.reasoningText,
   finishReason: output.finishReason,
 })
 ```

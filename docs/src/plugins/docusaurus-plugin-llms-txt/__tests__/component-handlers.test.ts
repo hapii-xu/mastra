@@ -4,7 +4,13 @@ import rehypeParse from 'rehype-parse'
 import remarkStringify from 'remark-stringify'
 import type { Element } from 'hast'
 
-import { isPropertiesTable, handlePropertiesTable } from '../component-handlers'
+import {
+  isCardGridItems,
+  handleCardGridItems,
+  isPropertiesTable,
+  handlePropertiesTable,
+  handleTabsContainer,
+} from '../component-handlers'
 
 // Helper: parse HTML fragment into a hast Element
 function parseHtml(html: string): Element {
@@ -17,14 +23,82 @@ function parseHtml(html: string): Element {
 }
 
 // Helper: convert mdast nodes to markdown string
-function toMarkdown(nodes: ReturnType<typeof handlePropertiesTable>): string {
+function toMarkdown(nodes: ReturnType<typeof handlePropertiesTable> | ReturnType<typeof handleCardGridItems>): string {
   const mdastNodes = Array.isArray(nodes) ? nodes : [nodes]
   const root = { type: 'root' as const, children: mdastNodes as any[] }
-  return unified().use(remarkStringify).stringify(root).trim()
+  return unified().use(remarkStringify, { bullet: '-' }).stringify(root).trim()
 }
 
-// Minimal mock state (handlePropertiesTable doesn't use state)
+// Minimal mock state (these handlers don't use state)
 const mockState = {} as any
+
+describe('CardGrid items', () => {
+  it('detects the explicit card-grid slot', () => {
+    expect(isCardGridItems(parseHtml('<div data-slot="card-grid"></div>'))).toBe(true)
+    expect(isCardGridItems(parseHtml('<ul data-slot="card-grid"></ul>'))).toBe(true)
+    expect(isCardGridItems(parseHtml('<div class="grid"></div>'))).toBe(false)
+  })
+
+  it('extracts cards that are direct children of a generic grid', () => {
+    const node = parseHtml(`
+      <div data-slot="card-grid">
+        <a href="/docs/agents/overview">
+          <div data-slot="card">
+            <div data-slot="card-title">Agents</div>
+          </div>
+        </a>
+      </div>
+    `)
+
+    expect(toMarkdown(handleCardGridItems(mockState, node))).toBe('- [Agents](https://mastra.ai/docs/agents/overview)')
+  })
+
+  it('extracts cards nested in semantic list items', () => {
+    const node = parseHtml(`
+      <ul data-slot="card-grid">
+        <li>
+          <a href="/integrations/frameworks/next-js">
+            <div data-slot="card">
+              <img src="/next.svg" alt="" />
+              <span data-slot="card-title">Next.js</span>
+            </div>
+          </a>
+        </li>
+        <li>
+          <a href="https://example.com/integration">
+            <div data-slot="card">
+              <span data-slot="card-title">External integration</span>
+            </div>
+          </a>
+        </li>
+      </ul>
+    `)
+
+    expect(toMarkdown(handleCardGridItems(mockState, node))).toBe(
+      [
+        '- [Next.js](https://mastra.ai/integrations/frameworks/next-js)',
+        '- [External integration](https://example.com/integration)',
+      ].join('\n'),
+    )
+  })
+
+  it('ignores links without card markup', () => {
+    const node = parseHtml(`
+      <ul data-slot="card-grid">
+        <li><a href="/filters">Filter</a></li>
+        <li>
+          <a href="/integrations/tools/tavily">
+            <div data-slot="card"><span data-slot="card-title">Tavily</span></div>
+          </a>
+        </li>
+      </ul>
+    `)
+
+    expect(toMarkdown(handleCardGridItems(mockState, node))).toBe(
+      '- [Tavily](https://mastra.ai/integrations/tools/tavily)',
+    )
+  })
+})
 
 describe('isPropertiesTable', () => {
   it('detects element with data-testid="properties-table"', () => {
@@ -318,5 +392,58 @@ describe('handlePropertiesTable', () => {
     const node = parseHtml(html)
     const result = handlePropertiesTable(mockState, node)
     expect(Array.isArray(result) ? result : [result]).toHaveLength(0)
+  })
+})
+
+describe('Tabs container', () => {
+  const tabsState = {
+    one: (child: any) => ({
+      type: 'paragraph' as const,
+      children: [{ type: 'text' as const, value: textContent(child) }],
+    }),
+  } as any
+
+  function textContent(node: any): string {
+    if (node.type === 'text') return node.value
+    if (node.type === 'element') return (node.children ?? []).map(textContent).join('')
+    return ''
+  }
+
+  it('only pairs labels with the panels owned by the container', () => {
+    const node = parseHtml(`
+      <div class="theme-tabs-container">
+        <ul role="tablist">
+          <li role="tab">Elysia</li>
+          <li role="tab">Express</li>
+        </ul>
+        <div class="margin-top--md">
+          <div role="tabpanel">
+            <div class="theme-tabs-container">
+              <ul role="tablist">
+                <li role="tab">npm</li>
+                <li role="tab">pnpm</li>
+              </ul>
+              <div class="margin-top--md">
+                <div role="tabpanel">npm install @mastra/elysia@latest elysia</div>
+                <div role="tabpanel">pnpm add @mastra/elysia@latest elysia</div>
+              </div>
+            </div>
+          </div>
+          <div role="tabpanel">
+            npm install @mastra/express@latest
+          </div>
+        </div>
+      </div>
+    `)
+
+    const markdown = toMarkdown(handleTabsContainer(tabsState, node))
+
+    expect(markdown).toContain('**Elysia**:')
+    expect(markdown).toContain('**Express**:')
+    expect(markdown).toContain('npm install @mastra/express@latest')
+    expect(markdown).not.toContain('Tab 1')
+    // The Express panel must not inherit the first panel's Elysia content.
+    const expressSection = markdown.slice(markdown.indexOf('**Express**:'))
+    expect(expressSection).not.toContain('@mastra/elysia')
   })
 })

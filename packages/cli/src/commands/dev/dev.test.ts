@@ -3,10 +3,12 @@ import { EventEmitter } from 'node:events';
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
 
 const devBundlerConstructorSpy = vi.hoisted(() => vi.fn());
+const loadedEnvVars = vi.hoisted(() => new Map<string, string>());
 
 vi.mock('node:fs', () => ({
   writeFileSync: vi.fn(),
   existsSync: vi.fn().mockImplementation((path: string) => path.endsWith('index.ts')),
+  statSync: vi.fn().mockReturnValue({ isFile: () => true }),
 }));
 
 vi.mock('execa', () => ({
@@ -82,13 +84,14 @@ vi.mock('./DevBundler', () => {
   // Use a class for constructor (Vitest v4 requirement)
   class MockDevBundler {
     __setLogger = vi.fn();
-    loadEnvVars = vi.fn().mockResolvedValue(new Map());
+    setConfigEntryFile = vi.fn();
+    loadEnvVars = vi.fn().mockImplementation(async () => new Map(loadedEnvVars));
     prepare = vi.fn().mockResolvedValue(undefined);
     getAllToolPaths = vi.fn().mockReturnValue([]);
     watch = vi.fn().mockResolvedValue(mockWatcher);
 
     constructor(...args: any[]) {
-      devBundlerConstructorSpy(...args);
+      devBundlerConstructorSpy.apply(this, args);
     }
   }
 
@@ -625,5 +628,177 @@ describe('dev command - factory mode environment', () => {
     const restartEnv = execaMock.mock.calls[1][2].env as Record<string, string>;
     expect(restartEnv.MASTRA_FACTORY_DEV).toBe('true');
     expect(restartEnv.MASTRA_TELEMETRY_COMMAND).toBe('factory dev');
+  });
+});
+
+describe('dev command - NODE_ENV precedence', () => {
+  let execaMock: any;
+  let mockChildProcess: MockChildProcess;
+
+  beforeEach(async () => {
+    vi.resetModules();
+    vi.clearAllMocks();
+    loadedEnvVars.clear();
+
+    mockChildProcess = new MockChildProcess();
+    vi.stubGlobal('fetch', vi.fn().mockRejectedValue(new Error('server unavailable')));
+
+    const { execa } = await import('execa');
+    execaMock = vi.mocked(execa);
+    execaMock.mockReturnValue(mockChildProcess as unknown as ChildProcess);
+  });
+
+  afterEach(() => {
+    vi.unstubAllGlobals();
+    vi.clearAllMocks();
+    loadedEnvVars.clear();
+  });
+
+  const runDev = async () => {
+    const { dev } = await import('./dev');
+    await dev({
+      dir: undefined,
+      root: process.cwd(),
+      tools: undefined,
+      env: undefined,
+      inspect: false,
+      inspectBrk: false,
+      customArgs: undefined,
+      https: false,
+      debug: false,
+    });
+  };
+
+  it('lets a dotenv-provided NODE_ENV override the default', async () => {
+    loadedEnvVars.set('NODE_ENV', 'development');
+
+    await runDev();
+
+    const childEnv = execaMock.mock.calls[0][2].env as Record<string, string>;
+    expect(childEnv.NODE_ENV).toBe('development');
+  });
+
+  it('falls back to production when no dotenv file sets NODE_ENV', async () => {
+    await runDev();
+
+    const childEnv = execaMock.mock.calls[0][2].env as Record<string, string>;
+    expect(childEnv.NODE_ENV).toBe('production');
+  });
+});
+
+describe('dev command - output directory preparation', () => {
+  beforeEach(async () => {
+    vi.resetModules();
+    vi.clearAllMocks();
+
+    vi.stubGlobal('fetch', vi.fn().mockRejectedValue(new Error('server unavailable')));
+
+    const { execa } = await import('execa');
+    vi.mocked(execa).mockReturnValue(new MockChildProcess() as unknown as ChildProcess);
+  });
+
+  afterEach(() => {
+    vi.unstubAllGlobals();
+    vi.clearAllMocks();
+    devBundlerConstructorSpy.mockReset();
+  });
+
+  it('empties the output directory before extracting server options so stale build artifacts cannot be resolved', async () => {
+    const callOrder: string[] = [];
+
+    const { getServerOptions } = await import('@mastra/deployer/build');
+    vi.mocked(getServerOptions).mockImplementation(async () => {
+      callOrder.push('getServerOptions');
+      return { port: 4111, host: 'localhost' } as any;
+    });
+
+    devBundlerConstructorSpy.mockImplementation(function (this: { prepare: ReturnType<typeof vi.fn> }) {
+      this.prepare = vi.fn().mockImplementation(async () => {
+        callOrder.push('prepare');
+      });
+    });
+
+    const { dev } = await import('./dev');
+    await dev({
+      dir: undefined,
+      root: process.cwd(),
+      tools: undefined,
+      env: undefined,
+      inspect: false,
+      inspectBrk: false,
+      customArgs: undefined,
+      https: false,
+      debug: false,
+    });
+
+    expect(callOrder).toEqual(['prepare', 'getServerOptions']);
+  });
+});
+
+describe('dev command - Ctrl-C shutdown', () => {
+  const signals = ['SIGINT', 'SIGTERM', 'SIGHUP'] as const;
+  let mockChildProcess: MockChildProcess;
+  let priorListeners: Map<string, Function[]>;
+  let exitSpy: ReturnType<typeof vi.spyOn>;
+
+  beforeEach(async () => {
+    vi.resetModules();
+    vi.clearAllMocks();
+
+    mockChildProcess = new MockChildProcess();
+    vi.stubGlobal('fetch', vi.fn().mockRejectedValue(new Error('server unavailable')));
+    const { execa } = await import('execa');
+    vi.mocked(execa).mockReturnValue(mockChildProcess as unknown as ChildProcess);
+
+    priorListeners = new Map(signals.map(signal => [signal, process.listeners(signal)]));
+    exitSpy = vi.spyOn(process, 'exit').mockImplementation((() => undefined) as never);
+  });
+
+  afterEach(() => {
+    for (const signal of signals) {
+      for (const listener of process.listeners(signal)) {
+        if (!priorListeners.get(signal)!.includes(listener)) {
+          process.removeListener(signal, listener);
+        }
+      }
+    }
+    exitSpy.mockRestore();
+    vi.unstubAllGlobals();
+    vi.useRealTimers();
+    vi.clearAllMocks();
+  });
+
+  it('gives the server the same 5 seconds as a hot reload to shut down before killing it', async () => {
+    const { dev } = await import('./dev');
+    await dev({
+      dir: undefined,
+      root: process.cwd(),
+      tools: undefined,
+      env: undefined,
+      inspect: false,
+      inspectBrk: false,
+      customArgs: undefined,
+      https: false,
+      debug: false,
+    });
+    const onSigint = process.listeners('SIGINT').find(listener => !priorListeners.get('SIGINT')!.includes(listener));
+    expect(onSigint).toBeDefined();
+
+    vi.useFakeTimers();
+    onSigint!('SIGINT');
+    await vi.advanceTimersByTimeAsync(0);
+    expect(mockChildProcess.kill).toHaveBeenCalledOnce();
+
+    await vi.advanceTimersByTimeAsync(4999);
+    expect(mockChildProcess.kill).not.toHaveBeenCalledWith('SIGKILL');
+    expect(exitSpy).not.toHaveBeenCalled();
+
+    await vi.advanceTimersByTimeAsync(1);
+    expect(mockChildProcess.kill).toHaveBeenCalledWith('SIGKILL');
+    // The CLI itself outlasts that window, since its exit would signal the server again.
+    expect(exitSpy).not.toHaveBeenCalled();
+
+    await vi.advanceTimersByTimeAsync(1000);
+    expect(exitSpy).toHaveBeenCalledWith(0);
   });
 });

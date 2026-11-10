@@ -1,7 +1,9 @@
 import { ThreadLockError } from '@mastra/code-sdk/utils/thread-lock';
+import { disposeAssistantRenderState } from '../assistant-render-registry.js';
 import { ThreadSelectorComponent } from '../components/thread-selector.js';
 import { askModalQuestion } from '../modal-question.js';
 import { showModalOverlay } from '../overlay.js';
+import { clearPendingTools } from '../state.js';
 import { askCloneName, confirmClone, resetUIAfterClone } from './clone.js';
 import type { SlashCommandContext } from './types.js';
 
@@ -45,7 +47,8 @@ export function showThreadLockPrompt(
     } else if (answer === 'New thread') {
       // pendingNewThread is already true from the caller
     } else {
-      process.exit(0);
+      if (ctx.exit) ctx.exit(0);
+      else process.exit(0);
     }
   })();
 }
@@ -116,11 +119,14 @@ export async function handleThreadsCommand(ctx: SlashCommandContext): Promise<vo
           return;
         }
 
-        if (thread.resourceId !== currentResourceId) {
-          await state.controller.setResourceId(state.session, { resourceId: thread.resourceId });
+        if (state.local && thread.resourceId !== currentResourceId) {
+          await state.local.controller.setResourceId(state.local.session, { resourceId: thread.resourceId });
         }
         try {
           await state.session.thread.switch({ threadId: thread.id });
+          if (state.options.backgroundToolsEnabled) {
+            await state.waitForAgentControllerEvents?.();
+          }
         } catch (error) {
           if (error instanceof ThreadLockError) {
             showThreadLockPrompt(ctx, thread.title || thread.id, error.ownerPid, thread.id);
@@ -132,13 +138,13 @@ export async function handleThreadsCommand(ctx: SlashCommandContext): Promise<vo
         }
         state.pendingNewThread = false;
 
+        disposeAssistantRenderState(state);
         state.chatContainer.clear();
         state.allToolComponents = [];
         state.allSystemReminderComponents = [];
         state.messageComponentsById.clear();
         state.allShellComponents = [];
-        state.pendingTools.clear();
-        state.pendingTaskToolIds?.clear();
+        clearPendingTools(state);
         await ctx.renderExistingMessages();
 
         ctx.showInfo(`Switched to: ${thread.title || thread.id}`);

@@ -1,4 +1,6 @@
+import type { LanguageModelV2Prompt } from '@ai-sdk/provider-v5';
 import type { LanguageModelV3, LanguageModelV3CallOptions } from '@ai-sdk/provider-v6';
+import { aiV5PromptToAIV6Prompt } from '../../../../agent/message-list/conversion';
 import type { MastraLanguageModelV3 } from '../../shared.types';
 import { createStreamFromGenerateResult } from '../generate-to-stream';
 
@@ -29,6 +31,21 @@ function remapToolsToV3(options: LanguageModelV3CallOptions): LanguageModelV3Cal
 }
 
 /**
+ * ModelRouter exposes a V2 interface, so prompts prepared upstream may contain
+ * V2 tool-result media parts even when the resolved provider implements V3.
+ */
+function remapToolResultMediaPartsToV3(options: LanguageModelV3CallOptions): LanguageModelV3CallOptions {
+  return {
+    ...options,
+    prompt: aiV5PromptToAIV6Prompt(options.prompt as LanguageModelV2Prompt) as typeof options.prompt,
+  };
+}
+
+function remapCallOptionsToV3(options: LanguageModelV3CallOptions): LanguageModelV3CallOptions {
+  return remapToolsToV3(remapToolResultMediaPartsToV3(options));
+}
+
+/**
  * Wrapper class for AI SDK V6 (LanguageModelV3) that converts doGenerate to return
  * a stream format for consistency with Mastra's streaming architecture.
  */
@@ -36,7 +53,7 @@ export class AISDKV6LanguageModel implements MastraLanguageModelV3 {
   /**
    * The language model must specify which language model interface version it implements.
    */
-  readonly specificationVersion: 'v3' = 'v3';
+  readonly specificationVersion = 'v3' as const;
   /**
    * Name of the provider for logging purposes.
    */
@@ -45,6 +62,8 @@ export class AISDKV6LanguageModel implements MastraLanguageModelV3 {
    * Provider-specific model ID for logging purposes.
    */
   readonly modelId: string;
+  /** Full `provider/model` ID this model was resolved from, when known. */
+  id?: string;
   /**
    * Supported URL patterns by media type for the provider.
    *
@@ -55,6 +74,11 @@ export class AISDKV6LanguageModel implements MastraLanguageModelV3 {
    * @returns A map of supported URL patterns by media type (as a promise or a plain object).
    */
   supportedUrls: PromiseLike<Record<string, RegExp[]>> | Record<string, RegExp[]>;
+  /**
+   * Whether the wrapped provider model sends native structured output (for example
+   * `@ai-sdk/openai-compatible` models created with `supportsStructuredOutputs: true`).
+   */
+  readonly supportsStructuredOutputs?: boolean;
 
   #model: LanguageModelV3;
 
@@ -63,10 +87,14 @@ export class AISDKV6LanguageModel implements MastraLanguageModelV3 {
     this.provider = this.#model.provider;
     this.modelId = this.#model.modelId;
     this.supportedUrls = this.#model.supportedUrls;
+    const supportsStructuredOutputs = (config as { supportsStructuredOutputs?: unknown }).supportsStructuredOutputs;
+    if (typeof supportsStructuredOutputs === 'boolean') {
+      this.supportsStructuredOutputs = supportsStructuredOutputs;
+    }
   }
 
   async doGenerate(options: LanguageModelV3CallOptions) {
-    const result = await this.#model.doGenerate(remapToolsToV3(options));
+    const result = await this.#model.doGenerate(remapCallOptionsToV3(options));
 
     return {
       ...result,
@@ -77,7 +105,7 @@ export class AISDKV6LanguageModel implements MastraLanguageModelV3 {
   }
 
   async doStream(options: LanguageModelV3CallOptions) {
-    return await this.#model.doStream(remapToolsToV3(options));
+    return await this.#model.doStream(remapCallOptionsToV3(options));
   }
 
   /**

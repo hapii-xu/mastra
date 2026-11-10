@@ -222,7 +222,7 @@ describe('DurableAgent Scorers', () => {
 
       const result = await durableAgent.prepare('Hello', {
         returnScorerData: true,
-      } as any);
+      });
 
       expect(result.workflowInput.options.returnScorerData).toBe(true);
     });

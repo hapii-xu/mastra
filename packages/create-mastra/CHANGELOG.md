@@ -1,5 +1,665 @@
 # create-mastra
 
+## 1.39.0-alpha.2
+
+## 1.39.0-alpha.1
+
+## 1.39.0-alpha.0
+
+### Patch Changes
+
+- Fixed new projects getting an organization (v2) Gateway key, which broke Studio threads with `Gateway API error 404`. New projects now get a Gateway project key, so Studio memory and threads work again. ([#29369](https://github.com/mastra-ai/mastra/pull/29369))
+
+## 1.38.0
+
+## 1.38.0-alpha.3
+
+## 1.38.0-alpha.2
+
+## 1.38.0-alpha.1
+
+## 1.38.0-alpha.0
+
+## 1.37.0
+
+### Minor Changes
+
+- Added Mastra Gateway as a model provider in `create-mastra`. Pick **Mastra Gateway** to call every model with one key: the CLI signs you in to Mastra in the browser, creates a Gateway API key, writes it to `.env` as `MASTRA_GATEWAY_API_KEY`, and points the agent at `mastra/` models. When your balance is $0, it offers to open the Mastra dashboard's Add credits page. ([#28718](https://github.com/mastra-ai/mastra/pull/28718))
+
+  ```bash
+  npx create-mastra@latest my-app --llm mastra
+  ```
+
+## 1.37.0-alpha.3
+
+### Minor Changes
+
+- Added Mastra Gateway as a model provider in `create-mastra`. Pick **Mastra Gateway** to call every model with one key: the CLI signs you in to Mastra in the browser, creates a Gateway API key, writes it to `.env` as `MASTRA_GATEWAY_API_KEY`, and points the agent at `mastra/` models. When your balance is $0, it offers to open the Mastra dashboard's Add credits page. ([#28718](https://github.com/mastra-ai/mastra/pull/28718))
+
+  ```bash
+  npx create-mastra@latest my-app --llm mastra
+  ```
+
+## 1.37.0-alpha.2
+
+## 1.37.0-alpha.1
+
+## 1.37.0-alpha.0
+
+## 1.36.0
+
+### Patch Changes
+
+- dependencies updates: ([#28417](https://github.com/mastra-ai/mastra/pull/28417))
+  - Updated dependency [`@types/node@22.19.15` ↗︎](https://www.npmjs.com/package/@types/node/v/22.19.15) (from `22.20.5`, in `devDependencies`)
+  - Updated dependency [`posthog-node@^5.57.1` ↗︎](https://www.npmjs.com/package/posthog-node/v/5.57.1) (from `^5.46.1`, in `devDependencies`)
+  - Updated dependency [`tinyexec@^1.3.1` ↗︎](https://www.npmjs.com/package/tinyexec/v/1.3.1) (from `^1.1.1`, in `devDependencies`)
+
+## 1.36.0-alpha.7
+
+## 1.36.0-alpha.6
+
+## 1.36.0-alpha.5
+
+## 1.36.0-alpha.4
+
+### Patch Changes
+
+- dependencies updates: ([#28417](https://github.com/mastra-ai/mastra/pull/28417))
+  - Updated dependency [`@types/node@22.19.15` ↗︎](https://www.npmjs.com/package/@types/node/v/22.19.15) (from `22.20.5`, in `devDependencies`)
+  - Updated dependency [`posthog-node@^5.57.1` ↗︎](https://www.npmjs.com/package/posthog-node/v/5.57.1) (from `^5.46.1`, in `devDependencies`)
+  - Updated dependency [`tinyexec@^1.3.1` ↗︎](https://www.npmjs.com/package/tinyexec/v/1.3.1) (from `^1.1.1`, in `devDependencies`)
+
+## 1.36.0-alpha.3
+
+## 1.36.0-alpha.2
+
+## 1.36.0-alpha.1
+
+## 1.35.1-alpha.0
+
+## 1.35.0
+
+### Patch Changes
+
+- Platform sign-ins started from `create-mastra` are now attributed to `create-mastra`, so new Mastra accounts can be traced back to it. ([#27229](https://github.com/mastra-ai/mastra/pull/27229))
+
+- Bump for npm ([#27221](https://github.com/mastra-ai/mastra/pull/27221))
+
+## 1.35.0-alpha.13
+
+## 1.35.0-alpha.12
+
+## 1.35.0-alpha.11
+
+## 1.35.0-alpha.10
+
+## 1.35.0-alpha.9
+
+## 1.35.0-alpha.8
+
+## 1.35.0-alpha.7
+
+## 1.35.0-alpha.6
+
+## 1.35.0-alpha.5
+
+## 1.34.3-alpha.4
+
+## 1.34.3-alpha.3
+
+## 1.34.3-alpha.2
+
+### Patch Changes
+
+- Platform sign-ins started from `create-mastra` are now attributed to `create-mastra`, so new Mastra accounts can be traced back to it. ([#27229](https://github.com/mastra-ai/mastra/pull/27229))
+
+## 1.34.3-alpha.1
+
+## 1.34.3-alpha.0
+
+### Patch Changes
+
+- Bump for npm ([#27221](https://github.com/mastra-ai/mastra/pull/27221))
+
+## 1.34.2
+
+## 1.34.2-alpha.9
+
+## 1.34.2-alpha.8
+
+## 1.34.2-alpha.7
+
+## 1.34.2-alpha.6
+
+## 1.34.2-alpha.5
+
+## 1.34.2-alpha.4
+
+## 1.34.2-alpha.3
+
+## 1.34.2-alpha.2
+
+## 1.34.2-alpha.1
+
+## 1.34.2-alpha.0
+
+## 1.34.1
+
+## 1.34.1-alpha.4
+
+## 1.34.1-alpha.3
+
+## 1.34.1-alpha.2
+
+## 1.34.1-alpha.1
+
+## 1.34.1-alpha.0
+
+## 1.34.0
+
+## 1.34.0-alpha.9
+
+## 1.34.0-alpha.8
+
+## 1.34.0-alpha.7
+
+## 1.34.0-alpha.6
+
+## 1.34.0-alpha.5
+
+## 1.34.0-alpha.4
+
+## 1.34.0-alpha.3
+
+## 1.34.0-alpha.2
+
+## 1.33.1-alpha.1
+
+## 1.33.1-alpha.0
+
+## 1.33.0
+
+## 1.33.0-alpha.8
+
+## 1.33.0-alpha.7
+
+## 1.33.0-alpha.6
+
+## 1.33.0-alpha.5
+
+## 1.32.2-alpha.4
+
+## 1.32.2-alpha.3
+
+## 1.32.2-alpha.2
+
+## 1.32.2-alpha.1
+
+## 1.32.2-alpha.0
+
+## 1.32.1
+
+## 1.32.1-alpha.1
+
+## 1.32.1-alpha.0
+
+## 1.32.0
+
+## 1.32.0-alpha.1
+
+## 1.31.5-alpha.0
+
+## 1.31.4
+
+## 1.31.4-alpha.10
+
+## 1.31.4-alpha.9
+
+## 1.31.4-alpha.8
+
+## 1.31.4-alpha.7
+
+## 1.31.4-alpha.6
+
+## 1.31.4-alpha.5
+
+## 1.31.4-alpha.4
+
+## 1.31.4-alpha.3
+
+## 1.31.4-alpha.2
+
+## 1.31.4-alpha.1
+
+## 1.31.4-alpha.0
+
+## 1.31.3
+
+## 1.31.3-alpha.1
+
+## 1.31.3-alpha.0
+
+## 1.31.2
+
+## 1.31.2-alpha.4
+
+## 1.31.2-alpha.3
+
+## 1.31.2-alpha.2
+
+## 1.31.2-alpha.1
+
+## 1.31.2-alpha.0
+
+## 1.31.1
+
+## 1.31.1-alpha.5
+
+## 1.31.1-alpha.4
+
+## 1.31.1-alpha.3
+
+## 1.31.1-alpha.2
+
+## 1.31.1-alpha.1
+
+## 1.31.1-alpha.0
+
+## 1.31.0
+
+## 1.31.0-alpha.13
+
+## 1.31.0-alpha.12
+
+## 1.31.0-alpha.11
+
+## 1.31.0-alpha.10
+
+## 1.31.0-alpha.9
+
+## 1.31.0-alpha.8
+
+## 1.31.0-alpha.7
+
+## 1.31.0-alpha.6
+
+## 1.31.0-alpha.5
+
+## 1.31.0-alpha.4
+
+## 1.31.0-alpha.3
+
+## 1.31.0-alpha.2
+
+## 1.31.0-alpha.1
+
+## 1.31.0-alpha.0
+
+## 1.30.0
+
+## 1.30.0-alpha.7
+
+## 1.30.0-alpha.6
+
+## 1.30.0-alpha.5
+
+## 1.30.0-alpha.4
+
+## 1.29.1-alpha.3
+
+## 1.29.1-alpha.2
+
+## 1.29.1-alpha.1
+
+## 1.29.1-alpha.0
+
+## 1.29.0
+
+### Patch Changes
+
+- Updated the README's pnpm command to explicitly run the latest create-mastra release. ([#23488](https://github.com/mastra-ai/mastra/pull/23488))
+
+## 1.29.0-alpha.4
+
+## 1.28.1-alpha.3
+
+### Patch Changes
+
+- Updated the README's pnpm command to explicitly run the latest create-mastra release. ([#23488](https://github.com/mastra-ai/mastra/pull/23488))
+
+## 1.28.1-alpha.2
+
+## 1.28.1-alpha.1
+
+## 1.28.1-alpha.0
+
+## 1.28.0
+
+## 1.28.0-alpha.14
+
+## 1.28.0-alpha.13
+
+## 1.28.0-alpha.12
+
+## 1.28.0-alpha.11
+
+## 1.28.0-alpha.10
+
+## 1.28.0-alpha.9
+
+## 1.28.0-alpha.8
+
+## 1.28.0-alpha.7
+
+## 1.28.0-alpha.6
+
+## 1.28.0-alpha.5
+
+## 1.28.0-alpha.4
+
+## 1.28.0-alpha.3
+
+## 1.28.0-alpha.2
+
+## 1.28.0-alpha.1
+
+## 1.27.4-alpha.0
+
+## 1.27.3
+
+### Patch Changes
+
+- Update README to include accurate, up-to-date information ([#22858](https://github.com/mastra-ai/mastra/pull/22858))
+
+- Remove `CHANGELOG.md` from distributed npm files resulting in reduced package size ([#22737](https://github.com/mastra-ai/mastra/pull/22737))
+
+## 1.27.3-alpha.10
+
+## 1.27.3-alpha.9
+
+## 1.27.3-alpha.8
+
+### Patch Changes
+
+- Update README to include accurate, up-to-date information ([#22858](https://github.com/mastra-ai/mastra/pull/22858))
+
+## 1.27.3-alpha.7
+
+## 1.27.3-alpha.6
+
+## 1.27.3-alpha.5
+
+## 1.27.3-alpha.4
+
+## 1.27.3-alpha.3
+
+## 1.27.3-alpha.2
+
+### Patch Changes
+
+- Remove `CHANGELOG.md` from distributed npm files resulting in reduced package size ([#22737](https://github.com/mastra-ai/mastra/pull/22737))
+
+## 1.27.3-alpha.1
+
+## 1.27.3-alpha.0
+
+## 1.27.2
+
+## 1.27.2-alpha.0
+
+## 1.27.1
+
+## 1.27.1-alpha.3
+
+## 1.27.1-alpha.2
+
+## 1.27.1-alpha.1
+
+## 1.27.1-alpha.0
+
+## 1.27.0
+
+## 1.27.0-alpha.1
+
+## 1.26.2-alpha.0
+
+## 1.26.1
+
+## 1.26.1-alpha.13
+
+## 1.26.1-alpha.12
+
+## 1.26.1-alpha.11
+
+## 1.26.1-alpha.10
+
+## 1.26.1-alpha.9
+
+## 1.26.1-alpha.8
+
+## 1.26.1-alpha.7
+
+## 1.26.1-alpha.6
+
+## 1.26.1-alpha.5
+
+## 1.26.1-alpha.4
+
+## 1.26.1-alpha.3
+
+## 1.26.1-alpha.2
+
+## 1.26.1-alpha.1
+
+## 1.26.1-alpha.0
+
+## 1.26.0
+
+## 1.26.0-alpha.5
+
+## 1.26.0-alpha.4
+
+## 1.26.0-alpha.3
+
+## 1.25.2-alpha.2
+
+## 1.25.2-alpha.1
+
+## 1.25.2-alpha.0
+
+## 1.25.1
+
+### Patch Changes
+
+- Reduced create-mastra's runtime dependencies while preserving project creation behavior. ([#21649](https://github.com/mastra-ai/mastra/pull/21649))
+
+- Removed unused starter files and templates from the `create-mastra` package. The command-line tool still clones the starter repository. ([#21644](https://github.com/mastra-ai/mastra/pull/21644))
+
+## 1.25.1-alpha.15
+
+## 1.25.1-alpha.14
+
+## 1.25.1-alpha.13
+
+## 1.25.1-alpha.12
+
+## 1.25.1-alpha.11
+
+## 1.25.1-alpha.10
+
+## 1.25.1-alpha.9
+
+## 1.25.1-alpha.8
+
+### Patch Changes
+
+- Reduced create-mastra's runtime dependencies while preserving project creation behavior. ([#21649](https://github.com/mastra-ai/mastra/pull/21649))
+
+- Removed unused starter files and templates from the `create-mastra` package. The command-line tool still clones the starter repository. ([#21644](https://github.com/mastra-ai/mastra/pull/21644))
+
+## 1.25.1-alpha.7
+
+## 1.25.1-alpha.6
+
+## 1.25.1-alpha.5
+
+## 1.25.1-alpha.4
+
+## 1.25.1-alpha.3
+
+## 1.25.1-alpha.2
+
+## 1.25.1-alpha.1
+
+## 1.25.1-alpha.0
+
+## 1.25.0
+
+## 1.25.0-alpha.5
+
+## 1.25.0-alpha.4
+
+## 1.25.0-alpha.3
+
+## 1.25.0-alpha.2
+
+## 1.25.0-alpha.1
+
+## 1.24.1-alpha.0
+
+## 1.24.0
+
+### Patch Changes
+
+- Fixed generated projects to approve required pnpm native builds and externalize DuckDB bindings for experiment workers. ([#21301](https://github.com/mastra-ai/mastra/pull/21301))
+
+- dependencies updates: ([#19783](https://github.com/mastra-ai/mastra/pull/19783))
+  - Updated dependency [`posthog-node@^5.46.1` ↗︎](https://www.npmjs.com/package/posthog-node/v/5.46.1) (from `^5.37.0`, in `dependencies`)
+
+## 1.24.0-alpha.18
+
+### Patch Changes
+
+- Fixed generated projects to approve required pnpm native builds and externalize DuckDB bindings for experiment workers. ([#21301](https://github.com/mastra-ai/mastra/pull/21301))
+
+## 1.24.0-alpha.17
+
+## 1.24.0-alpha.16
+
+## 1.24.0-alpha.15
+
+## 1.24.0-alpha.14
+
+## 1.24.0-alpha.13
+
+## 1.24.0-alpha.12
+
+## 1.24.0-alpha.11
+
+## 1.24.0-alpha.10
+
+## 1.24.0-alpha.9
+
+## 1.24.0-alpha.8
+
+## 1.24.0-alpha.7
+
+## 1.24.0-alpha.6
+
+## 1.24.0-alpha.5
+
+## 1.24.0-alpha.4
+
+## 1.24.0-alpha.3
+
+## 1.23.1-alpha.2
+
+## 1.23.1-alpha.1
+
+### Patch Changes
+
+- dependencies updates: ([#19783](https://github.com/mastra-ai/mastra/pull/19783))
+  - Updated dependency [`posthog-node@^5.46.1` ↗︎](https://www.npmjs.com/package/posthog-node/v/5.46.1) (from `^5.37.0`, in `dependencies`)
+
+## 1.23.1-alpha.0
+
+## 1.23.0
+
+### Patch Changes
+
+- Fixed prerelease project creation to keep using the running create-mastra release channel when npm dist-tags have not finished updating. ([#20723](https://github.com/mastra-ai/mastra/pull/20723))
+
+## 1.23.0-alpha.2
+
+## 1.23.0-alpha.1
+
+### Patch Changes
+
+- Fixed prerelease project creation to keep using the running create-mastra release channel when npm dist-tags have not finished updating. ([#20723](https://github.com/mastra-ai/mastra/pull/20723))
+
+## 1.22.1-alpha.0
+
+## 1.22.0
+
+### Patch Changes
+
+- Add `--no-install` flag to create command. It allows you to skip dependency installation. ([#20619](https://github.com/mastra-ai/mastra/pull/20619))
+
+- Generated projects now pin every Mastra dependency to the exact version published on the invoked release channel instead of writing the channel tag (for example `alpha`) verbatim. If the CLI cannot resolve exact versions, it warns and falls back to the channel tag. ([#20448](https://github.com/mastra-ai/mastra/pull/20448))
+
+## 1.22.0-alpha.8
+
+## 1.22.0-alpha.7
+
+## 1.22.0-alpha.6
+
+### Patch Changes
+
+- Add `--no-install` flag to create command. It allows you to skip dependency installation. ([#20619](https://github.com/mastra-ai/mastra/pull/20619))
+
+## 1.22.0-alpha.5
+
+## 1.22.0-alpha.4
+
+## 1.22.0-alpha.3
+
+## 1.22.0-alpha.2
+
+## 1.21.1-alpha.1
+
+## 1.21.1-alpha.0
+
+### Patch Changes
+
+- Generated projects now pin every Mastra dependency to the exact version published on the invoked release channel instead of writing the channel tag (for example `alpha`) verbatim. If the CLI cannot resolve exact versions, it warns and falls back to the channel tag. ([#20448](https://github.com/mastra-ai/mastra/pull/20448))
+
+## 1.21.0
+
+## 1.21.0-alpha.3
+
+## 1.21.0-alpha.2
+
+## 1.21.0-alpha.1
+
+## 1.21.0-alpha.0
+
+## 1.20.3
+
+## 1.20.3-alpha.4
+
+## 1.20.3-alpha.3
+
+## 1.20.3-alpha.2
+
+## 1.20.3-alpha.1
+
+## 1.20.3-alpha.0
+
+## 1.20.2
+
+## 1.20.2-alpha.5
+
 ## 1.20.2-alpha.4
 
 ## 1.20.2-alpha.3

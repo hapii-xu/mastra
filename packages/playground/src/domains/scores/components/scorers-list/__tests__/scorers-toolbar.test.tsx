@@ -106,8 +106,8 @@ describe('ScorersToolbar', () => {
     fireEvent.change(input, { target: { value: 'abc' } });
     expect(input.value).toBe('abc');
 
-    fireEvent.click(screen.getByRole('button', { name: 'Reset' }));
-    expect(input.value).toBe('');
+    fireEvent.click(screen.getByRole('button', { name: 'Clear filters' }));
+    expect((screen.getByLabelText('Search scorers') as HTMLInputElement).value).toBe('');
     expect(onReset).toHaveBeenCalledTimes(1);
 
     act(() => vi.advanceTimersByTime(300));

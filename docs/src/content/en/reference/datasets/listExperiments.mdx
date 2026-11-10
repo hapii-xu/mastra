@@ -1,6 +1,6 @@
 ---
 title: "Reference: dataset.listExperiments() | Datasets"
-description: "Documentation for the `dataset.listExperiments()` method, which lists all experiments for a dataset."
+description: "Lists experiments (runs) for this dataset with optional filters and pagination. Filters are applied at the storage layer, so results are always scoped to the current dataset."
 packages:
   - "@mastra/core"
 ---
@@ -141,13 +141,13 @@ for (const exp of experiments) {
                   },
                   {
                     name: 'targetType',
-                    type: "'agent' | 'workflow' | 'scorer' | 'processor'",
-                    description: 'Type of target used.',
+                    type: "'agent' | 'workflow' | 'scorer' | 'processor' | null",
+                    description: 'Type of target used. `null` for caller-driven ingestion experiments.',
                   },
                   {
                     name: 'targetId',
-                    type: 'string',
-                    description: 'ID of the target used.',
+                    type: 'string | null',
+                    description: 'ID of the target used. `null` for caller-driven ingestion experiments.',
                   },
                   {
                     name: 'status',

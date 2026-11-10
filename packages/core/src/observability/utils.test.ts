@@ -1,11 +1,16 @@
 import { describe, expect, it } from 'vitest';
 
+import type { Span } from './types';
 import { SpanType } from './types';
-import { getEntityTypeForSpan, getStepAvailableToolNames } from './utils';
+import { getEntityTypeForSpan, getOrCreateSpan, getStepAvailableToolNames, nestUnderRun } from './utils';
 
 describe('getEntityTypeForSpan', () => {
   it('maps rag ingestion spans to the rag_ingestion entity type', () => {
     expect(getEntityTypeForSpan({ spanType: SpanType.RAG_INGESTION })).toBe('rag_ingestion');
+  });
+
+  it('maps classifier evaluation spans to the classifier entity type', () => {
+    expect(getEntityTypeForSpan({ spanType: SpanType.CLASSIFIER_EVALUATION })).toBe('classifier');
   });
 
   it('prefers an explicit entity type when present', () => {
@@ -38,5 +43,66 @@ describe('getStepAvailableToolNames', () => {
 
   it('returns undefined when tools is undefined', () => {
     expect(getStepAvailableToolNames(undefined, undefined)).toBeUndefined();
+  });
+});
+
+describe('getOrCreateSpan', () => {
+  it('does not let undefined tracingOptions metadata erase span metadata', () => {
+    let received: { metadata?: Record<string, unknown> } | undefined;
+    const currentSpan = {
+      createChildSpan: (options: { metadata?: Record<string, unknown> }) => {
+        received = options;
+        return {} as Span<SpanType.AGENT_RUN>;
+      },
+    } as unknown as Span<SpanType.AGENT_RUN>;
+
+    getOrCreateSpan({
+      type: SpanType.AGENT_RUN,
+      name: 'test-agent',
+      attributes: {},
+      metadata: { runId: 'run-1' },
+      tracingContext: { currentSpan },
+      tracingOptions: { metadata: { runId: undefined, experiment: 'v2' } },
+    });
+
+    expect(received?.metadata).toEqual({ runId: 'run-1', experiment: 'v2' });
+  });
+
+  it('keeps defined tracingOptions metadata precedence', () => {
+    let received: { metadata?: Record<string, unknown> } | undefined;
+    const currentSpan = {
+      createChildSpan: (options: { metadata?: Record<string, unknown> }) => {
+        received = options;
+        return {} as Span<SpanType.AGENT_RUN>;
+      },
+    } as unknown as Span<SpanType.AGENT_RUN>;
+
+    getOrCreateSpan({
+      type: SpanType.AGENT_RUN,
+      name: 'test-agent',
+      attributes: {},
+      metadata: { runId: 'run-1' },
+      tracingContext: { currentSpan },
+      tracingOptions: { metadata: { runId: 'run-override' } },
+    });
+
+    expect(received?.metadata).toEqual({ runId: 'run-override' });
+  });
+});
+
+describe('nestUnderRun', () => {
+  it('attaches the next run under the previous run', () => {
+    expect(nestUnderRun({ traceId: 'a1', spanId: 'b2' }, { tags: ['judge'] })).toEqual({
+      tags: ['judge'],
+      traceId: 'a1',
+      parentSpanId: 'b2',
+      nestUnderParent: true,
+    });
+  });
+
+  it('returns the options unchanged when the previous run was not traced', () => {
+    const tracingOptions = { tags: ['judge'] };
+    expect(nestUnderRun({}, tracingOptions)).toBe(tracingOptions);
+    expect(nestUnderRun({ traceId: 'a1' })).toBeUndefined();
   });
 });

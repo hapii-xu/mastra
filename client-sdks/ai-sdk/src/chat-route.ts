@@ -9,6 +9,11 @@ import {
   isToolUIPart,
 } from '@internal/ai-v6';
 import type { UIMessageStreamOptions as UIMessageStreamOptionsV6 } from '@internal/ai-v6';
+import {
+  createUIMessageStream as createUIMessageStreamV7,
+  createUIMessageStreamResponse as createUIMessageStreamResponseV7,
+} from '@internal/ai-v7';
+import type { UIMessageStreamOptions as UIMessageStreamOptionsV7 } from '@internal/ai-v7';
 import type { AgentExecutionOptions, AgentExecutionOptionsBase } from '@mastra/core/agent';
 import type { Mastra } from '@mastra/core/mastra';
 import type { RequestContext } from '@mastra/core/request-context';
@@ -21,7 +26,12 @@ import type {
   V5UIMessageStream,
   V6UIMessage,
   V6UIMessageStream,
+  V7UIMessage,
+  V7UIMessageStream,
+  WithTraceId,
 } from './public-types';
+import type { MastraStreamTransformOptions } from './smooth-stream';
+import { assertValidHeartbeatMs, withSseHeartbeat } from './sse-heartbeat';
 
 export interface V6NativeApprovalResponse {
   resumeData: Record<string, unknown>;
@@ -68,8 +78,9 @@ export function extractV6NativeApprovals(messages: V6UIMessage[]): V6NativeAppro
   return [...byTarget.values()];
 }
 
-/** Streams exact approval targets sequentially as one v6 UI-message response. */
+/** Streams exact approval targets sequentially as one v6/v7 UI-message response. */
 function streamV6ApprovalResumes(args: {
+  version: 'v6' | 'v7';
   agent: { resumeStream: (resumeData: unknown, options: unknown) => Promise<unknown> };
   approvals: V6NativeApprovalResponse[];
   baseOptions: Record<string, unknown>;
@@ -80,13 +91,28 @@ function streamV6ApprovalResumes(args: {
   sendFinish: boolean;
   sendReasoning: boolean;
   sendSources: boolean;
+  includeSubAgentMetadata: boolean;
   onError?: (error: unknown) => string;
   messageMetadata?: UIMessageStreamOptionsV6<V6UIMessage>['messageMetadata'];
+  experimentalTransform?: MastraStreamTransformOptions<any>;
 }): ReadableStream<any> {
   const { agent, approvals, baseOptions, structuredOutput, messages, lastMessageId } = args;
-  const { sendStart, sendFinish, sendReasoning, sendSources, onError, messageMetadata } = args;
+  const {
+    sendStart,
+    sendFinish,
+    sendReasoning,
+    sendSources,
+    includeSubAgentMetadata,
+    onError,
+    messageMetadata,
+    experimentalTransform,
+  } = args;
 
-  return createUIMessageStreamV6<any>({
+  const createUIMessageStream = (
+    args.version === 'v7' ? createUIMessageStreamV7 : createUIMessageStreamV6
+  ) as typeof createUIMessageStreamV6;
+
+  return createUIMessageStream<any>({
     originalMessages: messages,
     onError,
     execute: async ({ writer }) => {
@@ -112,6 +138,8 @@ function streamV6ApprovalResumes(args: {
             sendFinish,
             sendReasoning,
             sendSources,
+            includeSubAgentMetadata,
+            experimentalTransform,
             onError,
             messageMetadata,
           })) {
@@ -139,7 +167,11 @@ function streamV6ApprovalResumes(args: {
           successfulLegs++;
         } catch (error) {
           const id = (error as { id?: string } | undefined)?.id;
-          if (id !== 'AGENT_RESUME_TOOL_CALL_NOT_SUSPENDED' && id !== 'AGENT_RESUME_NO_SNAPSHOT_FOUND') {
+          if (
+            id !== 'AGENT_RESUME_TOOL_CALL_NOT_SUSPENDED' &&
+            id !== 'AGENT_RESUME_NO_SNAPSHOT_FOUND' &&
+            id !== 'AGENT_RESUME_ALREADY_CLAIMED'
+          ) {
             throw error;
           }
           firstResolvedTargetError ??= error;
@@ -147,7 +179,8 @@ function streamV6ApprovalResumes(args: {
       }
 
       // Re-sent history may contain already-resolved responses alongside a new
-      // one. Skip only core's exact "not suspended" errors; if none of the
+      // one, or a response another request is resuming right now. Skip only
+      // core's exact "not suspended" and "already claimed" errors; if none of the
       // targets resumed, surface the typed error instead of silently dropping
       // a potentially valid approval.
       if (successfulLegs === 0 && firstResolvedTargetError) throw firstResolvedTargetError;
@@ -162,6 +195,15 @@ function streamV6ApprovalResumes(args: {
   }) as ReadableStream<any>;
 }
 
+const CREDENTIAL_HEADER_NAMES = new Set([
+  'authorization',
+  'proxy-authorization',
+  'x-api-key',
+  'api-key',
+  'x-goog-api-key',
+  'cookie',
+]);
+
 export type ChatStreamHandlerParams<
   UI_MESSAGE extends SupportedUIMessage = SupportedUIMessage,
   OUTPUT = undefined,
@@ -170,6 +212,11 @@ export type ChatStreamHandlerParams<
   resumeData?: Record<string, any>;
   /** The trigger for the request - sent by AI SDK's useChat hook */
   trigger?: 'submit-message' | 'regenerate-message';
+};
+
+export type ChatStreamDefaultOptions<OUTPUT = undefined> = AgentExecutionOptions<OUTPUT> & {
+  /** Experimental transforms applied before converting Mastra chunks to AI SDK UI chunks. */
+  experimentalTransform?: MastraStreamTransformOptions<OUTPUT>;
 };
 
 /**
@@ -183,17 +230,25 @@ export type ChatStreamHandlerOptions<UI_MESSAGE extends SupportedUIMessage = Sup
   agentId: string;
   agentVersion?: AgentVersionOptions;
   params: ChatStreamHandlerParams<UI_MESSAGE, OUTPUT>;
-  defaultOptions?: AgentExecutionOptions<OUTPUT>;
-  version?: 'v5' | 'v6';
+  defaultOptions?: ChatStreamDefaultOptions<OUTPUT>;
+  /** Experimental transforms applied before converting Mastra chunks to AI SDK UI chunks. */
+  experimentalTransform?: MastraStreamTransformOptions<OUTPUT>;
+  version?: 'v5' | 'v6' | 'v7';
   sendStart?: boolean;
   sendFinish?: boolean;
   sendReasoning?: boolean;
   sendSources?: boolean;
+  /**
+   * Whether to emit `data-tool-agent` / `data-tool-agent-step` parts with sub-agent progress
+   * when the agent delegates to sub-agents. Defaults to `true`.
+   */
+  includeSubAgentMetadata?: boolean;
   onError?: (error: unknown) => string;
+  /** Maps stream parts to metadata on AI SDK start and finish message parts. Also receives the run's `traceId`. */
   messageMetadata?: UI_MESSAGE extends V6UIMessage
-    ? UIMessageStreamOptionsV6<UI_MESSAGE>['messageMetadata']
+    ? WithTraceId<UIMessageStreamOptionsV6<UI_MESSAGE>['messageMetadata']>
     : UI_MESSAGE extends V5UIMessage
-      ? UIMessageStreamOptionsV5<UI_MESSAGE>['messageMetadata']
+      ? WithTraceId<UIMessageStreamOptionsV5<UI_MESSAGE>['messageMetadata']>
       : never;
 };
 
@@ -202,7 +257,7 @@ type ChatStreamHandlerOptionsV5<UI_MESSAGE extends V5UIMessage = V5UIMessage, OU
   'version' | 'messageMetadata'
 > & {
   version?: 'v5';
-  messageMetadata?: UIMessageStreamOptionsV5<UI_MESSAGE>['messageMetadata'];
+  messageMetadata?: WithTraceId<UIMessageStreamOptionsV5<UI_MESSAGE>['messageMetadata']>;
 };
 
 type ChatStreamHandlerOptionsV6<UI_MESSAGE extends V6UIMessage = V6UIMessage, OUTPUT = undefined> = Omit<
@@ -210,7 +265,15 @@ type ChatStreamHandlerOptionsV6<UI_MESSAGE extends V6UIMessage = V6UIMessage, OU
   'version' | 'messageMetadata'
 > & {
   version: 'v6';
-  messageMetadata?: UIMessageStreamOptionsV6<UI_MESSAGE>['messageMetadata'];
+  messageMetadata?: WithTraceId<UIMessageStreamOptionsV6<UI_MESSAGE>['messageMetadata']>;
+};
+
+type ChatStreamHandlerOptionsV7<UI_MESSAGE extends V7UIMessage = V7UIMessage, OUTPUT = undefined> = Omit<
+  ChatStreamHandlerOptions<UI_MESSAGE, OUTPUT>,
+  'version' | 'messageMetadata'
+> & {
+  version: 'v7';
+  messageMetadata?: WithTraceId<UIMessageStreamOptionsV7<UI_MESSAGE>['messageMetadata']>;
 };
 
 /**
@@ -241,20 +304,27 @@ export function handleChatStream<UI_MESSAGE extends V5UIMessage = V5UIMessage, O
 export function handleChatStream<UI_MESSAGE extends V6UIMessage = V6UIMessage, OUTPUT = undefined>(
   options: ChatStreamHandlerOptionsV6<UI_MESSAGE, OUTPUT>,
 ): Promise<V6UIMessageStream<UI_MESSAGE>>;
+export function handleChatStream<UI_MESSAGE extends V7UIMessage = V7UIMessage, OUTPUT = undefined>(
+  options: ChatStreamHandlerOptionsV7<UI_MESSAGE, OUTPUT>,
+): Promise<V7UIMessageStream<UI_MESSAGE>>;
 export async function handleChatStream<OUTPUT = undefined>({
   mastra,
   agentId,
   agentVersion,
   params,
   defaultOptions,
+  experimentalTransform,
   version = 'v5',
   sendStart = true,
   sendFinish = true,
   sendReasoning = false,
   sendSources = false,
+  includeSubAgentMetadata = true,
   onError,
   messageMetadata,
-}: ChatStreamHandlerOptions<any, OUTPUT>): Promise<ReadableStream<any>> {
+}: Omit<ChatStreamHandlerOptions<any, OUTPUT>, 'messageMetadata'> & {
+  messageMetadata?: any;
+}): Promise<ReadableStream<any>> {
   const { messages, resumeData, runId, requestContext, trigger, ...rest } = params;
 
   if (resumeData && !runId) {
@@ -308,8 +378,24 @@ export async function handleChatStream<OUTPUT = undefined>({
   }
 
   const { structuredOutput: restStructuredOutput, ...restOptions } = rest;
-  const { structuredOutput: defaultStructuredOutput, ...defaultOptionsRest } = defaultOptions ?? {};
+  // Never let a caller's credential headers override the server's provider auth.
+  if (restOptions.modelSettings?.headers) {
+    restOptions.modelSettings = {
+      ...restOptions.modelSettings,
+      headers: Object.fromEntries(
+        Object.entries(restOptions.modelSettings.headers).filter(
+          ([name]) => !CREDENTIAL_HEADER_NAMES.has(name.toLowerCase()),
+        ),
+      ),
+    };
+  }
+  const {
+    structuredOutput: defaultStructuredOutput,
+    experimentalTransform: defaultExperimentalTransform,
+    ...defaultOptionsRest
+  } = defaultOptions ?? {};
   const structuredOutput = restStructuredOutput ?? defaultStructuredOutput;
+  const effectiveExperimentalTransform = experimentalTransform ?? defaultExperimentalTransform;
 
   const mergedProviderOptions = {
     ...defaultOptions?.providerOptions,
@@ -324,15 +410,21 @@ export async function handleChatStream<OUTPUT = undefined>({
     ...(Object.keys(mergedProviderOptions).length > 0 && { providerOptions: mergedProviderOptions }),
   };
 
-  // AI SDK v6 re-submits approval responses on assistant tool parts. Scan the
+  // AI SDK v6/v7 re-submit approval responses on assistant tool parts. Scan the
   // whole request because the answered card may be on an earlier assistant
   // message, then resume every exact run/tool-call target in request order.
   // A trailing user message remains a normal chat turn; consuming it as an
   // approval resume would silently drop the user's new request.
-  if (version === 'v6' && !resumeData && trigger !== 'regenerate-message' && messages.at(-1)?.role === 'assistant') {
+  if (
+    (version === 'v6' || version === 'v7') &&
+    !resumeData &&
+    trigger !== 'regenerate-message' &&
+    messages.at(-1)?.role === 'assistant'
+  ) {
     const approvals = extractV6NativeApprovals(messages as V6UIMessage[]);
     if (approvals.length > 0) {
       return streamV6ApprovalResumes({
+        version,
         agent: agentObj as unknown as Parameters<typeof streamV6ApprovalResumes>[0]['agent'],
         approvals,
         baseOptions,
@@ -343,7 +435,9 @@ export async function handleChatStream<OUTPUT = undefined>({
         sendFinish,
         sendReasoning,
         sendSources,
+        includeSubAgentMetadata,
         onError,
+        experimentalTransform: effectiveExperimentalTransform,
         messageMetadata: messageMetadata as UIMessageStreamOptionsV6<V6UIMessage>['messageMetadata'],
       });
     }
@@ -357,10 +451,15 @@ export async function handleChatStream<OUTPUT = undefined>({
       ? await agentObj.stream(messagesToSend, { ...baseOptions, structuredOutput })
       : await agentObj.stream(messagesToSend, baseOptions as AgentExecutionOptionsBase<unknown>);
 
-  if (version === 'v6') {
-    return createUIMessageStreamV6<any>({
+  if (version === 'v6' || version === 'v7') {
+    const createUIMessageStream = (
+      version === 'v7' ? createUIMessageStreamV7 : createUIMessageStreamV6
+    ) as typeof createUIMessageStreamV6;
+    return createUIMessageStream<any>({
       originalMessages: messages,
       execute: async ({ writer }) => {
+        // v7 UI chunks are structurally identical to v6 at runtime, so both
+        // versions share the v6 transformer and are re-typed at the boundary.
         for await (const part of toAISdkStream(result, {
           from: 'agent',
           version: 'v6',
@@ -369,6 +468,8 @@ export async function handleChatStream<OUTPUT = undefined>({
           sendFinish,
           sendReasoning,
           sendSources,
+          includeSubAgentMetadata,
+          experimentalTransform: effectiveExperimentalTransform,
           onError,
           messageMetadata: messageMetadata as UIMessageStreamOptionsV6<V6UIMessage>['messageMetadata'],
         })) {
@@ -388,6 +489,8 @@ export async function handleChatStream<OUTPUT = undefined>({
         sendFinish,
         sendReasoning,
         sendSources,
+        includeSubAgentMetadata,
+        experimentalTransform: effectiveExperimentalTransform,
         onError,
         messageMetadata: messageMetadata as UIMessageStreamOptionsV5<V5UIMessage>['messageMetadata'],
       })) {
@@ -397,9 +500,11 @@ export async function handleChatStream<OUTPUT = undefined>({
   }) as ReadableStream<any>;
 }
 
-export type chatRouteOptions<OUTPUT = undefined> = {
-  defaultOptions?: AgentExecutionOptions<OUTPUT>;
-  version?: 'v5' | 'v6';
+export type chatRouteOptions<OUTPUT = undefined, UI_MESSAGE extends SupportedUIMessage = SupportedUIMessage> = {
+  defaultOptions?: ChatStreamDefaultOptions<OUTPUT>;
+  /** Experimental transforms applied before converting Mastra chunks to AI SDK UI chunks. */
+  experimentalTransform?: MastraStreamTransformOptions<OUTPUT>;
+  version?: 'v5' | 'v6' | 'v7';
   agentVersion?: AgentVersionOptions;
 } & (
   | {
@@ -415,7 +520,13 @@ export type chatRouteOptions<OUTPUT = undefined> = {
     sendFinish?: boolean;
     sendReasoning?: boolean;
     sendSources?: boolean;
+    /** Whether to emit `data-tool-agent` / `data-tool-agent-step` parts with sub-agent progress. Defaults to `true`. */
+    includeSubAgentMetadata?: boolean;
+    /** Target interval for periodic SSE comment heartbeats. Values up to 0 disable heartbeats. `NaN`, positive infinity, and values above 2,147,483,647 throw a `RangeError`. */
+    heartbeatMs?: number;
     onError?: (error: unknown) => string;
+    /** Metadata attached to start and finish message parts in the AI SDK stream. */
+    messageMetadata?: ChatStreamHandlerOptions<UI_MESSAGE, OUTPUT>['messageMetadata'];
   };
 
 /**
@@ -431,11 +542,15 @@ export type chatRouteOptions<OUTPUT = undefined> = {
  * @param {boolean} [options.sendFinish=true] - Whether to send finish events in the stream
  * @param {boolean} [options.sendReasoning=false] - Whether to include reasoning steps in the stream
  * @param {boolean} [options.sendSources=false] - Whether to include source citations in the stream
+ * @param {boolean} [options.includeSubAgentMetadata=true] - Whether to emit `data-tool-agent` / `data-tool-agent-step` parts with sub-agent progress
+ * @param {number} [options.heartbeatMs] - Target interval for periodic SSE comment heartbeats. Already-buffered source events and stream lifecycle signals take priority. Values up to 0 disable heartbeats. `NaN`, positive infinity, and values above 2,147,483,647 throw a `RangeError`.
  * @param {(error: unknown) => string} [options.onError] - Custom error serializer streamed to the client. When omitted, errors are passed through a default serializer that strips sensitive fields (e.g. `APICallError.requestBodyValues`, which holds the system prompt) before they reach the client.
+ * @param {Function} [options.messageMetadata] - Maps stream parts to metadata attached to AI SDK start and finish message parts. Receives `{ part, traceId }`.
  *
  * @returns {ReturnType<typeof registerApiRoute>} A registered API route handler
  *
  * @throws {Error} When path doesn't include `:agentId` and no fixed agent is specified
+ * @throws {RangeError} When `heartbeatMs` is `NaN`, positive infinity, or greater than 2,147,483,647
  * @throws {Error} When agent ID is missing at runtime
  * @throws {Error} When specified agent is not found in Mastra instance
  *
@@ -458,25 +573,30 @@ export type chatRouteOptions<OUTPUT = undefined> = {
  * @remarks
  * - The route handler expects a JSON body with a `messages` array
  * - Messages should follow the format: `{ role: 'user' | 'assistant' | 'system', content: string }`
- * - The response is a Server-Sent Events (SSE) stream compatible with AI SDK v5
+ * - The response is a Server-Sent Events (SSE) stream compatible with the selected AI SDK version
  * - If both `agent` and `:agentId` are present, a warning is logged and the fixed `agent` takes precedence
  * - Request context from the incoming request overrides `defaultOptions.requestContext` if both are present
  */
-export function chatRoute<OUTPUT = undefined>({
+export function chatRoute<OUTPUT = undefined, UI_MESSAGE extends SupportedUIMessage = SupportedUIMessage>({
   path = '/chat/:agentId',
   agent,
   defaultOptions,
+  experimentalTransform,
   version = 'v5',
   agentVersion,
   sendStart = true,
   sendFinish = true,
   sendReasoning = false,
   sendSources = false,
+  includeSubAgentMetadata = true,
+  heartbeatMs,
   onError,
-}: chatRouteOptions<OUTPUT>): ReturnType<typeof registerApiRoute> {
+  messageMetadata,
+}: chatRouteOptions<OUTPUT, UI_MESSAGE>): ReturnType<typeof registerApiRoute> {
   if (!agent && !path.includes('/:agentId')) {
     throw new Error('Path must include :agentId to route to the correct agent or pass the agent explicitly');
   }
+  assertValidHeartbeatMs(heartbeatMs);
 
   return registerApiRoute(path, {
     method: 'POST',
@@ -664,24 +784,39 @@ export function chatRoute<OUTPUT = undefined>({
           abortSignal: c.req.raw.signal,
         } as any,
         defaultOptions,
+        experimentalTransform,
         sendStart,
         sendFinish,
         sendReasoning,
         sendSources,
+        includeSubAgentMetadata,
         onError,
       };
 
-      if (version === 'v6') {
+      let response: Response;
+      if (version === 'v7') {
+        const uiMessageStream = await handleChatStream({
+          ...handlerOptions,
+          version: 'v7',
+          messageMetadata: messageMetadata as UIMessageStreamOptionsV7<V7UIMessage>['messageMetadata'],
+        });
+        response = createUIMessageStreamResponseV7({ stream: uiMessageStream });
+      } else if (version === 'v6') {
         const uiMessageStream = await handleChatStream({
           ...handlerOptions,
           version: 'v6',
+          messageMetadata: messageMetadata as UIMessageStreamOptionsV6<V6UIMessage>['messageMetadata'],
         });
-
-        return createUIMessageStreamResponseV6({ stream: uiMessageStream });
+        response = createUIMessageStreamResponseV6({ stream: uiMessageStream });
+      } else {
+        const uiMessageStream = await handleChatStream({
+          ...handlerOptions,
+          messageMetadata: messageMetadata as UIMessageStreamOptionsV5<V5UIMessage>['messageMetadata'],
+        });
+        response = createUIMessageStreamResponseV5({ stream: uiMessageStream });
       }
 
-      const uiMessageStream = await handleChatStream(handlerOptions);
-      return createUIMessageStreamResponseV5({ stream: uiMessageStream });
+      return withSseHeartbeat(response, heartbeatMs);
     },
   });
 }

@@ -1,8 +1,24 @@
 import { describe, expect, it } from 'vitest';
 
+import { ProviderAuthRequiredError } from '../../auth/provider-auth-error.js';
 import { parseError } from '../errors.js';
 
 describe('parseError', () => {
+  it('classifies a provider credential failure as auth without rewriting its message', () => {
+    const parsed = parseError(new ProviderAuthRequiredError('Not logged in to Anthropic.'));
+
+    expect(parsed.type).toBe('auth');
+    expect(parsed.message).toBe('Not logged in to Anthropic.');
+  });
+
+  it('classifies a credential failure that reached the host as a flattened wire payload', () => {
+    const parsed = parseError({ name: 'ProviderAuthRequiredError', message: 'Not logged in to Anthropic.' });
+
+    expect(parsed.type).toBe('auth');
+    expect(parsed.message).toBe('Not logged in to Anthropic.');
+    expect(parsed.retryable).toBe(false);
+  });
+
   it('preserves useful detail for network-style errors', () => {
     const error = new Error('fetch failed: socket hang up');
 
@@ -45,5 +61,36 @@ describe('parseError', () => {
     expect(parsed.type).toBe('auth');
     expect(parsed.message).toBe('Access denied. You may not have permission to use this model.');
     expect(parsed.requestUrl).toBe('https://gateway-api.mastra.ai/v1/responses');
+  });
+
+  it('classifies an exhausted quota apart from a rate limit, without a retry delay', () => {
+    const error = Object.assign(new Error('You exceeded your current quota, please check your plan and billing.'), {
+      statusCode: 429,
+    });
+
+    const parsed = parseError(error);
+
+    expect(parsed.type).toBe('quota');
+    expect(parsed.retryable).toBe(false);
+    expect(parsed.retryDelay).toBeUndefined();
+  });
+
+  it('classifies a context overflow named only in the provider body', () => {
+    const error = Object.assign(new Error('Bad Request'), {
+      statusCode: 400,
+      responseBody: '{"error":{"code":"context_length_exceeded","message":"Input exceeds the context window."}}',
+    });
+
+    expect(parseError(error).type).toBe('context_length');
+  });
+
+  it.each([
+    ['usage-limit wording under a numeric status 503', { status: 503 }, 'Your weekly limit has been reached'],
+    ['auth wording under a provider outage', { statusCode: 503 }, 'Upstream authentication service unavailable'],
+  ])('retries %s as a server error', (_label, status, message) => {
+    const parsed = parseError(Object.assign(new Error(message), status));
+
+    expect(parsed.type).toBe('server_error');
+    expect(parsed.retryable).toBe(true);
   });
 });

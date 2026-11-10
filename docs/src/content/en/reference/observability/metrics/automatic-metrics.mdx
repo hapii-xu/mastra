@@ -1,6 +1,6 @@
 ---
 title: "Reference: Automatic Metrics | Observability"
-description: "Complete reference for the metrics Mastra emits automatically from traced execution."
+description: "Mastra automatically extracts performance and usage metrics from traced execution. This page is the complete reference for every metric name, label, and context field that Mastra emits."
 packages:
   - "@mastra/observability"
 ---
@@ -13,11 +13,11 @@ For setup instructions, see the [Metrics overview](/docs/observability/metrics/o
 
 ## When Mastra emits automatic metrics
 
-Metrics are extracted from spans when they end. The observability layer inspects each completed span, calculates duration, and (for model generation spans) reads token usage data. No manual instrumentation is needed.
+Metrics are extracted from spans when they end. The observability layer inspects each completed span, calculates duration, and reads token usage data from model generation and classifier evaluation spans. No manual instrumentation is needed.
 
 ### What affects whether a metric is available
 
-Two conditions must be true for a metric to reach storage:
+A metric reaches storage when:
 
 1. `MastraStorageExporter` is configured as an exporter.
 1. The storage backend supports metrics (ClickHouse, DuckDB, or Postgres v-next with the observability domain enabled).
@@ -38,7 +38,7 @@ Duration metrics record execution time in milliseconds, calculated from the span
 
 ## Token usage metrics
 
-Token metrics are emitted only from `MODEL_GENERATION` spans that include `usage` data. If the provider doesn't report usage, no token metrics are emitted for that span.
+Token metrics are emitted from `MODEL_GENERATION` and `CLASSIFIER_EVALUATION` spans that include `usage` data. Token metrics require usage data from the provider.
 
 ### Input token metrics
 
@@ -48,6 +48,8 @@ Token metrics are emitted only from `MODEL_GENERATION` spans that include `usage
 | `mastra_model_input_text_tokens` | Text tokens in the input prompt |
 | `mastra_model_input_cache_read_tokens` | Tokens read from prompt cache (e.g. Anthropic) |
 | `mastra_model_input_cache_write_tokens` | Tokens written to prompt cache |
+| `mastra_model_input_cache_write_5m_tokens` | Tokens written to prompt cache with a 5-minute TTL (e.g. Anthropic) |
+| `mastra_model_input_cache_write_1h_tokens` | Tokens written to prompt cache with a 1-hour TTL (e.g. Anthropic) |
 | `mastra_model_input_audio_tokens` | Audio tokens in the input (multimodal models) |
 | `mastra_model_input_image_tokens` | Image tokens in the input (vision models) |
 
@@ -69,7 +71,19 @@ The detailed breakdown metrics (everything except `total_input` and `total_outpu
 
 ### When cost context is attached
 
-Cost context is attached to token metrics when the embedded pricing registry has a matching entry for the provider and model. The registry ships with Mastra and covers common providers and models. If no match is found, token metrics are still emitted but without cost fields.
+Cost context is attached to token metrics when the provider reports a valid cost for every completed model step or when the pricing registry has a matching entry for the provider and model. Mastra sums the per-step provider costs into one query total. If any completed step lacks a valid reported cost, Mastra uses the pricing registry instead of reporting a partial total. If neither source is available, token metrics are still emitted without cost fields.
+
+A caller-supplied `costContext` takes precedence over provider-reported costs and pricing registry estimates. Provider-reported totals use `costMetadata.source: 'provider_reported'`, `costMetadata.scope: 'query_total'`, and `costMetadata.reportedStepCount` to identify the source, scope, and number of completed steps included in the total.
+
+### Where prices come from
+
+The pricing registry uses model prices from [models.dev](https://models.dev). `@mastra/observability` includes a snapshot of these prices, and each new release of the package includes recent prices. Stored cost estimates aren't recalculated when prices change. A [custom gateway](/models/gateways/custom-gateways#model-pricing) can return its own `pricing` for models that models.dev doesn't list. These prices only fill in models that models.dev doesn't price.
+
+When you run `mastra dev`, Mastra also refreshes prices from models.dev in the background once a day, and when a model has no price. Cost estimates don't wait for a refresh, so the first call to a newly released model can still have no cost. In other environments, such as production, you can turn on the refresh with `MASTRA_AUTO_REFRESH_PRICING=true`.
+
+Refreshed prices are cached in `~/.cache/mastra/pricing-data.json` and reused by later processes. If a refresh fails, Mastra keeps the prices it already has.
+
+To use only the bundled snapshot, set `MASTRA_AUTO_REFRESH_PRICING=false`. Setting `MASTRA_OFFLINE=true` also turns off the refresh.
 
 ### What cost fields may be included
 
@@ -77,17 +91,17 @@ Cost context is attached to token metrics when the embedded pricing registry has
 | - | - |
 | `provider` | Provider name (e.g. `openai`, `anthropic`) |
 | `model` | Model identifier (e.g. `gpt-4o`, `claude-sonnet-4-20250514`) |
-| `estimatedCost` | Estimated cost for this metric, calculated from token count and pricing tier |
+| `estimatedCost` | Estimated cost from token count and pricing tier, or a total reported by the provider |
 | `costUnit` | Currency unit (e.g. `USD`) |
-| `costMetadata` | Additional pricing context (tier information, error details) |
+| `costMetadata` | Additional pricing context, including tier information, error details, and provider-reported cost source and scope |
 
 ## Correlation with traces
 
 ### How metrics relate to spans and trace context
 
-Each metric carries a `CorrelationContext` snapshot from the span that produced it. This context is stored alongside the metric value and lets you navigate from a metric to the exact span and trace.
+Each metric carries a `CorrelationContext` snapshot from the span that produced it. This context is stored alongside the metric value and links a metric to the exact span and trace.
 
-The correlation fields are grouped into four categories:
+Correlation fields use these categories:
 
 **Trace correlation**
 
@@ -115,7 +129,7 @@ The correlation fields are grouped into four categories:
 
 ### Why correlation helps with debugging
 
-When you spot a spike in latency or token usage on the Metrics dashboard, correlation context lets you drill directly into the trace that produced the metric. From there you can inspect the individual span to find the root cause: a slow tool call, a large prompt, or an unexpected error.
+When you spot a spike in latency or token usage on the Metrics dashboard, correlation context lets you drill directly into the trace that produced the metric. From there you can inspect the individual span. The root cause might be a slow tool call or a large prompt. It might also be an unexpected error.
 
 ## Troubleshooting
 
@@ -133,11 +147,11 @@ When you spot a spike in latency or token usage on the Metrics dashboard, correl
 
 ### Token metrics are missing
 
-- **Span is a model generation**: Token metrics are only emitted from `MODEL_GENERATION` spans.
-- **Provider reports usage**: The model provider must include `usage` data in its response. If usage is absent, no token metrics are emitted.
+- **Span is a model generation or classifier evaluation**: Token metrics are only emitted from `MODEL_GENERATION` and `CLASSIFIER_EVALUATION` spans.
+- **Provider reports usage**: The model provider must include `usage` data in its response. Usage data is required to emit token metrics.
 
 ## Related
 
 - [Metrics overview](/docs/observability/metrics/overview)
-- [Querying metrics](/docs/observability/metrics/querying)
+- [Metric queries](/reference/observability/metrics/queries)
 - [Studio observability](/docs/studio/observability)

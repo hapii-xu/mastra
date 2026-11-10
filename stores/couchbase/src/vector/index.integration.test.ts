@@ -50,10 +50,10 @@ async function setupCluster() {
   }
 }
 
-async function waitForFtsReady(bucket: Bucket): Promise<void> {
+async function waitForFtsReady(cluster: Cluster): Promise<void> {
   const maxAttempts = 30;
   for (let attempt = 0; attempt < maxAttempts; attempt++) {
-    const report = await bucket.ping({ serviceTypes: [ServiceType.Search] });
+    const report = await cluster.ping({ serviceTypes: [ServiceType.Search] });
     const endpoints = report.services[ServiceType.Search] ?? [];
     if (endpoints.length > 0 && endpoints.every(ep => ep.state === PingState.Ok)) {
       console.log(`FTS service ready after ${attempt + 1} attempt(s)`);
@@ -95,11 +95,10 @@ async function checkBucketHealth(
         responseData.nodes[0].status === 'healthy'
       ) {
         return;
-      } else {
-        console.log(`Attempt ${attempt + 1}/${maxAttempts}: Bucket '${bucketName}' health check failed`);
-        await new Promise(resolve => setTimeout(resolve, 1000));
-        attempt++;
       }
+      console.log(`Attempt ${attempt + 1}/${maxAttempts}: Bucket '${bucketName}' health check failed`);
+      await new Promise(resolve => setTimeout(resolve, 1000));
+      attempt++;
     } catch (error) {
       console.log(
         `Attempt ${attempt + 1}/${maxAttempts}: Bucket '${bucketName}' health check failed with error: ${error.message}`,
@@ -153,9 +152,8 @@ describe('Integration Testing CouchbaseVector', async () => {
         }
         bucket = cluster.bucket(test_bucketName);
 
-        // Wait for FTS to be fully ready via the SDK's built-in ping.
-        // Replaces the original 10s fixed sleep in setupCluster.
-        await waitForFtsReady(bucket);
+        // The bucket is not open yet, so its ping report has no service endpoints.
+        await waitForFtsReady(cluster);
 
         // If scope or collection are not there, then create it
         const all_scopes = await bucket.collections().getAllScopes();
@@ -528,6 +526,24 @@ describe('Integration Testing CouchbaseVector', async () => {
       } catch (error) {
         expect(error).toBeInstanceOf(Error);
       }
+    });
+
+    it('should delete only the requested vectors by ID', async () => {
+      const ids = await couchbase_client.upsert({ indexName: test_indexName, vectors: testVectors });
+
+      await couchbase_client.deleteVectors({ indexName: test_indexName, ids: ids.slice(0, 2) });
+
+      await expect(collection.get(ids[0])).rejects.toThrow();
+      await expect(collection.get(ids[1])).rejects.toThrow();
+      await expect(collection.get(ids[2])).resolves.toHaveProperty('content.embedding', testVectors[2]);
+    });
+
+    it('should ignore missing IDs and delete the existing vectors', async () => {
+      const ids = await couchbase_client.upsert({ indexName: test_indexName, vectors: testVectors });
+      await couchbase_client.deleteVectors({ indexName: test_indexName, ids: ['missing-vector-id', ids[0]] });
+
+      await expect(collection.get(ids[0])).rejects.toThrow();
+      await expect(collection.get(ids[1])).resolves.toHaveProperty('content.embedding', testVectors[1]);
     });
   });
 

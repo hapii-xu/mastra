@@ -3,7 +3,7 @@ import type { Adapter, StreamChunk, Thread } from 'chat';
 import type { IMastraLogger } from '../logger/logger';
 import type { AgentChunkType } from '../stream/types';
 import { chatModule } from './chat-lazy';
-import { formatToolApproval } from './formatting';
+import { formatTaskTitle, formatToolApproval } from './formatting';
 import { asOmChunk, formatTokens, renderOmTaskUpdate } from './om';
 import type { PendingApprovalRecord } from './stream-helpers';
 import {
@@ -14,7 +14,13 @@ import {
   postTripwire,
   renderBuiltInToolEvent,
 } from './stream-helpers';
-import type { PostableMessage, ToolDisplayEvent, ToolDisplayFn } from './types';
+import type { PostableMessage, ToolDisplayEvent, ToolDisplayFn, ToolDisplayResult } from './types';
+
+/**
+ * Header for the tool Plan widget. The rows carry the per-tool detail, so
+ * the header is a fixed label rather than an echo of the current row.
+ */
+const PLAN_TITLE = 'Working…';
 
 export interface StreamingDriverArgs {
   stream: AsyncIterable<AgentChunkType<any>>;
@@ -32,7 +38,7 @@ export interface StreamingDriverArgs {
    * renderers are bypassed and this is called once per tool lifecycle event.
    * A `{ kind: 'post' }` return triggers the close/post/reopen lifecycle
    * (same as `'cards'`/`'text'`); a `{ kind: 'stream' }` return pushes the
-   * chunk into the active streaming session.
+   * chunk into the streaming session, subject to its `openIfEmpty` policy.
    */
   toolDisplayFn?: ToolDisplayFn;
   streamingOptions?: { updateIntervalMs?: number };
@@ -65,6 +71,12 @@ export interface StreamingDriverArgs {
   typingGate: { active: boolean };
   /** Optional adapter-supplied formatter for `error` chunks; defaults to a plain prefix. */
   formatError?: (error: Error) => unknown;
+  /**
+   * Dialect for the final reply text on the buffered fallback path.
+   * `'markdown'` (the absent-value default) posts `{ markdown }`; `'plain'`
+   * posts the bare string. The native streaming path is always markdown.
+   */
+  textFormat?: 'markdown' | 'plain';
 }
 
 interface StreamingSession {
@@ -95,6 +107,7 @@ export async function runStreamingDriver({
   takePendingApproval,
   typingGate,
   formatError,
+  textFormat,
 }: StreamingDriverArgs): Promise<void> {
   const platform = adapter.name;
 
@@ -117,6 +130,7 @@ export async function runStreamingDriver({
   // and a plain `let` would get narrowed to its initial `null` between
   // iterations of the for-await loop).
   const sessionRef: { current: StreamingSession | null } = { current: null };
+  const pendingInitialText: string[] = [];
 
   // Tracks OM cycles currently in `'in_progress'` so we can flush them as
   // `'complete'` before closing the session. OM buffering runs async in the
@@ -143,11 +157,15 @@ export async function runStreamingDriver({
     } | null;
   } = { current: null };
 
-  // Whether we have set a non-default plan title this session. The chat
-  // SDK falls back to "Thinking completed" when no `plan_update` ever fires
-  // — push a meaningful title with the first OM event so memory-only runs
-  // don't show the default.
+  // Whether we have set a plan title this session. The chat SDK falls back
+  // to "Thinking completed" when no `plan_update` ever fires, so the first
+  // tool or OM event pushes one.
   const planTitleRef: { current: boolean } = { current: false };
+
+  // Whether a tool row has been pushed this session. Kept apart from
+  // `planTitleRef` because an OM event can set a header first; the opener
+  // split and the `Working…` header both key off tool rows specifically.
+  const toolTasksRef: { current: boolean } = { current: false };
 
   const openSession = (): StreamingSession => {
     let buffer: (string | StreamChunk)[] = [];
@@ -197,7 +215,7 @@ export async function runStreamingDriver({
         const cleaned = fallback.replace(/[\u200B-\u200D\uFEFF]/g, '').trim();
         if (cleaned) {
           try {
-            await chatThread.post(cleaned);
+            await chatThread.post(textFormat === 'plain' ? cleaned : { markdown: cleaned });
           } catch (postErr) {
             logger?.debug('[CHANNEL] buffered fallback also failed', { error: postErr });
           }
@@ -232,7 +250,10 @@ export async function runStreamingDriver({
 
   const closeSession = async () => {
     const s = sessionRef.current;
-    if (!s) return;
+    if (!s) {
+      pendingInitialText.length = 0;
+      return;
+    }
     // OM buffering is background work that often finishes after the session
     // closes. The chat-SDK plan widget flips any still-`in_progress` task to
     // an error icon at stream end, so optimistically mark pending OM tasks
@@ -244,6 +265,7 @@ export async function runStreamingDriver({
     pendingOmTasks.clear();
     aggregatedRecallRef.current = null;
     planTitleRef.current = false;
+    toolTasksRef.current = false;
     sessionRef.current = null;
     s.close();
     await s.done;
@@ -259,7 +281,16 @@ export async function runStreamingDriver({
    */
   const pushToSession = (piece: string | StreamChunk) => {
     if (!sessionRef.current) sessionRef.current = openSession();
+    for (const pendingPiece of pendingInitialText) {
+      sessionRef.current.push(pendingPiece);
+    }
+    pendingInitialText.length = 0;
     sessionRef.current.push(piece);
+  };
+
+  const pushToolDisplayResult = (result: Extract<ToolDisplayResult, { kind: 'stream' }>): void => {
+    if (result.openIfEmpty === false && !sessionRef.current) return;
+    pushToSession(result.chunk);
   };
 
   // Cached task titles for resumed-approval runs: a `tool-result` may arrive
@@ -268,7 +299,30 @@ export async function runStreamingDriver({
   // to the approval card's stashed displayName + argsSummary.
   const lookupTaskTitle = (toolCallId: string, fallback: string): string => {
     const stash = getPendingApproval(toolCallId);
-    return stash ? `${stash.displayName} ${stash.argsSummary}` : fallback;
+    return stash ? formatTaskTitle(stash.displayName, stash.argsSummary, stash.args) : fallback;
+  };
+
+  // Push a tool row into the Plan widget. The first row of a session also
+  // sets the header: one fixed label, because mirroring each row's title
+  // into it made a single-tool run read the same line twice. Result-only
+  // sessions (a resumed approval whose `tool-call` we never saw) go through
+  // here too, so they get a header instead of the SDK's fallback.
+  //
+  // In grouped mode the first row also closes any text-only session first,
+  // so an "On it — checking X" opener posts as its own message instead of
+  // landing under the widget (Slack renders tasks above text in one post).
+  // Only until the first tool row: every later step keeps accumulating under
+  // the one widget. Memory rows alone don't count — an OM event before the
+  // first tool must not pin the opener either. Timeline splits per step at
+  // the `tool-call` site instead.
+  const pushToolTask = async (task: Extract<StreamChunk, { type: 'task_update' }>) => {
+    if (!toolTasksRef.current) {
+      if (toolDisplay === 'grouped' && sessionRef.current) await closeSession();
+      pushToSession({ type: 'plan_update', title: PLAN_TITLE });
+      planTitleRef.current = true;
+      toolTasksRef.current = true;
+    }
+    pushToSession(task);
   };
 
   /**
@@ -277,6 +331,16 @@ export async function runStreamingDriver({
    * chunk reopen a fresh session. Used for `'cards'`/`'text'` tool events
    * and `ToolDisplayFn` `{ kind: 'post' }` returns.
    */
+  /**
+   * Skip blank tool posts so a fn that intentionally returns "" or an empty
+   * `{ markdown }` doesn't post or edit in an empty platform message.
+   * Mirrors the static driver's guard in `renderToolEvent`.
+   */
+  const isBlankToolMessage = (message: PostableMessage): boolean => {
+    if (typeof message === 'string') return message.trim().length === 0;
+    return 'markdown' in message && message.markdown.trim().length === 0;
+  };
+
   const postOutOfBand = async (message: PostableMessage): Promise<string | undefined> => {
     await closeSession();
     try {
@@ -291,7 +355,8 @@ export async function runStreamingDriver({
   /**
    * Dispatch a tool lifecycle event:
    *   - If `toolDisplayFn` is set, call it. `{ kind: 'post' }` → close /
-   *     post / reopen. `{ kind: 'stream' }` → push to active session.
+   *     post / reopen. `{ kind: 'stream' }` → push according to its session
+   *     policy.
    *     `undefined` → skip.
    *   - Else if `toolDisplay` renders inside the Plan widget
    *     (`'timeline'`/`'grouped'`/`'hidden'`), return null so the caller
@@ -306,11 +371,12 @@ export async function runStreamingDriver({
       const result = toolDisplayFn(event, { mode: 'streaming', platform });
       if (result == null) return { posted: true };
       if (result.kind === 'stream') {
-        pushToSession(result.chunk);
+        pushToolDisplayResult(result);
         return { posted: false };
       }
       // kind === 'post'
-      const id = result.message != null ? await postOutOfBand(result.message) : undefined;
+      const id =
+        result.message != null && !isBlankToolMessage(result.message) ? await postOutOfBand(result.message) : undefined;
       return { posted: true, messageId: id };
     }
     if (rendersToolsInPlan || toolDisplay === 'hidden') {
@@ -416,6 +482,10 @@ export async function runStreamingDriver({
     if (chunk.type === 'text-delta') {
       const piece = chunk.payload.text;
       if (!piece) continue;
+      if (!sessionRef.current && !piece.replace(/[\u200B-\u200D\uFEFF]/g, '').trim()) {
+        pendingInitialText.push(piece);
+        continue;
+      }
       pushToSession(piece);
       continue;
     }
@@ -448,7 +518,6 @@ export async function runStreamingDriver({
     }
 
     if (chunk.type === 'finish') {
-      await closeSession();
       tracker.reset();
       continue;
     }
@@ -481,11 +550,10 @@ export async function runStreamingDriver({
         continue;
       }
 
-      // For Plan-widget modes, close any active text-only session before
-      // the first tool of a step in timeline mode so the preceding text
-      // posts as its own platform message. In grouped mode keep the
-      // session open so every task accumulates under one plan widget.
-      if (toolDisplay === 'timeline' && sessionRef.current && tracker.inFlightCount === 1) {
+      // Timeline: close any active text-only session before each step's
+      // first tool so the preceding text posts as its own platform message.
+      // (Grouped does the equivalent once, inside `pushToolTask`.)
+      if (sessionRef.current && toolDisplay === 'timeline' && tracker.inFlightCount === 1) {
         await closeSession();
       }
 
@@ -520,17 +588,10 @@ export async function runStreamingDriver({
       }
 
       // 'timeline' | 'grouped' — push task_update into Plan widget.
-      const taskTitle = `${enr.displayName} ${enr.argsSummary}`;
-      if (toolDisplay === 'grouped') {
-        // Mirror the task title (with inline args) into the plan title so
-        // Slack's AI Assistant Thinking Steps widget shows the current
-        // tool instead of the default "Thinking…"/"completed" label.
-        pushToSession({ type: 'plan_update', title: taskTitle });
-      }
-      pushToSession({
+      await pushToolTask({
         type: 'task_update',
         id: enr.toolCallId,
-        title: taskTitle,
+        title: formatTaskTitle(enr.displayName, enr.argsSummary, enr.args),
         status: 'in_progress',
       });
       continue;
@@ -569,10 +630,11 @@ export async function runStreamingDriver({
           );
           if (result == null) continue;
           if (result.kind === 'stream') {
-            pushToSession(result.chunk);
+            pushToolDisplayResult(result);
             continue;
           }
-          if (result.message != null) await editOrPost(messageId, result.message);
+          if (result.message != null && !isBlankToolMessage(result.message))
+            await editOrPost(messageId, result.message);
           continue;
         }
         const message = renderBuiltInToolEvent(
@@ -595,10 +657,9 @@ export async function runStreamingDriver({
       }
 
       // 'timeline' | 'grouped' — push task_update into Plan widget.
-      const fallbackTitle = `${enr.displayName} ${enr.argsSummary}`;
+      const fallbackTitle = formatTaskTitle(enr.displayName, enr.argsSummary, enr.args);
       const taskTitle = lookupTaskTitle(enr.toolCallId, fallbackTitle);
-      pushToSession({ type: 'plan_update', title: taskTitle });
-      pushToSession({
+      await pushToolTask({
         type: 'task_update',
         id: enr.toolCallId,
         title: taskTitle,
@@ -641,10 +702,11 @@ export async function runStreamingDriver({
           );
           if (result == null) continue;
           if (result.kind === 'stream') {
-            pushToSession(result.chunk);
+            pushToolDisplayResult(result);
             continue;
           }
-          if (result.message != null) await editOrPost(messageId, result.message);
+          if (result.message != null && !isBlankToolMessage(result.message))
+            await editOrPost(messageId, result.message);
           continue;
         }
         const message = renderBuiltInToolEvent(
@@ -666,12 +728,12 @@ export async function runStreamingDriver({
       }
 
       // 'timeline' | 'grouped' — push task_update into Plan widget.
-      const fallbackTitle = `${enr.displayName} ${enr.argsSummary}`;
+      const fallbackTitle = formatTaskTitle(enr.displayName, enr.argsSummary, enr.args);
       const taskTitle = lookupTaskTitle(enr.toolCallId, fallbackTitle);
       // Mark as `complete` rather than `error` so a single failing tool
       // doesn't flip the overall plan header to ⚠. The error text in
       // `details` is enough to convey the failure inline.
-      pushToSession({
+      await pushToolTask({
         type: 'task_update',
         id: enr.toolCallId,
         title: taskTitle,
@@ -687,7 +749,7 @@ export async function runStreamingDriver({
         toolName: chunk.payload.toolName,
         args: chunk.payload.args,
       });
-      const taskTitle = `${enr.displayName} ${enr.argsSummary}`;
+      const taskTitle = formatTaskTitle(enr.displayName, enr.argsSummary, enr.args);
       // Only park the plan row in modes where tool calls are already rendered
       // in the plan. Non-plan modes (`'cards'`/`'text'`/`'hidden'`) would
       // otherwise flash a one-row Plan widget that closes immediately after.
@@ -702,10 +764,27 @@ export async function runStreamingDriver({
         });
       }
       await closeSession();
-      // Approval cards are always rendered as Block Kit (`useCards: true`)
-      // so the Approve/Deny buttons render — non-cards modes never opt out
-      // of rich approval rendering.
-      const approvalMessage = formatToolApproval(enr.displayName, enr.argsSummary, enr.toolCallId, true);
+      // Approval cards default to Block Kit (`useCards: true`) so the
+      // Approve/Deny buttons render — string modes never opt out of rich
+      // approval rendering. A custom `toolDisplayFn` may supply the message
+      // instead; nullish / blank / `stream` results fall back to the built-in
+      // card so the approval always stays actionable (mirrors the static
+      // driver's `renderToolEvent`).
+      let approvalMessage: PostableMessage = formatToolApproval(enr.displayName, enr.argsSummary, enr.toolCallId, true);
+      if (toolDisplayFn) {
+        const approvalEvent: ToolDisplayEvent = {
+          kind: 'approval',
+          toolCallId: enr.toolCallId,
+          toolName: enr.toolName,
+          displayName: enr.displayName,
+          argsSummary: enr.argsSummary,
+          args: enr.args,
+        };
+        const result = toolDisplayFn(approvalEvent, { mode: 'streaming', platform });
+        if (result?.kind === 'post' && result.message != null && !isBlankToolMessage(result.message)) {
+          approvalMessage = result.message;
+        }
+      }
       // Prefer editing the running tool-card posted by `tool-call` (cards
       // mode stashes it in `toolMessageIds`) so the approval buttons replace
       // the running card in-place. Fall back to a re-posted approval message

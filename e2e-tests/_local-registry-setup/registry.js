@@ -1,10 +1,11 @@
 import { fork, execSync } from 'node:child_process';
 import { existsSync } from 'node:fs';
-import { copyFile, mkdir, writeFile } from 'node:fs/promises';
+import { copyFile, mkdir, readFile, unlink, writeFile } from 'node:fs/promises';
 import { createRequire } from 'node:module';
 import { dirname, join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { prepareMonorepo } from './prepare.js';
+import { E2E_TAG } from './publish-roots.js';
 import { publishPackages } from './publish.js';
 
 let require = global.require;
@@ -14,11 +15,25 @@ if (typeof require === 'undefined') {
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 
-function resolveVerdaccioPath() {
+export function resolveVerdaccioPathFrom(requireFrom) {
+  const manifestPath = requireFrom.resolve('verdaccio/package.json');
+  const manifest = requireFrom(manifestPath);
+  const binPath = typeof manifest.bin === 'string' ? manifest.bin : manifest.bin?.verdaccio;
+  if (!binPath) {
+    throw new Error(`Verdaccio package at ${manifestPath} does not declare a verdaccio binary`);
+  }
+  return resolve(dirname(manifestPath), binPath);
+}
+
+export function resolveVerdaccioPath() {
   try {
-    return require.resolve('verdaccio/bin/verdaccio');
-  } catch {
-    return createRequire(join(process.cwd(), 'package.json')).resolve('verdaccio/bin/verdaccio');
+    return resolveVerdaccioPathFrom(require);
+  } catch (primaryError) {
+    try {
+      return resolveVerdaccioPathFrom(createRequire(join(process.cwd(), 'package.json')));
+    } catch (fallbackError) {
+      throw new AggregateError([primaryError, fallbackError], 'Unable to resolve the Verdaccio binary');
+    }
   }
 }
 
@@ -52,6 +67,11 @@ export async function startRegistry(verdaccioPath, port, location = process.cwd(
   const registry = await runRegistry(verdaccioPath, ['-c', configPath, '-l', `${port}`], {
     cwd: location,
   });
+
+  if (process.env.MASTRA_E2E_REGISTRY_PID_FILE) {
+    await mkdir(dirname(process.env.MASTRA_E2E_REGISTRY_PID_FILE), { recursive: true });
+    await writeFile(process.env.MASTRA_E2E_REGISTRY_PID_FILE, `${registry.pid}\n`);
+  }
 
   // Set a dummy auth token for npm/pnpm (required by npm even if registry doesn't validate it)
   execSync(`npm config set //localhost:${port}/:_authToken dummy-token`);
@@ -95,6 +115,17 @@ export async function stopRegistry(registry) {
       resolve();
     }
   });
+
+  const pidFile = process.env.MASTRA_E2E_REGISTRY_PID_FILE;
+  if (pidFile) {
+    try {
+      if ((await readFile(pidFile, 'utf8')).trim() === String(registry.pid)) {
+        await unlink(pidFile);
+      }
+    } catch (error) {
+      if (error?.code !== 'ENOENT') throw error;
+    }
+  }
 }
 
 export async function startPublishedRegistry({
@@ -120,14 +151,8 @@ export async function startPublishedRegistry({
 
 export async function startPublishedRegistryFromEnv() {
   const storageDir = process.env.MASTRA_E2E_REGISTRY_STORAGE;
-  const tag = process.env.MASTRA_E2E_REGISTRY_TAG;
-
-  if (!storageDir && !tag) {
+  if (!storageDir) {
     return null;
-  }
-
-  if (!storageDir || !tag) {
-    throw new Error('MASTRA_E2E_REGISTRY_STORAGE and MASTRA_E2E_REGISTRY_TAG must be set together');
   }
 
   const registry = await startPublishedRegistry({
@@ -136,7 +161,7 @@ export async function startPublishedRegistryFromEnv() {
     port: Number(process.env.MASTRA_E2E_REGISTRY_PORT || 4873),
   });
 
-  return { tag, registry };
+  return { tag: E2E_TAG, registry };
 }
 
 export async function setupPublishedRegistryFromEnv(project) {
@@ -154,19 +179,14 @@ export async function setupPublishedRegistryFromEnv(project) {
 
 export async function createPublishedRegistry({
   rootDir,
-  tag,
   port = 4873,
   configPath,
   storageDir,
   publishFilters,
-  publishGroups,
   verdaccioPath = resolveVerdaccioPath(),
 }) {
   if (!rootDir) {
     throw new Error('rootDir is required to create a published registry');
-  }
-  if (!tag) {
-    throw new Error('tag is required to create a published registry');
   }
   if (!configPath) {
     throw new Error('configPath is required to create a published registry');
@@ -175,9 +195,8 @@ export async function createPublishedRegistry({
     throw new Error('storageDir is required to create a published registry');
   }
 
-  const groups = publishGroups || [{ tag, publishFilters }];
-  if (groups.some(group => !group.tag || !group.publishFilters?.length)) {
-    throw new Error('publishGroups must include a tag and publishFilters');
+  if (!publishFilters?.length) {
+    throw new Error('publishFilters is required to create a published registry');
   }
 
   const defaultConfigStorageDir = resolve(dirname(configPath), 'storage');
@@ -198,12 +217,8 @@ export async function createPublishedRegistry({
     const { glob: globby } = await import('tinyglobby');
 
     registry = await startRegistry(verdaccioPath, port, dirname(configPath), configPath);
-    for (const group of groups) {
-      teardown = await prepareMonorepo(rootDir, globby, group.tag);
-      await publishPackages([...new Set(group.publishFilters)], group.tag, rootDir, registry);
-      await teardown();
-      teardown = async () => {};
-    }
+    teardown = await prepareMonorepo(rootDir, globby, E2E_TAG);
+    await publishPackages(publishFilters, E2E_TAG, rootDir, registry);
   } finally {
     await stopRegistry(registry);
     await teardown();
@@ -211,7 +226,7 @@ export async function createPublishedRegistry({
 
   const registryUrl = `http://localhost:${port}`;
   const metadata = {
-    tag,
+    tag: E2E_TAG,
     registryPort: port,
     registryUrl,
     storageDir,

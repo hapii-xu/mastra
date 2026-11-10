@@ -2,6 +2,7 @@ export { TripWire } from './trip-wire';
 export { MessageList, convertMessages, aiV5ModelMessageToV2PromptMessage, TypeDetector } from './message-list';
 export type { OutputFormat } from './message-list';
 export * from './types';
+export type { AgentStreamsConfig } from './streams/types';
 export * from './signals';
 export * from '../signals/signal-provider';
 export * from '../signals/webhook-signal-provider';
@@ -30,6 +31,7 @@ export {
 } from '../schedules';
 export * from './agent';
 export { getGoalActivityDurationMs } from './goal';
+export { DEFAULT_TOOL_DECLINE_REASON, resolveDeclineReason } from './tool-approval';
 export * from './utils';
 export * from './fs-routing';
 
@@ -49,6 +51,7 @@ export type {
   DelegationCompleteContext,
   DelegationCompleteResult,
   OnDelegationCompleteHandler,
+  DelegationHookError,
   DelegationConfig,
   MessageFilterContext,
   /** @deprecated Use MessageFilterContext instead */

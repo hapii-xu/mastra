@@ -1,6 +1,6 @@
 ---
 title: "Reference: Agent.getLLM() | Agents"
-description: "Documentation for the `Agent.getLLM()` method in Mastra agents, which retrieves the language model instance and supports request-scoped model overrides."
+description: "The .getLLM() method retrieves the language model instance configured for an agent, resolving it if it's a function."
 packages:
   - "@mastra/core"
 ---
@@ -62,7 +62,7 @@ await agent.getLLM({
   content={[
   {
     name: 'llm',
-    type: 'MastraLLMV1 | Promise<MastraLLMV1>',
+    type: 'MastraLLMV1 | MastraLLMVNext | Promise<MastraLLMV1 | MastraLLMVNext>',
     description:
       'The language model instance configured for the agent, either as a direct instance or a promise that resolves to the LLM.',
   },

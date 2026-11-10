@@ -1,3 +1,4 @@
+import type { TransformStream } from 'node:stream/web';
 import type {
   LanguageModelV2FinishReason,
   LanguageModelV2Usage,
@@ -13,10 +14,15 @@ import type {
   LogProbs as LanguageModelV1LogProbs,
 } from '@internal/ai-sdk-v4';
 import type { CallSettings, ModelMessage, StepResult, ToolSet, TypedToolCall, UIMessage } from '@internal/ai-sdk-v5';
+import type { Agent } from '../agent';
 import type { AIV5ResponseMessage } from '../agent/message-list';
+import type { StoredMessageLoader } from '../agent/message-list/memory-message-refs';
 import type { AIV5Type, MastraDBMessage } from '../agent/message-list/types';
+import type { AgentSignalDataPart, AgentSignalType } from '../agent/signals';
 import type { StructuredOutputOptions } from '../agent/types';
+import type { ModelConfigModelSettings } from '../llm/model/model-settings';
 import type { MastraLanguageModel, SharedProviderOptions } from '../llm/model/shared.types';
+import type { IMastraLogger } from '../logger';
 import type { ScorerResult } from '../loop';
 import type { ClientObservabilityCarrier, ObservabilityContext } from '../observability';
 import type { OutputProcessorOrWorkflow } from '../processors';
@@ -85,8 +91,18 @@ export type StreamTransportRef = {
 
 interface BaseChunkType {
   runId: string;
+  /** Trace ID of the run that produced this chunk. Undefined when tracing is disabled. */
+  traceId?: string;
   from: ChunkFrom;
   metadata?: Record<string, any>;
+  /**
+   * Position of the run-log entry this chunk came from, on durable and evented agent streams and
+   * on `observe()` for any agent, when the transport numbers its entries. To resume after a dropped connection, observe the run
+   * from the last received chunk's `index + 1`. Entries that send no chunk leave gaps. Structured-output `object` chunks are
+   * built by the client, so they carry no index, and neither does an `abort` chunk, whose index is on the `finish` sent
+   * beside it: resume from the last chunk that has one. An `object-result` logged by a structuring-model run carries an index.
+   */
+  index?: number;
 }
 
 interface ResponseMetadataPayload {
@@ -143,6 +159,20 @@ export interface FilePayload {
   data: string | Uint8Array;
   base64?: string;
   mimeType: string;
+  filename?: string;
+  providerMetadata?: ProviderMetadata;
+}
+
+export interface ReasoningFilePayload {
+  data: string | Uint8Array;
+  base64?: string;
+  mimeType: string;
+  providerMetadata?: ProviderMetadata;
+}
+
+export interface CustomPayload {
+  /** The kind of custom content, in the format `{provider}.{provider-type}`. */
+  kind: string;
   providerMetadata?: ProviderMetadata;
 }
 
@@ -185,6 +215,9 @@ export interface ToolCallPayload<TArgs = unknown, TOutput = unknown> {
   providerMetadata?: ProviderMetadata;
   output?: TOutput;
   dynamic?: boolean;
+  title?: string;
+  /** Tool-owned metadata for UI hosts (e.g. `app` holds the MCP App UI pointer). */
+  toolMetadata?: JSONObject;
   /**
    * W3C trace context carrier for client-side tool execution.
    *
@@ -206,6 +239,8 @@ export interface ToolResultPayload<TResult = unknown, TArgs = unknown> {
   providerMetadata?: ProviderMetadata;
   args?: TArgs;
   dynamic?: boolean;
+  /** Partial provider-executed result (e.g. an in-progress image). A final, non-preliminary result always follows. */
+  preliminary?: boolean;
 }
 
 export type DynamicToolCallPayload = ToolCallPayload<any, any>;
@@ -217,6 +252,8 @@ interface ToolCallInputStreamingStartPayload {
   providerExecuted?: boolean;
   providerMetadata?: ProviderMetadata;
   dynamic?: boolean;
+  title?: string;
+  toolMetadata?: JSONObject;
   observability?: ClientObservabilityCarrier;
 }
 
@@ -236,6 +273,8 @@ interface FinishPayload<Tools extends ToolSet = ToolSet, OUTPUT extends OutputSc
   stepResult: {
     /** Includes 'tripwire' and 'retry' for processor scenarios */
     reason: LanguageModelV2FinishReason | 'tripwire' | 'retry';
+    /** Provider's own finish reason (e.g. 'MALFORMED_FUNCTION_CALL'), when the provider reports one */
+    rawReason?: string;
     warnings?: LanguageModelV2CallWarning[];
     isContinued?: boolean;
     logprobs?: LanguageModelV1LogProbs;
@@ -269,12 +308,28 @@ interface RawPayload {
   [key: string]: unknown;
 }
 
+export interface ThreadHistoryPayload {
+  /** Stored thread messages, oldest first. */
+  messages: MastraDBMessage[];
+  /** Whether older messages exist beyond this page. */
+  hasMore: boolean;
+  /**
+   * Run holding the thread lease at hydration, or null when idle. When the lease backend doesn't answer in time,
+   * this is the run this process last saw take the thread, and it can be stale.
+   */
+  activeRunId: string | null;
+}
+
 interface StartPayload {
   [key: string]: unknown;
 }
 
 export interface StepStartPayload {
   messageId?: string;
+  /** Epoch milliseconds sampled immediately before the model provider call. Absent when no provider call occurred. */
+  startedAt?: number;
+  modelId?: string;
+  provider?: string;
   request: {
     body?: string;
     [key: string]: unknown;
@@ -295,6 +350,8 @@ export interface StepFinishPayload<Tools extends ToolSet = ToolSet, OUTPUT = und
     isContinued?: boolean;
     warnings?: LanguageModelV2CallWarning[];
     reason: LanguageModelV2FinishReason;
+    /** Provider's own finish reason (e.g. 'MALFORMED_FUNCTION_CALL'), when the provider reports one */
+    rawReason?: string;
   };
   output: {
     text?: string;
@@ -317,7 +374,7 @@ export interface StepFinishPayload<Tools extends ToolSet = ToolSet, OUTPUT = und
   [key: string]: unknown;
 }
 
-interface ToolErrorPayload {
+export interface ToolErrorPayload {
   id?: string;
   providerMetadata?: ProviderMetadata;
   toolCallId: string;
@@ -325,6 +382,18 @@ interface ToolErrorPayload {
   args?: Record<string, unknown>;
   error: unknown;
   providerExecuted?: boolean;
+}
+
+/** Terminal stream payload when a requireApproval tool call is declined. */
+export interface ToolOutputDeniedPayload {
+  toolCallId: string;
+  toolName: string;
+  args?: Record<string, unknown>;
+  approval: {
+    id: string;
+    approved: false;
+    reason?: string;
+  };
 }
 
 interface AbortPayload {
@@ -771,20 +840,65 @@ interface ToolExecutionAbortPayload {
   primitiveId: string;
 }
 
-interface ToolCallApprovalPayload {
+/**
+ * Set when a supervisor re-raises a pause from a delegated sub-agent. `toolCallId` stays the
+ * supervisor's delegation call, which is what resumes the run.
+ */
+export interface DelegatedPauseIdentity {
+  /** The sub-agent's own tool call that paused. */
+  delegatedToolCallId?: string;
+  /** The name of the sub-agent's tool that paused. */
+  delegatedToolName?: string;
+}
+
+interface ToolCallApprovalPayload extends DelegatedPauseIdentity {
   toolCallId: string;
   toolName: string;
   args: Record<string, any>;
   resumeSchema: string;
+  /** Epoch ms when approval was requested; matches the tool part's `updatedAt`. */
+  updatedAt?: number;
+  /** Token usage of the model step that produced this tool call. */
+  usage?: LanguageModelUsage;
+  /** Provider metadata of the model step that produced this tool call. */
+  providerMetadata?: ProviderMetadata;
 }
 
-interface ToolCallSuspendedPayload {
+interface ToolCallSuspendedPayload extends DelegatedPauseIdentity {
   toolCallId: string;
   toolName: string;
   suspendPayload: any;
   args: Record<string, any>;
   resumeSchema: string;
+  /** Token usage of the model step that produced this tool call. */
+  usage?: LanguageModelUsage;
+  /** Provider metadata of the model step that produced this tool call. */
+  providerMetadata?: ProviderMetadata;
 }
+
+interface ToolCallResumedPayload extends DelegatedPauseIdentity {
+  toolCallId: string;
+  toolName: string;
+  /** Whether the resumed pause was a `suspend()` call or a tool approval request. */
+  kind: 'suspension' | 'approval';
+  args?: Record<string, any>;
+  suspendPayload?: any;
+  resumeSchema?: string;
+}
+
+/** Subscription-only presentation of admitted input, not the step-boundary delivery echo. */
+export type UserMessagePendingChunk = BaseChunkType & {
+  type: 'data-user-message-pending';
+  transient: true;
+  data: AgentSignalDataPart['data'] & { metadata: Record<string, unknown> & { status: 'pending' | 'queued' } };
+};
+
+/** Emitted only for input actually removed before delivery, never for a cancellation request. */
+export type UserMessageCancelledChunk = BaseChunkType & {
+  type: 'data-user-message-cancelled';
+  transient: true;
+  data: { id: string };
+};
 
 export type DataChunkType = {
   type: `data-${string}`;
@@ -792,7 +906,18 @@ export type DataChunkType = {
   id?: string;
   /** When true, the chunk is streamed to the client but not persisted to storage. */
   transient?: boolean;
+  /** Run-log index on durable and evented agent streams; see `BaseChunkType.index`. */
+  index?: number;
 };
+
+/**
+ * Whether a stream chunk or message part is a custom `data-*` chunk (e.g. written via `writer.custom()`).
+ * The `data-` type prefix is the discriminant for these chunks, shared with the AI SDK.
+ */
+export function isDataChunk<T>(value: T): value is T & { type: `data-${string}` } {
+  const type = (value as { type?: unknown } | null | undefined)?.type;
+  return typeof type === 'string' && type.startsWith('data-');
+}
 
 export type NetworkChunkType<OUTPUT = undefined> =
   | (BaseChunkType & { type: 'routing-agent-start'; payload: RoutingAgentStartPayload })
@@ -824,6 +949,15 @@ export type NetworkChunkType<OUTPUT = undefined> =
   | (BaseChunkType & { type: 'network-object-result'; payload: { object: OUTPUT } });
 
 // Strongly typed chunk type (currently only OUTPUT is strongly typed, tools use dynamic types)
+/** Emitted only by `subscribeToThread({ withInitialHistory })`, before any other chunk. */
+export type ThreadHistoryChunk = BaseChunkType & { type: 'thread-history'; payload: ThreadHistoryPayload };
+
+/** A thread run's outcome, independent of stored-message replay. Suspension is resumable. */
+export type ThreadRunStatusChunk = BaseChunkType & {
+  type: 'thread-run-status';
+  payload: { status: 'success' | 'failed' | 'aborted' | 'suspended' };
+};
+
 export type AgentChunkType<OUTPUT = undefined> =
   | (BaseChunkType & { type: 'response-metadata'; payload: ResponseMetadataPayload })
   | (BaseChunkType & { type: 'text-start'; payload: TextStartPayload })
@@ -836,9 +970,12 @@ export type AgentChunkType<OUTPUT = undefined> =
   | (BaseChunkType & { type: 'redacted-reasoning'; payload: RedactedReasoningPayload })
   | (BaseChunkType & { type: 'source'; payload: SourcePayload })
   | (BaseChunkType & { type: 'file'; payload: FilePayload })
+  | (BaseChunkType & { type: 'reasoning-file'; payload: ReasoningFilePayload })
+  | (BaseChunkType & { type: 'custom'; payload: CustomPayload })
   | (BaseChunkType & { type: 'tool-call'; payload: ToolCallPayload })
   | (BaseChunkType & { type: 'tool-call-approval'; payload: ToolCallApprovalPayload })
   | (BaseChunkType & { type: 'tool-call-suspended'; payload: ToolCallSuspendedPayload })
+  | (BaseChunkType & { type: 'tool-call-resumed'; payload: ToolCallResumedPayload })
   | (BaseChunkType & { type: 'tool-result'; payload: ToolResultPayload })
   | (BaseChunkType & { type: 'tool-call-input-streaming-start'; payload: ToolCallInputStreamingStartPayload })
   | (BaseChunkType & { type: 'tool-call-delta'; payload: ToolCallDeltaPayload })
@@ -850,6 +987,7 @@ export type AgentChunkType<OUTPUT = undefined> =
   | (BaseChunkType & { type: 'step-start'; payload: StepStartPayload })
   | (BaseChunkType & { type: 'step-finish'; payload: StepFinishPayload<ToolSet, OUTPUT> })
   | (BaseChunkType & { type: 'tool-error'; payload: ToolErrorPayload })
+  | (BaseChunkType & { type: 'tool-output-denied'; payload: ToolOutputDeniedPayload })
   | (BaseChunkType & { type: 'abort'; payload: AbortPayload })
   | (BaseChunkType & {
       type: 'object';
@@ -916,12 +1054,9 @@ export type WorkflowStreamEvent =
       type: 'workflow-finish';
       payload: {
         workflowStatus: WorkflowRunStatus;
+        finalWorkflowResult?: unknown;
         output: {
-          usage: {
-            inputTokens: number;
-            outputTokens: number;
-            totalTokens: number;
-          };
+          usage: LanguageModelUsage;
         };
         metadata: Record<string, any>;
       };
@@ -1011,7 +1146,15 @@ export type TypedChunkType<OUTPUT = undefined> =
   | AgentChunkType<OUTPUT>
   | WorkflowStreamEvent
   | NetworkChunkType<OUTPUT>
-  | (DataChunkType & { from: never; runId: never; metadata?: BaseChunkType['metadata']; payload: never });
+  | UserMessagePendingChunk
+  | UserMessageCancelledChunk
+  | (DataChunkType & {
+      from: never;
+      runId: never;
+      traceId?: never;
+      metadata?: BaseChunkType['metadata'];
+      payload: never;
+    });
 
 // Default ChunkType for backward compatibility using dynamic (any) tool types
 export type ChunkType<OUTPUT = undefined> = TypedChunkType<OUTPUT>;
@@ -1030,8 +1173,11 @@ export type CreateStream = () => Promise<LanguageModelV2StreamResult>;
 
 export type SourceChunk = BaseChunkType & { type: 'source'; payload: SourcePayload };
 export type FileChunk = BaseChunkType & { type: 'file'; payload: FilePayload };
+export type ReasoningFileChunk = BaseChunkType & { type: 'reasoning-file'; payload: ReasoningFilePayload };
+export type CustomChunk = BaseChunkType & { type: 'custom'; payload: CustomPayload };
 export type ToolCallChunk = BaseChunkType & { type: 'tool-call'; payload: ToolCallPayload };
 export type ToolResultChunk = BaseChunkType & { type: 'tool-result'; payload: ToolResultPayload };
+export type ToolOutputDeniedChunk = BaseChunkType & { type: 'tool-output-denied'; payload: ToolOutputDeniedPayload };
 export type ReasoningChunk = BaseChunkType & { type: 'reasoning'; payload: ReasoningDeltaPayload };
 
 export type PendingToolCall = {
@@ -1051,9 +1197,10 @@ export type ExecuteStreamModelManager<T> = (
 export type ModelManagerModelConfig = {
   model: MastraLanguageModel;
   maxRetries: number;
+  maxRetriesConfigured?: boolean;
   id: string;
   headers?: Record<string, string>;
-  modelSettings?: Omit<CallSettings, 'abortSignal' | 'maxRetries' | 'headers'>;
+  modelSettings?: ModelConfigModelSettings;
   providerOptions?: SharedProviderOptions;
 };
 
@@ -1065,6 +1212,8 @@ export type LanguageModelUsage = LanguageModelV2Usage & {
   reasoningTokens?: number;
   cachedInputTokens?: number;
   cacheCreationInputTokens?: number;
+  cacheCreationInputTokens5m?: number;
+  cacheCreationInputTokens1h?: number;
   /**
    * Raw usage data from the provider, preserved for advanced use cases.
    * For V3 models, contains the full nested structure:
@@ -1084,20 +1233,80 @@ export type MastraOnStepFinishCallback<OUTPUT = undefined> = (
 ) => Promise<void> | void;
 
 export type MastraOnFinishCallbackArgs<OUTPUT = undefined> = LLMStepResult<OUTPUT> & {
+  /** Present when execution ends at a tool suspension boundary. */
+  suspendReason?: 'tool-call-approval' | 'tool-call-suspended';
+  toolCallId?: string;
+  toolName?: string;
   error?: Error | string | { message: string; stack: string };
   object?: OUTPUT;
+  /**
+   * True when `object` is the configured `fallbackValue`, substituted because the model
+   * output failed schema validation (or the separate structuring model failed) under
+   * `errorStrategy: 'fallback'`.
+   */
+  usedFallbackValue?: boolean;
   steps: LLMStepResult<OUTPUT>[];
   totalUsage: LanguageModelUsage;
   model?: partialModel;
   runId?: string;
+  /** Model messages the run added to the conversation (the response messages). */
+  messages?: ModelMessage[];
+  /**
+   * @internal Cumulative usage already recorded by earlier suspended legs of this run, so the
+   * MODEL_GENERATION span of a resumed leg records only its own share.
+   */
+  generationReportedUsage?: LanguageModelUsage;
+  /**
+   * @internal Provider metadata of each model step this leg of the run ran, so the
+   * MODEL_GENERATION span of a suspended or resumed leg records only its own provider cost.
+   * Absent when no earlier leg reported any step, so every step in `steps` belongs to this leg.
+   */
+  generationStepProviderMetadata?: (ProviderMetadata | undefined)[];
+};
+
+/**
+ * Writer for emitting custom chunks from `onFinish` callbacks while the `finish`
+ * chunk is being assembled. Chunks written through this writer are delivered to
+ * stream consumers before the `finish` chunk.
+ */
+export type CustomChunkWriter = {
+  custom: (
+    data: { type: `data-${string}`; data: unknown; transient?: boolean },
+    writerOptions?: { messageId?: string },
+  ) => Promise<void> | void;
+};
+
+/** Context passed as the second argument to `MastraOnFinishCallback`. */
+export type MastraOnFinishCallbackContext = {
+  writer?: CustomChunkWriter;
+  /**
+   * Set when an output processor aborted the run from `processOutputResult`. The run-level
+   * message save never happens in that case, so the agent removes any response messages the
+   * run already saved (before a tool-approval suspension, or with `savePerStep`).
+   */
+  outputResultTripwire?: StepTripwireData;
 };
 
 export type MastraOnFinishCallback<OUTPUT = undefined> = (
   event: MastraOnFinishCallbackArgs<OUTPUT>,
+  context?: MastraOnFinishCallbackContext,
 ) => Promise<void> | void;
+
+/**
+ * Creates a fresh transform for a Mastra model output stream.
+ *
+ * @experimental This API may change in a future release.
+ */
+export type MastraStreamTransform<OUTPUT = undefined> = () => TransformStream<ChunkType<OUTPUT>, ChunkType<OUTPUT>>;
+
+/** @experimental This API may change in a future release. */
+export type MastraStreamTransformOptions<OUTPUT = undefined> =
+  | MastraStreamTransform<OUTPUT>
+  | readonly MastraStreamTransform<OUTPUT>[];
 
 export type MastraModelOutputOptions<OUTPUT = undefined> = {
   runId: string;
+  logger?: IMastraLogger;
   toolCallStreaming?: boolean;
   onFinish?: MastraOnFinishCallback<OUTPUT>;
   onStepFinish?: MastraOnStepFinishCallback<OUTPUT>;
@@ -1112,10 +1321,28 @@ export type MastraModelOutputOptions<OUTPUT = undefined> = {
    * processor processing (isLLMExecutionStep) AND final promise resolution.
    */
   resolveFinalPromises?: boolean;
+  /**
+   * When true, `error` chunks and `finish` chunks with stepResult.reason
+   * 'error' bypass the per-chunk output processor pass. These chunks describe a
+   * single model call that the caller may still recover from via an error
+   * processor retry or a fallback model, so the caller becomes responsible for
+   * running output processors on the error once recovery has been ruled out.
+   */
+  deferErrorChunks?: boolean;
   returnScorerData?: boolean;
+  /** Loads response messages the run pruned from its message list (kept there by id only) for scorer data. */
+  loadStoredMessages?: StoredMessageLoader;
   processorStates?: Map<string, any>;
+  /** The agent producing this output, passed to output processors as `agent`. */
+  agent?: Agent<any, any, any, any>;
   requestContext?: RequestContext;
+  /** The run's abort signal, forwarded to output processors. */
+  abortSignal?: AbortSignal;
   transportRef?: StreamTransportRef;
+  /** Experimental transforms applied whenever `fullStream` is consumed. */
+  experimentalTransform?: MastraStreamTransformOptions<OUTPUT>;
+  /** @internal Signal exclusions for caller-facing streams, not internal fanout. */
+  hideSignals?: boolean | AgentSignalType[];
 } & Partial<ObservabilityContext>;
 
 /**

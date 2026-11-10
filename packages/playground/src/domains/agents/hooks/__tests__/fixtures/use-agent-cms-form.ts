@@ -1,4 +1,6 @@
-import type { StoredAgentResponse } from '@mastra/client-js';
+import type { GetAgentResponse, ListAgentVersionsResponse, StoredAgentResponse } from '@mastra/client-js';
+
+import { v2Agent } from '../../../components/__tests__/fixtures/composer-model-settings';
 
 /**
  * Minimal stored-agent record returned by `POST /stored/agents` when Studio
@@ -14,4 +16,106 @@ export const createdCodeAgent: StoredAgentResponse = {
   name: 'Code Override Editable',
   instructions: 'Original code instructions for editable override agent.',
   model: { provider: 'openai', name: '__AI_SDK_OPENAI_MODEL_BASE__' },
+};
+
+/** No override has been saved yet for a code-defined agent. */
+export const noAgentVersions: ListAgentVersionsResponse = {
+  versions: [],
+  total: 0,
+  page: 0,
+  perPage: 20,
+  hasMore: false,
+};
+
+/** The first override version, created by the save and left unpublished. */
+export const oneUnpublishedAgentVersion: ListAgentVersionsResponse = {
+  ...noAgentVersions,
+  versions: [
+    {
+      id: 'version-1',
+      agentId: 'code-override-editable',
+      versionNumber: 1,
+      name: 'Code Override Editable',
+      instructions: 'User edited prompt',
+      model: { provider: 'openai', name: '__AI_SDK_OPENAI_MODEL_BASE__' },
+      createdAt: '2026-06-16T00:00:01.000Z',
+    },
+  ],
+  total: 1,
+};
+
+export const savedModelList = [
+  {
+    id: 'fallback',
+    model: { provider: 'anthropic', modelId: 'claude-sonnet-4-5', modelVersion: 'v2' },
+    enabled: true,
+    maxRetries: 3,
+  },
+  {
+    id: 'primary',
+    model: { provider: 'openai', modelId: 'gpt-5.4-mini', modelVersion: 'v2' },
+    enabled: false,
+    maxRetries: 0,
+  },
+] satisfies NonNullable<GetAgentResponse['modelList']>;
+
+export const modelOwnedRuntimeAgent: GetAgentResponse = {
+  ...v2Agent,
+  id: 'code-override-editable',
+  name: 'Code Override Editable',
+  instructions: 'Original code instructions for editable override agent.',
+  modelId: '__AI_SDK_OPENAI_MODEL_BASE__',
+  modelList: savedModelList,
+  source: 'code',
+  editor: { model: true },
+  modelListEditable: true,
+};
+
+/** A stored agent whose memory points at a Memory instance registered on the Mastra instance. */
+export const storedAgentWithMemoryRef: StoredAgentResponse = {
+  id: 'support-agent',
+  status: 'published',
+  createdAt: '2026-06-16T00:00:00.000Z',
+  updatedAt: '2026-06-16T00:00:00.000Z',
+  name: 'Support Agent',
+  instructions: 'Help customers.',
+  model: { provider: 'openai', name: '__AI_SDK_OPENAI_MODEL_BASE__' },
+  memory: { type: 'id', memoryId: 'support-memory' },
+};
+
+/** `GET /agents/:id` for an agent discovered from an `agents/<name>/` folder. */
+export const fsAgent: GetAgentResponse = {
+  id: 'fs-agent',
+  name: 'FS Agent',
+  instructions: 'File-based instructions.',
+  tools: { 'get-weather': { id: 'get-weather', description: 'Original weather description' } },
+  workflows: {},
+  agents: {},
+  provider: 'openai',
+  modelId: 'gpt-4o-mini',
+  modelVersion: 'v2',
+  modelList: undefined,
+  defaultOptions: {},
+  defaultGenerateOptionsLegacy: {},
+  defaultStreamOptionsLegacy: {},
+  skills: [],
+  workspaceTools: [],
+  browserTools: [],
+  hasBrowser: false,
+  inputProcessors: [],
+  outputProcessors: [],
+  source: 'fs',
+  status: 'published',
+  hasDraft: false,
+};
+
+/** The stored override Studio creates on the first save of the file-based agent. */
+export const fsAgentOverride: StoredAgentResponse = {
+  id: 'fs-agent',
+  status: 'draft',
+  createdAt: '2026-06-16T00:00:00.000Z',
+  updatedAt: '2026-06-16T00:00:01.000Z',
+  name: 'FS Agent',
+  instructions: 'Saved draft instructions.',
+  model: { provider: 'openai', name: 'gpt-4o-mini' },
 };

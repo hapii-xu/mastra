@@ -1,6 +1,6 @@
 {
   "name": "@mastra/factory",
-  "version": "0.2.1-alpha.3",
+  "version": "0.28.0-alpha.2",
   "description": "Mastra Software Factory module: the server core behind the Mastra Software Factory — storage domains, integrations, and surfaces for agent-powered software delivery",
   "type": "module",
   "publishConfig": {
@@ -8,8 +8,7 @@
   },
   "files": [
     "dist",
-    "factory-skills",
-    "CHANGELOG.md"
+    "factory-skills"
   ],
   "main": "dist/index.js",
   "types": "dist/index.d.ts",
@@ -18,6 +17,12 @@
       "import": {
         "types": "./dist/index.d.ts",
         "default": "./dist/index.js"
+      }
+    },
+    "./boards": {
+      "import": {
+        "types": "./dist/boards/index.d.ts",
+        "default": "./dist/boards/index.js"
       }
     },
     "./*": {
@@ -29,12 +34,13 @@
     "./package.json": "./package.json"
   },
   "scripts": {
-    "build:lib": "tsup --silent --config tsup.config.ts",
+    "build:lib": "tsdown --silent --config tsdown.config.ts",
+    "generate:api-cli-route-metadata": "tsx scripts/generate-api-cli-route-metadata.ts",
     "smoke:dist": "node --input-type=module -e \"import('./dist/index.js').then(() => console.log('dist import ok')).catch(e => { console.error(e.message); process.exit(1); })\"",
     "check": "tsc --noEmit",
     "test": "vitest run",
-    "lint": "oxlint . && eslint .",
-    "lint:fix": "oxlint --fix . && eslint --fix ."
+    "lint": "oxlint --type-aware .",
+    "lint:fix": "oxlint --type-aware --fix ."
   },
   "keywords": [
     "mastra",
@@ -57,22 +63,31 @@
     "@mastra/auth-studio": "workspace:*",
     "@mastra/auth-workos": "workspace:*",
     "@mastra/code-sdk": "workspace:*",
+    "@mastra/connect": "workspace:*",
     "@mastra/core": "workspace:*",
-    "@octokit/auth-app": "^8.0.0",
+    "@mastra/mcp": "workspace:*",
+    "@mastra/platform-workspace": "workspace:*",
+    "@mastra/slack": "workspace:*",
+    "@octokit/auth-app": "^8.3.1",
     "@octokit/rest": "^22.0.1",
-    "hono": "^4.12.8",
-    "zod": "^4.3.6"
+    "chat": "catalog:",
+    "fetch-to-node": "^2.1.0",
+    "hono": "^4.13.13",
+    "posthog-node": "^5.57.1",
+    "zod": "catalog:"
   },
   "devDependencies": {
     "@internal/lint": "workspace:*",
+    "@internal/types-builder": "workspace:*",
+    "@internal/workspace": "workspace:*",
+    "@mastra/deployer": "workspace:*",
     "@mastra/libsql": "workspace:*",
     "@mastra/pg": "workspace:*",
-    "@internal/types-builder": "workspace:*",
-    "@types/node": "22.20.1",
-    "eslint": "^10.7.0",
-    "tsup": "^8.5.1",
-    "typescript": "catalog:",
-    "typescript-eslint": "^8.57.0",
+    "@mastra/server": "workspace:*",
+    "@types/node": "22.19.15",
+    "msw": "^2.12.11",
+    "tsdown": "0.23.1",
+    "typescript": "catalog:ts6",
     "vitest": "catalog:"
   },
   "engines": {

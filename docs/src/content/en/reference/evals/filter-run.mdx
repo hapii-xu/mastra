@@ -1,13 +1,13 @@
 ---
 title: 'Reference: filterRun() | Evals'
-description: 'API reference for filterRun(), a utility that creates a prepareRun function to filter and limit scorer input data.'
+description: "Creates a prepareRun function from declarative options. Pass the result to createScorer() to filter messages and limit context size."
 packages:
   - '@mastra/core'
 ---
 
 # filterRun()
 
-Creates a `prepareRun` function from declarative options. Pass the result to `createScorer()` to filter messages, limit context size, and drop unnecessary fields before the scorer pipeline runs.
+Creates a `prepareRun` function from declarative options. Pass the result to `createScorer()` to filter messages and limit context size. It also drops unnecessary fields before the scorer pipeline runs.
 
 Use [`filterRun()`](#usage-example) for declarative filtering. Write a custom `prepareRun` function directly when you need imperative logic that `filterRun()` doesn't cover. See [Custom scorers: input filtering](/docs/evals/custom-scorers#input-filtering) for more.
 
@@ -141,7 +141,7 @@ const simpleScorer = createScorer({
 ]}
 />
 
-**Returns:** `(run: ScorerRun) => ScorerRun` — A function suitable for the `prepareRun` option on [`createScorer()`](/reference/evals/create-scorer).
+**Returns:** `(run: ScorerRun) => ScorerRun`. A function suitable for the `prepareRun` option on [`createScorer()`](/reference/evals/create-scorer).
 
 ## Part types
 
@@ -166,7 +166,7 @@ The `partTypes` option accepts `MastraPartType` values. Each value is prefix-mat
 ## Filtering behavior
 
 - **Part type filtering** applies to both `input.rememberedMessages` and `output` when they contain agent message arrays.
-- **Tool name filtering** only affects messages that contain tool invocations. Text-only messages pass through.
+- **Tool name filtering** only affects messages that contain tool invocations. Messages without tool invocations are filtered by `partTypes` only, and pass through when `partTypes` isn't set.
 - **System messages** (`systemMessages`, `taggedSystemMessages`) are never filtered, regardless of `partTypes` or `toolNames`.
 - **Message limits** (`maxRememberedMessages`, `maxOutputMessages`) apply after type and tool filtering, taking the most recent messages.
-- When both `partTypes` and `toolNames` are set, a message must satisfy both filters to be kept.
+- When both `partTypes` and `toolNames` are set, a message with tool invocations must satisfy both filters to be kept.

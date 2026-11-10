@@ -7,14 +7,24 @@
  * result to an exit code, and owns teardown + `process.exit`.
  */
 import { existsSync } from 'node:fs';
+import type { Writable } from 'node:stream';
 import { parseArgs } from 'node:util';
 
+import { resolveSubagentsSetting } from '../agents/subagents/index.js';
 import { createMastraCode } from '../index.js';
+import { activateModePackInSettings, resolveModePackArg, resolvePackSelection } from '../onboarding/pack-activation.js';
+import { listBuiltinModePacks } from '../onboarding/packs.js';
+import { loadSettings, resolveModelDefaults, saveSettings } from '../onboarding/settings.js';
+import {
+  createProcessMemoryDiagnosticsFromEnvironment,
+  startConfiguredProcessMemoryDiagnostics,
+  stopProcessMemoryDiagnosticsWithTimeout,
+} from '../process-memory-diagnostics.js';
 import { setupDebugLogging } from '../utils/debug-log.js';
 import { releaseAllThreadLocks } from '../utils/thread-lock.js';
 
 import { buildParseArgsOptions, FLAGS, renderFlagUsage } from './flags.js';
-import { createHumanFormatState, formatHuman, formatJsonl, renderJsonResult } from './format.js';
+import { createHumanFormatState, formatHuman, formatJsonl, isJsonlEvent, renderJsonResult } from './format.js';
 import { permissionModeToPolicy } from './policy.js';
 import { runMC } from './run-mc.js';
 import type { PermissionMode, RunMode, ThinkingLevel } from './types.js';
@@ -29,6 +39,7 @@ export interface HeadlessArgs {
   output: OutputMode;
   continue_: boolean;
   model?: string;
+  pack?: string;
   mode?: RunMode;
   thinkingLevel?: ThinkingLevel;
   settings?: string;
@@ -43,6 +54,7 @@ export interface HeadlessArgs {
 }
 
 const parseArgsOptions = buildParseArgsOptions();
+const STOP_NOTIFICATION_DISPATCH_TIMEOUT_MS = 2_000;
 
 /**
  * Returns true if `argv` selects headless mode. This must agree with what
@@ -145,10 +157,29 @@ Examples:
 }
 
 /**
+ * Wait until everything written to `stream` has been handed to the OS, since
+ * `process.exit()` drops writes a pipe has not accepted yet. Resolves `false`
+ * if the stream fails or closes first; never rejects or hangs on a gone reader.
+ */
+export function flushWritable(stream: Writable): Promise<boolean> {
+  if (stream.destroyed || stream.errored) return Promise.resolve(false);
+  if (stream.writableLength === 0) return Promise.resolve(true);
+  return new Promise(resolve => {
+    // Left attached: a stream can emit `error` after failing pending callbacks.
+    stream.once('error', () => resolve(false));
+    stream.once('close', () => resolve(false));
+    stream.write('', error => resolve(!error));
+  });
+}
+
+/**
  * Headless CLI entry point: parse arguments, read stdin, initialize MastraCode,
  * run via `runMC`, render output, and exit with the mapped code.
  */
-export async function runMCCli(predrainedInput?: string | null): Promise<never> {
+export async function runMCCli(
+  predrainedInput?: string | null,
+  options?: { coAuthor?: { name?: string; email?: string } },
+): Promise<never> {
   if (process.argv.includes('--help') || process.argv.includes('-h')) {
     printHeadlessUsage();
     process.exit(0);
@@ -184,23 +215,54 @@ export async function runMCCli(predrainedInput?: string | null): Promise<never> 
     process.exit(1);
   }
 
-  const boot = await createMastraCode({ settingsPath: args.settings });
-  const { controller, session, mcpManager, effectiveDefaults } = boot;
-
-  if (mcpManager?.hasServers()) {
-    try {
-      await mcpManager.initInBackground();
-    } catch (err) {
-      process.stderr.write(`Warning: MCP server initialization failed: ${(err as Error).message ?? err}\n`);
+  // Resolve --pack up front: an unknown pack fails fast with the valid list,
+  // before MastraCode boots. The selection itself is resolved inside runMC
+  // after thread selection, because a resumed thread restores its persisted
+  // mode — the mode that decides whether the pack has a model for this run.
+  // Activation (which mirrors /models → Activate and becomes the global
+  // default pack in settings) is saved via onApplied only once the pack has
+  // actually been applied to the session — a rejected pack must not change
+  // the persisted default on its way out.
+  const settings = loadSettings(args.settings);
+  let packId: string | undefined;
+  if (args.pack !== undefined) {
+    const resolved = resolveModePackArg(settings, args.pack);
+    if ('error' in resolved) {
+      process.stderr.write(`Error: ${resolved.error}\n`);
+      process.exit(1);
     }
+    packId = resolved.packId;
   }
 
-  setupDebugLogging();
+  const diagnosticsSetup = createProcessMemoryDiagnosticsFromEnvironment(process.env);
+  const processMemoryDiagnostics = await startConfiguredProcessMemoryDiagnostics(diagnosticsSetup, warning => {
+    process.stderr.write(`Warning: ${warning}\n`);
+  });
 
+  let boot: Awaited<ReturnType<typeof createMastraCode>> | undefined;
   // Default to a non-zero exit so an unexpected throw before the run resolves
   // still surfaces as a failure to the caller / CI.
   let exitCode = 1;
   try {
+    boot = await createMastraCode({
+      settingsPath: args.settings,
+      coAuthor: options?.coAuthor,
+      subagents: resolveSubagentsSetting(settings.preferences.subagentsEnabled),
+    });
+    const { controller, session, mcpManager } = boot;
+
+    const effectiveDefaults = resolveModelDefaults(settings, listBuiltinModePacks());
+
+    if (mcpManager?.hasServers()) {
+      try {
+        await mcpManager.initInBackground();
+      } catch (err) {
+        process.stderr.write(`Warning: MCP server initialization failed: ${(err as Error).message ?? err}\n`);
+      }
+    }
+
+    setupDebugLogging();
+
     const humanState = createHumanFormatState();
     const run = runMC({
       controller,
@@ -209,6 +271,18 @@ export async function runMCCli(predrainedInput?: string | null): Promise<never> 
       model: args.model,
       mode: args.mode,
       modeDefaults: effectiveDefaults,
+      ...(packId
+        ? {
+            pack: {
+              id: packId,
+              resolve: (modeId: string) => resolvePackSelection(settings, packId, modeId),
+              onApplied: () => {
+                activateModePackInSettings(settings, packId);
+                saveSettings(settings, args.settings);
+              },
+            },
+          }
+        : {}),
       thinkingLevel: args.thinkingLevel,
       thread: { id: args.thread, continueLatest: args.continue_, clone: args.cloneThread },
       resourceId: args.resourceId,
@@ -224,7 +298,7 @@ export async function runMCCli(predrainedInput?: string | null): Promise<never> 
         const out = formatHuman(event, humanState);
         if (out.stdout) process.stdout.write(out.stdout);
         if (out.stderr) process.stderr.write(out.stderr);
-      } else if (args.output === 'jsonl') {
+      } else if (args.output === 'jsonl' && isJsonlEvent(event)) {
         process.stdout.write(JSON.stringify(formatJsonl(event)) + '\n');
       }
     }
@@ -249,14 +323,48 @@ export async function runMCCli(predrainedInput?: string | null): Promise<never> 
   } finally {
     // --- Teardown (always runs, even on a thrown error) ---
     releaseAllThreadLocks();
-    const closeSignalsPubSub = (boot.signalsPubSub as { close?: () => Promise<void> | void } | undefined)?.close;
-    await Promise.allSettled([
-      mcpManager?.disconnect(),
-      controller.getMastra()?.stopWorkers(),
-      controller?.stopIntervals(),
-      closeSignalsPubSub?.(),
-    ]);
+    if (boot) {
+      // Stop plugin-contributed signal providers (and the plugin reload listener)
+      // before quiescing workers: a provider that keeps polling past this point
+      // could dispatch into a controller that is shutting down. Release thread
+      // claims first so a restarted process need not wait out this teardown.
+      try {
+        boot.releaseThreadClaims();
+      } catch {
+        // Best-effort — the process is exiting.
+      }
+      try {
+        boot.stopPluginSignalProviders();
+      } catch {
+        // Best-effort — the process is exiting.
+      }
+      const { controller, mcpManager } = boot;
+      // Release notification dispatch leases before the pubsub that holds them
+      // closes. Headless has no shutdown deadline, so don't let a stalled
+      // in-flight dispatch hold up exit.
+      await Promise.race([
+        boot.stopNotificationDispatch?.().catch(() => {}),
+        new Promise<void>(resolve => setTimeout(resolve, STOP_NOTIFICATION_DISPATCH_TIMEOUT_MS).unref()),
+      ]);
+      await Promise.allSettled([
+        mcpManager?.disconnect(),
+        controller.getMastra()?.stopWorkers(),
+        controller.stopIntervals(),
+      ]);
+      // The signals pubsub is Mastra's event bus, so close it after the workers
+      // stop. Call close() on the object; a detached method loses `this` and
+      // rejects silently, leaving socket files behind.
+      const signalsPubSub = boot.signalsPubSub as { close?: () => Promise<void> | void } | undefined;
+      await Promise.allSettled([signalsPubSub?.close?.()]);
+    }
+    await stopProcessMemoryDiagnosticsWithTimeout(processMemoryDiagnostics, warning => {
+      process.stderr.write(`Warning: ${warning}\n`);
+    });
   }
 
+  // Let piped output (the final result line in particular) reach the reader
+  // before exiting. Output that never arrived must not count as success.
+  const [stdoutFlushed] = await Promise.all([flushWritable(process.stdout), flushWritable(process.stderr)]);
+  if (!stdoutFlushed && exitCode === 0) exitCode = 1;
   process.exit(exitCode);
 }

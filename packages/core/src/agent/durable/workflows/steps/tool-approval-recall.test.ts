@@ -14,16 +14,23 @@
  *     round-trip to the expected AI SDK v6 UI parts.
  */
 import { afterEach, describe, expect, it, vi } from 'vitest';
+import { Mastra } from '../../../../mastra';
 import { PUBSUB_SYMBOL } from '../../../../workflows/constants';
 import type { MastraDBMessage } from '../../../message-list';
 import { MessageList } from '../../../message-list';
+import { SaveQueueManager } from '../../../save-queue';
 import { globalRunRegistry } from '../../run-registry';
+import { rebuildRunToolsFromMastra } from '../../utils/resolve-runtime';
 import { createDurableLLMMappingStep } from './llm-mapping';
 import { createDurableToolCallStep } from './tool-call';
 
-vi.mock('../../utils/resolve-runtime', () => ({
+vi.mock('../../utils/resolve-runtime', async () => ({
+  restoreRequestContext: (
+    await vi.importActual<typeof import('../../utils/resolve-runtime')>('../../utils/resolve-runtime')
+  ).restoreRequestContext,
   resolveTool: vi.fn(),
   toolRequiresApproval: vi.fn().mockResolvedValue(true),
+  rebuildRunToolsFromMastra: vi.fn().mockResolvedValue(undefined),
 }));
 
 vi.mock('../../stream-adapter', () => ({
@@ -62,12 +69,12 @@ function setupRegistry(execute: (...args: any[]) => any) {
   } as any);
 }
 
-function runToolCallStep(resumeData: unknown) {
+function runToolCallStep(resumeData: unknown, args = TOOL_ARGS, suspend = vi.fn()) {
   const step = createDurableToolCallStep();
   return (step as any).execute({
-    inputData: { toolCallId: TOOL_CALL_ID, toolName: TOOL_NAME, args: TOOL_ARGS },
+    inputData: { toolCallId: TOOL_CALL_ID, toolName: TOOL_NAME, args },
     mastra: { getLogger: () => undefined },
-    suspend: vi.fn(),
+    suspend,
     resumeData,
     requestContext: new Map(),
     getInitData: () => makeInitData(),
@@ -149,6 +156,100 @@ afterEach(() => {
 });
 
 describe('issue #17218 (durable engine): tool-call step records the approval decision', () => {
+  it.each([TOOL_NAME, 'agent-worker'])(
+    'restores cold-worker context for %s without persisting the copied transcript',
+    async toolName => {
+      const messageList = new MessageList({ threadId: THREAD_ID, resourceId: RESOURCE_ID });
+      messageList.add('Original parent request', 'input');
+      messageList.add(
+        {
+          id: 'parent-assistant',
+          role: 'assistant',
+          createdAt: new Date(),
+          content: {
+            format: 2,
+            parts: ['call-1', 'call-2'].map(toolCallId => ({
+              type: 'tool-invocation' as const,
+              toolInvocation: { state: 'call' as const, toolCallId, toolName, args: TOOL_ARGS },
+            })),
+          },
+        },
+        'response',
+      );
+      const messageListState = messageList.serialize();
+      const memory = {
+        recall: vi.fn(async () => ({ messages: structuredClone(messageList.get.all.db()) })),
+        saveMessages: vi.fn().mockResolvedValue([]),
+      };
+      const saveQueueManager = new SaveQueueManager({ memory: memory as any });
+      const execute = vi.fn(async (_args, context) => {
+        expect(JSON.stringify(context.messages)).toContain('Original parent request');
+        await context.suspend({}, { requireToolApproval: true });
+      });
+      expect(globalRunRegistry.has(RUN_ID)).toBe(false);
+      for (const toolCallId of ['call-1', 'call-2']) {
+        vi.mocked(rebuildRunToolsFromMastra).mockResolvedValueOnce({
+          tools: { [toolName]: { execute } },
+          memory,
+          saveQueueManager,
+        } as any);
+        const suspend = vi.fn().mockResolvedValue('suspended');
+        await (createDurableToolCallStep() as any).execute({
+          inputData: { toolCallId, toolName, args: TOOL_ARGS },
+          mastra: new Mastra({ logger: false }),
+          suspend,
+          resumeData: { approved: true },
+          requestContext: new Map(),
+          getInitData: () => makeInitData(),
+          state: { messageListState },
+          getStepResultAsync: async () => undefined,
+          [PUBSUB_SYMBOL]: mockPubsub(),
+        });
+        expect(suspend).toHaveBeenCalledTimes(1);
+      }
+
+      expect(execute).toHaveBeenCalledTimes(2);
+      // A worker without a registry list persists the new approval through the
+      // recalled history (#28050); only that assistant message is written, never
+      // the copied replay transcript.
+      const saved = memory.saveMessages.mock.calls.flatMap(([{ messages }]) => messages as MastraDBMessage[]);
+      expect(saved.map(m => m.role)).toEqual(['assistant', 'assistant']);
+      expect(saved.map(m => Object.keys((m.content.metadata as any)?.pendingToolApprovals ?? {}))).toEqual([
+        ['call-1'],
+        ['call-2'],
+      ]);
+      for (const [, context] of execute.mock.calls) {
+        expect(context.getMessages).toBeUndefined();
+      }
+      expect(globalRunRegistry.has(RUN_ID)).toBe(false);
+      expect(messageList.serialize()).toEqual(messageListState);
+    },
+  );
+
+  it.each([{}, { approved: 'true' }])('re-suspends malformed workflow approval data: %j', async resumeData => {
+    const execute = vi.fn().mockResolvedValue(TOOL_RESULT);
+    const suspend = vi.fn().mockResolvedValue('suspended');
+    setupRegistry(execute);
+
+    const result = await runToolCallStep(resumeData, TOOL_ARGS, suspend);
+
+    expect(result).toBe('suspended');
+    expect(suspend).toHaveBeenCalledTimes(1);
+    expect(execute).not.toHaveBeenCalled();
+  });
+
+  it('does not accept model-authored approval data', async () => {
+    const execute = vi.fn().mockResolvedValue(TOOL_RESULT);
+    const suspend = vi.fn().mockResolvedValue('suspended');
+    setupRegistry(execute);
+
+    const result = await runToolCallStep(undefined, { ...TOOL_ARGS, resumeData: { approved: true } }, suspend);
+
+    expect(result).toBe('suspended');
+    expect(suspend).toHaveBeenCalledTimes(1);
+    expect(execute).not.toHaveBeenCalled();
+  });
+
   it('decline returns approval { approved: false } with the reason and NO result', async () => {
     const execute = vi.fn().mockResolvedValue(TOOL_RESULT);
     setupRegistry(execute);

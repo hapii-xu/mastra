@@ -1,2 +1,30 @@
-export { Composer, ComposerActions, ComposerAttachments, ComposerBox, ComposerInput } from './composer';
-export type { ComposerBoxProps, ComposerInputProps, ComposerProps } from './composer';
+export {
+  Composer,
+  ComposerActions,
+  ComposerAttachments,
+  ComposerBox,
+  ComposerInput,
+  ComposerRing,
+  ComposerToneLabel,
+} from './composer';
+export type {
+  ComposerBoxProps,
+  ComposerInputProps,
+  ComposerProps,
+  ComposerRingProps,
+  ComposerTone,
+  ComposerToneLabelProps,
+} from './composer';
+export { ComposerHeader, ComposerHeaderActions, ComposerHeaderContent, ComposerHeaderRow } from './composer-header';
+export type {
+  ComposerHeaderActionsProps,
+  ComposerHeaderContentProps,
+  ComposerHeaderProps,
+  ComposerHeaderRowProps,
+} from './composer-header';
+export { ComposerSuggestions } from './commands/composer-suggestions';
+export type { ComposerSuggestionItem, ComposerSuggestionsProps } from './commands/composer-suggestions';
+export { useComposerCommands } from './commands/use-composer-commands';
+export type { UseComposerCommandsProps } from './commands/use-composer-commands';
+export { matchCommands, matchCommandOptions } from './commands/command-matches';
+export type { ComposerCommand, ComposerCommandOption } from './commands/command-matches';

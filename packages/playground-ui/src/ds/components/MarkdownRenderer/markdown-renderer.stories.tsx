@@ -1,4 +1,5 @@
 import type { Meta, StoryObj } from '@storybook/react-vite';
+import { useEffect, useState } from 'react';
 import { TooltipProvider } from '../Tooltip';
 import { MarkdownRenderer } from './markdown-renderer';
 
@@ -8,7 +9,7 @@ const meta: Meta<typeof MarkdownRenderer> = {
   decorators: [
     Story => (
       <TooltipProvider>
-        <div className="w-150 p-4">
+        <div className="w-150 max-w-[calc(100vw-2rem)] p-4">
           <Story />
         </div>
       </TooltipProvider>
@@ -96,6 +97,7 @@ Regular text after the quote.`,
 
 export const Tables: Story = {
   args: {
+    tableActions: true,
     children: `## Agent Comparison
 
 | Agent Name | Model | Temperature | Max Tokens |
@@ -103,6 +105,42 @@ export const Tables: Story = {
 | Support | GPT-4 | 0.7 | 4096 |
 | Sales | GPT-4-Turbo | 0.5 | 2048 |
 | Research | Claude-3 | 0.9 | 8192 |`,
+  },
+};
+
+const FACTORY_TABLE = `One factory, **Acme Platform**, with 19 cards.
+
+| Board | Stage | Cards |
+| --- | --- | --- |
+| Work | Intake | 4 (one is linked to a GitHub issue) |
+| Work | Triage | 2 |
+| Work | Planning | 2 |
+| Work | Building | 2 |
+| Work | Review | 2 |
+| Work | PR review | 1 (linked to a PR) |
+| Work | Done / Canceled | 2 / 1 |
+| Review | Intake / Reviewing / Done | 1 / 1 / 1 (all linked to PRs) |`;
+
+export const ChatTable: Story = {
+  args: {
+    children: FACTORY_TABLE,
+  },
+};
+
+export const ChatTableWithActions: Story = {
+  args: {
+    ...ChatTable.args,
+    tableActions: true,
+  },
+};
+
+export const SingleColumnTable: Story = {
+  args: {
+    children: `| Stage |
+| --- |
+| Intake |
+| Planning |
+| Building |`,
   },
 };
 
@@ -157,4 +195,61 @@ Some content here.
 
 More content after the divider.`,
   },
+};
+
+const STREAMED_REPLY = `Here is what I found in the router.
+
+The redirect runs before the session is read, so a signed-in visitor is sent to
+the login page and back again.
+
+\`\`\`ts
+if (!session) return redirect('/login');
+\`\`\`
+
+Moving the guard below the loader fixes it.`;
+
+/** Chunks land in clumps, the way a proxy flushes them, not one word at a time. */
+function useReplay(reply: string): string {
+  const [text, setText] = useState('');
+
+  useEffect(() => {
+    let landed = 0;
+    const timer = setInterval(() => {
+      landed = Math.min(reply.length, landed + 12 + Math.floor(Math.random() * 45));
+      setText(reply.slice(0, landed));
+      if (landed === reply.length) clearInterval(timer);
+    }, 130);
+
+    return () => clearInterval(timer);
+  }, [reply]);
+
+  return text;
+}
+
+function ArrivingReply() {
+  const arriving = useReplay(STREAMED_REPLY);
+
+  return <MarkdownRenderer streaming={arriving !== STREAMED_REPLY}>{arriving}</MarkdownRenderer>;
+}
+
+function StreamCadence() {
+  const [run, setRun] = useState(0);
+
+  return (
+    <div className="flex flex-col gap-4">
+      <button
+        type="button"
+        onClick={() => setRun(count => count + 1)}
+        className="self-start rounded-md border border-border px-3 py-1 text-caption text-foreground"
+      >
+        Replay
+      </button>
+      <ArrivingReply key={run} />
+    </div>
+  );
+}
+
+/** The clumps the replay feeds in should not be readable in the cadence that comes out. */
+export const Streaming: Story = {
+  render: () => <StreamCadence />,
 };

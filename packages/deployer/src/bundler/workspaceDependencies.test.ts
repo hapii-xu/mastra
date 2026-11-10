@@ -1,15 +1,16 @@
+import type { WorkspacesRoot } from '@internal/find-workspaces';
+import { findWorkspacesRoot, findWorkspaces } from '@internal/find-workspaces';
 import type { IMastraLogger } from '@mastra/core/logger';
 import * as pkg from 'empathic/package';
-import type { WorkspacesRoot } from 'find-workspaces';
-import { findWorkspacesRoot, findWorkspaces } from 'find-workspaces';
 import { describe, it, expect, beforeEach, vi } from 'vitest';
 import {
   collectTransitiveWorkspaceDependencies,
   packWorkspaceDependencies,
   getWorkspaceInformation,
+  hasRootExport,
 } from './workspaceDependencies';
 
-vi.mock('find-workspaces', () => ({
+vi.mock('@internal/find-workspaces', () => ({
   findWorkspacesRoot: vi.fn().mockReturnValue({ location: '/mock-root' }),
   findWorkspaces: vi.fn(),
   createWorkspacesCache: vi.fn(),
@@ -55,15 +56,34 @@ describe('workspaceDependencies', () => {
     vi.clearAllMocks();
   });
 
+  describe('hasRootExport', () => {
+    it.each([
+      ['missing exports', undefined, true],
+      ['string shorthand', './dist/index.js', true],
+      ['array shorthand with target', ['./dist/index.js'], true],
+      ['array shorthand with only blocked targets', [null, false], false],
+      ['empty array shorthand', [], false],
+      ['root condition map', { import: './dist/index.mjs', require: './dist/index.cjs' }, true],
+      ['root condition map with no viable target', { import: null, require: false }, false],
+      ['explicit root target', { '.': './dist/index.js', './value': './dist/value.js' }, true],
+      ['explicit root condition map', { '.': { import: './dist/index.mjs' }, './value': './dist/value.js' }, true],
+      ['subpath-only map', { './value': './dist/value.js' }, false],
+      ['empty map', {}, false],
+      ['blocked explicit root', { '.': null, './value': './dist/value.js' }, false],
+    ])('detects %s', (_name, exportsField, expected) => {
+      expect(hasRootExport(exportsField)).toBe(expected);
+    });
+  });
+
   describe('collectTransitiveWorkspaceDependencies', () => {
-    it('should collect direct dependencies', () => {
+    it('should collect direct dependencies', async () => {
       const workspaceMap = new Map<
         string,
         { location: string; dependencies: Record<string, string> | undefined; version: string | undefined }
       >([['pkg-a', { location: '/pkg-a', dependencies: {}, version: '1.0.0' }]]);
       const initialDeps = new Set(['pkg-a']);
 
-      const result = collectTransitiveWorkspaceDependencies({
+      const result = await collectTransitiveWorkspaceDependencies({
         workspaceMap,
         initialDependencies: initialDeps,
         logger: mockLogger,
@@ -73,7 +93,7 @@ describe('workspaceDependencies', () => {
       expect(result.usedWorkspacePackages.has('pkg-a')).toBe(true);
     });
 
-    it('should collect transitive dependencies', () => {
+    it('should collect transitive dependencies', async () => {
       const workspaceMap = new Map<
         string,
         { location: string; dependencies: Record<string, string> | undefined; version: string | undefined }
@@ -83,7 +103,7 @@ describe('workspaceDependencies', () => {
       ]);
       const initialDeps = new Set(['pkg-a']);
 
-      const result = collectTransitiveWorkspaceDependencies({
+      const result = await collectTransitiveWorkspaceDependencies({
         workspaceMap,
         initialDependencies: initialDeps,
         logger: mockLogger,
@@ -94,7 +114,24 @@ describe('workspaceDependencies', () => {
       expect(result.usedWorkspacePackages.has('pkg-b')).toBe(true);
     });
 
-    it('should handle circular dependencies', () => {
+    it('resolves a versionless workspace package to the placeholder version tarball', async () => {
+      vi.mocked(findWorkspacesRoot).mockReturnValue({ location: '/root' } as unknown as WorkspacesRoot);
+
+      await collectTransitiveWorkspaceDependencies({
+        workspaceMap: new Map([
+          ['@inner/versionless', { location: '/versionless', dependencies: {}, version: undefined }],
+        ]),
+        initialDependencies: new Set(['@inner/versionless']),
+        logger: mockLogger,
+      });
+
+      expect(mockDepsServiceMethods.getWorkspaceDependencyPath).toHaveBeenCalledWith({
+        pkgName: 'inner-versionless',
+        version: '0.0.0',
+      });
+    });
+
+    it('should handle circular dependencies', async () => {
       const workspaceMap = new Map<
         string,
         { location: string; dependencies: Record<string, string> | undefined; version: string | undefined }
@@ -104,7 +141,7 @@ describe('workspaceDependencies', () => {
       ]);
       const initialDeps = new Set(['pkg-a']);
 
-      const result = collectTransitiveWorkspaceDependencies({
+      const result = await collectTransitiveWorkspaceDependencies({
         workspaceMap,
         initialDependencies: initialDeps,
         logger: mockLogger,
@@ -113,14 +150,14 @@ describe('workspaceDependencies', () => {
       expect(result.usedWorkspacePackages.size).toBe(2);
     });
 
-    it('should handle missing workspace packages', () => {
+    it('should handle missing workspace packages', async () => {
       const workspaceMap = new Map<
         string,
         { location: string; dependencies: Record<string, string> | undefined; version: string | undefined }
       >([['pkg-a', { location: '/pkg-a', dependencies: { 'pkg-missing': '1.0.0' }, version: '1.0.0' }]]);
       const initialDeps = new Set(['pkg-a']);
 
-      const result = collectTransitiveWorkspaceDependencies({
+      const result = await collectTransitiveWorkspaceDependencies({
         workspaceMap,
         initialDependencies: initialDeps,
         logger: mockLogger,
@@ -159,7 +196,31 @@ describe('workspaceDependencies', () => {
       });
 
       expect(mockDepsServiceMethods.pack).toHaveBeenCalledTimes(3);
+      expect(mockDepsServiceMethods.pack).toHaveBeenCalledWith({
+        dir: '/pkg-a',
+        destination: expect.stringContaining('workspace-module'),
+        sanitizedName: 'pkg-a',
+        version: '1.0.0',
+      });
       expect(mockLogger.info).toHaveBeenCalledWith('Successfully packaged workspace dependencies', { count: 3 });
+    });
+
+    it('packs a versionless workspace package under the placeholder version', async () => {
+      await packWorkspaceDependencies({
+        workspaceMap: new Map([
+          ['@inner/versionless', { location: '/versionless', dependencies: {}, version: undefined }],
+        ]),
+        usedWorkspacePackages: new Set(['@inner/versionless']),
+        bundleOutputDir: '/output',
+        logger: mockLogger,
+      });
+
+      expect(mockDepsServiceMethods.pack).toHaveBeenCalledWith({
+        dir: '/versionless',
+        destination: expect.stringContaining('workspace-module'),
+        sanitizedName: 'inner-versionless',
+        version: '0.0.0',
+      });
     });
 
     it('should do nothing with empty workspace packages', async () => {
@@ -201,7 +262,12 @@ describe('workspaceDependencies', () => {
       vi.mocked(findWorkspaces).mockResolvedValue([
         {
           location: '/workspace/packages/pkg-a',
-          package: { name: 'pkg-a', dependencies: { lodash: '^4.0.0' }, version: '1.0.0' },
+          package: {
+            name: 'pkg-a',
+            dependencies: { lodash: '^4.0.0' },
+            version: '1.0.0',
+            exports: { './value': './dist/value.js' },
+          },
         },
         {
           location: '/workspace/packages/pkg-b',
@@ -222,6 +288,7 @@ describe('workspaceDependencies', () => {
         location: '/workspace/packages/pkg-a',
         dependencies: { lodash: '^4.0.0' },
         version: '1.0.0',
+        exports: { './value': './dist/value.js' },
       });
     });
 
@@ -282,6 +349,7 @@ describe('workspaceDependencies', () => {
         location: '/workspace/minimal',
         dependencies: undefined,
         version: undefined,
+        exports: undefined,
       });
       expect(result.isWorkspacePackage).toBe(true);
     });
@@ -308,6 +376,7 @@ describe('workspaceDependencies', () => {
       location: '/workspace/minimal',
       dependencies: undefined,
       version: undefined,
+      exports: undefined,
     });
     expect(result.isWorkspacePackage).toBe(true);
   });

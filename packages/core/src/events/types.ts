@@ -5,9 +5,22 @@ export type Event = {
   data: any;
   runId: string;
   createdAt: Date;
+  /** Epoch ms at which the event's payload was produced, when it differs from publish time. */
+  producedAt?: number;
   /**
-   * Sequential index for position tracking.
-   * Enables efficient resume from a specific position.
+   * Claim generation of the durable run execution that published the event.
+   * Consumers drop events from a generation older than one they have already
+   * seen: a newer execution has taken the run over.
+   */
+  generation?: number;
+  /**
+   * Index of this event in its topic's log.
+   *
+   * Allocated when the event is appended to the shared cache (see
+   * `MastraServerCache.listPushIndexed`), so a subscriber can resume from an
+   * index and, on seeing a higher one, read the gap back from the log. Absent
+   * when the event could not be cached — such events are delivered live-only
+   * and cannot be resumed by offset.
    */
   index?: number;
   /**
@@ -81,6 +94,11 @@ export interface SubscribeOptions {
    */
   group?: string;
   /**
+   * Where a newly created subscription should begin reading.
+   * Defaults to 'earliest'. Existing consumer groups keep their checkpoint.
+   */
+  startFrom?: 'earliest' | 'latest';
+  /**
    * Opt-in batching policy. When omitted, behavior is unchanged.
    */
   batch?: SubscribeBatchOptions;
@@ -94,5 +112,23 @@ export interface SubscribeOptions {
  * @param nack - Negative acknowledge. Message is requeued for redelivery after a delay.
  *               Not calling either ack or nack leaves the message in-flight until the
  *               backend's ack deadline expires (typically 10s for GCP).
+ *
+ * Subscribers on persistent backends must call `ack` for every delivered event —
+ * including events they filter out — otherwise the message stays in the backend's
+ * pending set for the lifetime of the subscription and the topic grows unbounded.
+ *
+ * A returned promise is honored by backends that support redelivery: a rejection
+ * is treated as a `nack`. The promise is not awaited before the next delivery, so
+ * subscribers that need ordering must serialize internally.
  */
-export type EventCallback = (event: Event, ack?: () => Promise<void>, nack?: () => Promise<void>) => void;
+export type EventCallback = (
+  event: Event,
+  ack?: () => Promise<void>,
+  nack?: () => Promise<void>,
+  /**
+   * Renews the delivery's lease/visibility so the broker does not redeliver
+   * the event while its handler is still running. Omitted by backends that
+   * cannot extend a delivery.
+   */
+  extend?: () => Promise<void>,
+) => void | Promise<void>;

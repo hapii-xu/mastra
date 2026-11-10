@@ -1,5 +1,148 @@
 # @mastra/auth-better-auth
 
+## 1.1.11-alpha.0
+
+### Patch Changes
+
+- Updated `better-auth` to `^1.7.15`. ([#29052](https://github.com/mastra-ai/mastra/pull/29052))
+
+## 1.1.10
+
+### Patch Changes
+
+- dependencies updates: ([#28538](https://github.com/mastra-ai/mastra/pull/28538))
+  - Updated dependency [`better-auth@^1.7.13` ↗︎](https://www.npmjs.com/package/better-auth/v/1.7.13) (from `^1.7.12`, in `dependencies`)
+
+## 1.1.10-alpha.0
+
+### Patch Changes
+
+- dependencies updates: ([#28538](https://github.com/mastra-ai/mastra/pull/28538))
+  - Updated dependency [`better-auth@^1.7.13` ↗︎](https://www.npmjs.com/package/better-auth/v/1.7.13) (from `^1.7.12`, in `dependencies`)
+
+## 1.1.9
+
+### Patch Changes
+
+- dependencies updates: ([#28417](https://github.com/mastra-ai/mastra/pull/28417))
+  - Updated dependency [`better-auth@^1.7.12` ↗︎](https://www.npmjs.com/package/better-auth/v/1.7.12) (from `^1.7.7`, in `dependencies`)
+  - Updated dependency [`@types/node@22.19.15` ↗︎](https://www.npmjs.com/package/@types/node/v/22.19.15) (from `22.20.5`, in `devDependencies`)
+
+## 1.1.9-alpha.0
+
+### Patch Changes
+
+- dependencies updates: ([#28417](https://github.com/mastra-ai/mastra/pull/28417))
+  - Updated dependency [`better-auth@^1.7.12` ↗︎](https://www.npmjs.com/package/better-auth/v/1.7.12) (from `^1.7.7`, in `dependencies`)
+  - Updated dependency [`@types/node@22.19.15` ↗︎](https://www.npmjs.com/package/@types/node/v/22.19.15) (from `22.20.5`, in `devDependencies`)
+
+## 1.1.8
+
+### Patch Changes
+
+- Bump for npm ([#27221](https://github.com/mastra-ai/mastra/pull/27221))
+
+## 1.1.8-alpha.0
+
+### Patch Changes
+
+- Bump for npm ([#27221](https://github.com/mastra-ai/mastra/pull/27221))
+
+## 1.1.7
+
+### Patch Changes
+
+- security: bump better-auth to ^1.7.7 and @modelcontextprotocol/sdk to ^1.32.1 for Vanta/Aikido findings (AIKIDO-2026-373183, AIKIDO-2026-261025, AIKIDO-2026-365378/156139/344432). ([#26773](https://github.com/mastra-ai/mastra/pull/26773))
+
+## 1.1.7-alpha.0
+
+### Patch Changes
+
+- security: bump better-auth to ^1.7.7 and @modelcontextprotocol/sdk to ^1.32.1 for Vanta/Aikido findings (AIKIDO-2026-373183, AIKIDO-2026-261025, AIKIDO-2026-365378/156139/344432). ([#26773](https://github.com/mastra-ai/mastra/pull/26773))
+
+## 1.1.6
+
+### Patch Changes
+
+- Fixed Better Auth so attackers cannot tell whether an account exists or send requests as a signed-in user from another site. Updated better-auth to 1.7.4. ([#24027](https://github.com/mastra-ai/mastra/pull/24027))
+
+## 1.1.6-alpha.0
+
+### Patch Changes
+
+- Fixed Better Auth so attackers cannot tell whether an account exists or send requests as a signed-in user from another site. Updated better-auth to 1.7.4. ([#24027](https://github.com/mastra-ai/mastra/pull/24027))
+
+## 1.1.5
+
+### Patch Changes
+
+- Update README to include accurate, up-to-date information ([#22858](https://github.com/mastra-ai/mastra/pull/22858))
+
+- Remove `CHANGELOG.md` from distributed npm files resulting in reduced package size ([#22737](https://github.com/mastra-ai/mastra/pull/22737))
+
+## 1.1.5-alpha.1
+
+### Patch Changes
+
+- Update README to include accurate, up-to-date information ([#22858](https://github.com/mastra-ai/mastra/pull/22858))
+
+## 1.1.5-alpha.0
+
+### Patch Changes
+
+- Remove `CHANGELOG.md` from distributed npm files resulting in reduced package size ([#22737](https://github.com/mastra-ai/mastra/pull/22737))
+
+## 1.1.4
+
+### Patch Changes
+
+- Resolve a default `activeOrganizationId` from the user's oldest existing membership when the stored better-auth session has no `activeOrganizationId` set. Nothing in a default sign-in flow calls the organization plugin's `setActive`, so the field was always null and org-scoped consumers saw users with no organization. ([#21482](https://github.com/mastra-ai/mastra/pull/21482))
+
+  ```ts
+  import { MastraAuthBetterAuth } from '@mastra/auth-better-auth';
+
+  const mastraAuth = new MastraAuthBetterAuth({ auth });
+  const user = await mastraAuth.authenticateToken(token, request);
+  // Populated even when the sign-in flow never called `setActive`.
+  console.log(user?.session.activeOrganizationId);
+  ```
+
+  The resolution is read-only and best-effort: the session row is not mutated, users with no memberships still authenticate, and a failed lookup falls back to today's behavior. Caveats: the resolved value is an inferred default, not an explicit user selection, and a session whose active organization was deliberately cleared via `setActive` is indistinguishable from one that was never set, so it also receives the default. A membership removed by an administrator stops being applied to new sessions within about a minute.
+
+- Fixed reading request headers from Express-style plain header objects so cookie-based auth providers no longer throw and fail with a misleading 401. ([#21261](https://github.com/mastra-ai/mastra/pull/21261))
+
+  Related to https://github.com/mastra-ai/mastra/issues/21253
+
+## 1.1.4-alpha.1
+
+### Patch Changes
+
+- Resolve a default `activeOrganizationId` from the user's oldest existing membership when the stored better-auth session has no `activeOrganizationId` set. Nothing in a default sign-in flow calls the organization plugin's `setActive`, so the field was always null and org-scoped consumers saw users with no organization. ([#21482](https://github.com/mastra-ai/mastra/pull/21482))
+
+  The resolution is read-only and best-effort: the session row is not mutated, users with no memberships still authenticate, and a failed lookup falls back to today's behavior. Caveats: the resolved value is an inferred default, not an explicit user selection, and a session whose active organization was deliberately cleared via `setActive` is indistinguishable from one that was never set, so it also receives the default. A membership removed by an administrator stops being applied to new sessions within about a minute.
+
+## 1.1.4-alpha.0
+
+### Patch Changes
+
+- Fixed reading request headers from Express-style plain header objects so cookie-based auth providers no longer throw and fail with a misleading 401. ([#21261](https://github.com/mastra-ai/mastra/pull/21261))
+
+  Related to https://github.com/mastra-ai/mastra/issues/21253
+
+## 1.1.3
+
+### Patch Changes
+
+- dependencies updates: ([#20162](https://github.com/mastra-ai/mastra/pull/20162))
+  - Updated dependency [`better-auth@^1.6.23` ↗︎](https://www.npmjs.com/package/better-auth/v/1.6.23) (from `^1.6.13`, in `dependencies`)
+
+## 1.1.3-alpha.0
+
+### Patch Changes
+
+- dependencies updates: ([#20162](https://github.com/mastra-ai/mastra/pull/20162))
+  - Updated dependency [`better-auth@^1.6.23` ↗︎](https://www.npmjs.com/package/better-auth/v/1.6.23) (from `^1.6.13`, in `dependencies`)
+
 ## 1.1.2
 
 ### Patch Changes

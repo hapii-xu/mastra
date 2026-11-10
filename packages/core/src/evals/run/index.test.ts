@@ -5,7 +5,7 @@ import { z } from 'zod/v4';
 import { Agent } from '../../agent';
 import { Mastra } from '../../mastra';
 import { MockMemory } from '../../memory/mock';
-import { NoOpObservability } from '../../observability';
+import { NoOpObservability, SpanType } from '../../observability';
 import { RequestContext } from '../../request-context';
 import { InMemoryStore } from '../../storage';
 import { createTool } from '../../tools';
@@ -402,7 +402,9 @@ describe('runEvals', () => {
       expect(mockScorers[1].run).toHaveBeenCalled();
     });
 
-    it('should run scorers on individual step results', async () => {
+    // On storage v2 the first step's result is evicted by the end of the run, so its scorer only
+    // sees it if the result's lazy `steps` is loaded back from storage.
+    it.each([1, 2] as const)('should run scorers on individual step results (storage v%s)', async storageVersion => {
       const mockStep = createStep({
         id: 'test-step',
         inputSchema: z.object({ input: z.string() }),
@@ -411,15 +413,25 @@ describe('runEvals', () => {
           return { output: `Processed: ${inputData.input}` };
         },
       });
+      const passOn = (id: string) =>
+        createStep({
+          id,
+          inputSchema: z.object({ output: z.string() }),
+          outputSchema: z.object({ output: z.string() }),
+          execute: async ({ inputData }) => inputData,
+        });
 
       const workflow = createWorkflow({
         id: 'test-workflow',
         inputSchema: z.object({ input: z.string() }),
         outputSchema: z.object({ output: z.string() }),
-        options: { validateInputs: false },
+        options: { validateInputs: false, storageVersion },
       })
         .then(mockStep)
+        .then(passOn('second-step'))
+        .then(passOn('third-step'))
         .commit();
+      const mastra = new Mastra({ workflows: { workflow }, logger: false, storage: new InMemoryStore() });
 
       // Mock the scorer to track what it receives
       const mockScorer = createMockScorer('step-scorer', 0.8);
@@ -432,7 +444,7 @@ describe('runEvals', () => {
             'test-step': [mockScorer],
           },
         },
-        target: workflow,
+        target: mastra.getWorkflow('workflow'),
       });
 
       // Verify the scorer was called with step-specific data
@@ -646,37 +658,18 @@ describe('runEvals', () => {
         .then(mockStep)
         .commit();
 
-      // Create mock scores storage
-      const saveScoreSpy = vi.fn().mockResolvedValue({ score: {} });
-      const mockScoresStore = {
-        saveScore: saveScoreSpy,
-      };
-
-      // Mock workflows store with methods needed for scorer workflow runs
-      const mockWorkflowsStore = {
-        getWorkflowRunById: vi.fn().mockResolvedValue(null),
-        deleteWorkflowRunById: vi.fn().mockResolvedValue(undefined),
-        persistWorkflowSnapshot: vi.fn().mockResolvedValue(undefined),
-        listWorkflowRuns: vi.fn().mockResolvedValue({ runs: [] }),
-      };
-
-      const mockStorage = {
-        init: vi.fn().mockResolvedValue(undefined),
-        getStore: vi.fn().mockImplementation(async (domain: string) => {
-          if (domain === 'workflows') return mockWorkflowsStore;
-          if (domain === 'scores') return mockScoresStore;
-          return null;
-        }),
-        __setLogger: vi.fn(),
-      };
-
+      // Workflow runs claim run ownership through the workflows store, so a
+      // partial mock cannot satisfy them. Use a real in-memory store.
       const mastra = new Mastra({
         workflows: {
           testWorkflow: workflow,
         },
         logger: false,
-        storage: mockStorage as any,
+        storage: new InMemoryStore(),
       });
+
+      const scoresStore = (await mastra.getStorage()!.getStore('scores'))!;
+      const saveScoreSpy = vi.spyOn(scoresStore, 'saveScore');
 
       const scorer = createScorer({
         id: 'workflowScorer',
@@ -1193,6 +1186,105 @@ describe('runEvals', () => {
       });
 
       expect(result.scores.trajectory['raw-output-check']).toBe(1.0);
+    });
+
+    describe('trace store reads', () => {
+      // The storage exporter buffers spans, so the trace is only readable after a flush.
+      async function runWithTraceStore({
+        storedOnFlush,
+        flushFails = false,
+      }: {
+        storedOnFlush: boolean;
+        flushFails?: boolean;
+      }) {
+        const { agent } = createToolCallingAgent();
+        const observability = new NoOpObservability();
+        const storage = new InMemoryStore();
+        const mastra = new Mastra({ agents: { agent }, storage, observability, logger: false });
+        const target = mastra.getAgent('agent');
+        const generate = target.generate.bind(target);
+        vi.spyOn(target, 'generate').mockImplementation(async (...args: any[]) => ({
+          ...(await (generate as any)(...args)),
+          traceId: 'trace-1',
+          spanId: 'agent-1',
+        }));
+
+        let flushed = false;
+        vi.spyOn(observability, 'flush').mockImplementation(async () => {
+          if (flushFails) throw new Error('flush failed');
+          flushed = storedOnFlush;
+        });
+        const span = (spanId: string, spanType: SpanType, parentSpanId: string | null) => ({
+          traceId: 'trace-1',
+          spanId,
+          parentSpanId,
+          name: spanId,
+          spanType,
+          startedAt: new Date('2025-01-01T00:00:00Z'),
+          endedAt: new Date('2025-01-01T00:00:01Z'),
+        });
+        const observabilityStore = (await storage.getStore('observability'))!;
+        vi.spyOn(observabilityStore, 'getTrace').mockImplementation(async () =>
+          flushed
+            ? ({
+                traceId: 'trace-1',
+                spans: [
+                  span('agent-1', SpanType.AGENT_RUN, null),
+                  span('model-1', SpanType.MODEL_GENERATION, 'agent-1'),
+                  span('tool-1', SpanType.TOOL_CALL, 'model-1'),
+                ],
+              } as any)
+            : null,
+        );
+        const warn = vi.spyOn(mastra.getLogger(), 'warn');
+        const debug = vi.spyOn(mastra.getLogger(), 'debug');
+
+        let received: any;
+        const probe = createScorer({
+          id: 'trajectory-probe',
+          description: 'Keeps its input',
+          type: 'trajectory',
+        }).generateScore(({ run }) => {
+          received = run.output;
+          return 1;
+        });
+        let gateReceived: any;
+        const gate = createScorer({
+          id: 'trajectory-gate',
+          description: 'Keeps its input',
+          type: 'trajectory',
+        }).generateScore(({ run }) => {
+          gateReceived = run.output;
+          return 1;
+        });
+        await runEvals({
+          data: [{ input: 'What is the weather?' }],
+          scorers: { trajectory: [probe] },
+          gates: [gate],
+          target,
+        });
+        return { received, gateReceived, warn, debug };
+      }
+
+      it('uses the stored trace once observability is flushed', async () => {
+        const { received, gateReceived } = await runWithTraceStore({ storedOnFlush: true });
+        expect(received.steps.map((s: any) => s.stepType)).toEqual(['model_generation']);
+        expect(gateReceived.steps.map((s: any) => s.stepType)).toEqual(['model_generation']);
+      });
+
+      it('uses the messages when the trace is not stored', async () => {
+        const { received, debug } = await runWithTraceStore({ storedOnFlush: false });
+        expect(received.steps.map((s: any) => s.name)).toEqual(['weatherTool', 'calendarTool']);
+        expect(debug).toHaveBeenCalledWith(
+          expect.stringContaining('Trace trace-1 was not found in observability storage'),
+        );
+      });
+
+      it('keeps scoring when the flush fails', async () => {
+        const { received, warn } = await runWithTraceStore({ storedOnFlush: true, flushFails: true });
+        expect(received.steps.map((s: any) => s.name)).toEqual(['weatherTool', 'calendarTool']);
+        expect(warn).toHaveBeenCalledWith('Failed to flush observability before reading the trace:', expect.any(Error));
+      });
     });
   });
 
@@ -1844,6 +1936,122 @@ describe('runEvals', () => {
       expect(result.turnResults!.length).toBe(2);
       expect(result.turnResults![0]!.scores!['per-turn-length']).toBe(1.0);
       expect(result.turnResults![1]!.scores!['per-turn-length']).toBe(1.0);
+    });
+
+    it('gives a trajectory-typed gate a WORKFLOW trajectory built from stepResults (#22632, CR-2)', async () => {
+      const stepOne = createStep({
+        id: 'first-step',
+        inputSchema: z.object({ input: z.string() }),
+        outputSchema: z.object({ output: z.string() }),
+        execute: async ({ inputData }) => ({ output: `one:${inputData.input}` }),
+      });
+      const stepTwo = createStep({
+        id: 'second-step',
+        inputSchema: z.object({ output: z.string() }),
+        outputSchema: z.object({ output: z.string() }),
+        execute: async ({ inputData }) => ({ output: `two:${inputData.output}` }),
+      });
+
+      const workflow = createWorkflow({
+        id: 'trajectory-gate-workflow',
+        inputSchema: z.object({ input: z.string() }),
+        // The workflow result is an ordinary object — NOT an iterable of agent messages.
+        outputSchema: z.object({ output: z.string() }),
+        options: { validateInputs: false },
+      })
+        .then(stepOne)
+        .then(stepTwo)
+        .commit();
+
+      let seenOutput: any;
+      const trajectoryGate = createScorer({
+        id: 'workflow-trajectory-gate',
+        description: 'Reads the workflow trajectory it was handed',
+        type: 'trajectory',
+      }).generateScore(({ run }: any) => {
+        seenOutput = run.output;
+        return run.output.steps.length >= 2 ? 1.0 : 0.0;
+      });
+
+      // No Mastra instance is attached, so there is no trace storage: the gate path
+      // must fall back to the workflow step results, exactly as `scorers.trajectory` does.
+      const result = await runEvals({
+        data: [{ input: { input: 'go' } }],
+        gates: [trajectoryGate],
+        target: workflow,
+      } as any);
+
+      expect(seenOutput).toBeDefined();
+      expect(Array.isArray(seenOutput)).toBe(false);
+      expect(seenOutput.steps).toBeInstanceOf(Array);
+      // Built from stepResults, so both executed steps are present.
+      expect(seenOutput.steps.length).toBeGreaterThanOrEqual(2);
+      expect(result.gateResults![0]!.score).toBe(1.0);
+      expect(result.verdict).toBe('passed');
+    });
+
+    it('hands a trajectory-typed PER-TURN gate a Trajectory and threads expectedTrajectory (#22632)', async () => {
+      const agent = createTurnAgent('turnTrajectoryGateAgent');
+
+      const seen: Array<{ output: unknown; expected: unknown }> = [];
+      const perTurnTrajectoryGate = createScorer({
+        id: 'per-turn-trajectory-gate',
+        description: 'Records the shape a per-turn trajectory gate receives',
+        type: 'trajectory',
+      }).generateScore(({ run }: any) => {
+        seen.push({ output: run.output, expected: run.expectedTrajectory });
+        return 1.0;
+      });
+
+      const expectedTrajectory = { steps: [] };
+
+      const result = await runEvals({
+        data: [
+          {
+            expectedTrajectory,
+            turns: [{ input: 'Turn one', gates: [perTurnTrajectoryGate] }],
+          },
+        ],
+        target: agent,
+      } as any);
+
+      expect(seen).toHaveLength(1);
+      // Same contract as the top-level gate loop: a Trajectory, never the raw messages.
+      expect(Array.isArray(seen[0]!.output)).toBe(false);
+      expect((seen[0]!.output as { steps?: unknown }).steps).toBeInstanceOf(Array);
+      expect(seen[0]!.expected).toEqual(expectedTrajectory);
+      expect(result.turnResults![0]!.gateResults![0]!.passed).toBe(true);
+    });
+
+    it('logs the cause when a gate throws, while still scoring it 0 (#22632)', async () => {
+      const agent = createTurnAgent('gateThrowLoggingAgent');
+      const warn = vi.fn();
+      const mastra = new Mastra({
+        agents: { gateThrowLoggingAgent: agent },
+        logger: { warn, error: vi.fn(), info: vi.fn(), debug: vi.fn(), trackException: vi.fn() } as any,
+      });
+
+      const throwingGate = createScorer({
+        id: 'throwing-gate-logged',
+        description: 'Always throws',
+      }).generateScore(() => {
+        throw new Error('gate boom');
+      });
+
+      const result = await runEvals({
+        data: [{ input: 'Test' }],
+        gates: [throwingGate],
+        target: mastra.getAgent('gateThrowLoggingAgent'),
+      });
+
+      // The score-0 contract is deliberate and stays.
+      expect(result.gateResults![0]!.score).toBe(0);
+      expect(result.verdict).toBe('failed');
+      // ... but the cause is no longer discarded by a bare catch.
+      expect(warn).toHaveBeenCalled();
+      const logged = warn.mock.calls.map((c: unknown[]) => c.map(String).join(' ')).join(' | ');
+      expect(logged).toContain('throwing-gate-logged');
+      expect(logged).toContain('gate boom');
     });
 
     it('fails the verdict when a per-turn gate fails on one turn (wrong turn cannot satisfy)', async () => {

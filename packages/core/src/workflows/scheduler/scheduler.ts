@@ -2,14 +2,17 @@ import { MastraBase } from '../../base';
 import type { PubSub } from '../../events/pubsub';
 import { RegisteredLogger } from '../../logger/constants';
 import type { Schedule, ScheduleTrigger, SchedulesStorage } from '../../storage/domains/schedules/base';
-import { computeNextFireAt } from './cron';
-import type { SchedulerConfig } from './types';
+import { computeNextFire } from './cron';
+import type { ScheduledWorkflowTrigger, SchedulerConfig } from './types';
 
 const TOPIC_WORKFLOWS = 'workflows';
 export const TOPIC_AGENT_SCHEDULES = 'agent-schedules';
 const DEFAULT_TICK_INTERVAL_MS = 10_000;
 const DEFAULT_BATCH_SIZE = 100;
 const DEFAULT_MISSES_BEFORE_DELETE = 3;
+const DEFAULT_STALE_SKIPS_BEFORE_ESCALATION = 5;
+/** Longest delay `setTimeout` accepts; larger values fire immediately. */
+const MAX_TIMER_DELAY_MS = 2 ** 31 - 1;
 
 /**
  * Drives cron-based workflow triggers.
@@ -30,8 +33,12 @@ export class Scheduler extends MastraBase {
   #pubsub: PubSub;
   #config: Required<Pick<SchedulerConfig, 'tickIntervalMs' | 'batchSize'>> & SchedulerConfig;
 
-  #intervalHandle?: ReturnType<typeof setInterval>;
+  #timerHandle?: ReturnType<typeof setTimeout>;
   #inflightTick?: Promise<void>;
+  #loop?: Promise<void>;
+  #wakeRequested = false;
+  /** Whether the last tick saw due schedules, or failed to list them. */
+  #lastTickBusy = false;
   #started = false;
   #stopping = false;
 
@@ -42,6 +49,20 @@ export class Scheduler extends MastraBase {
    * ordering races before reclaiming a ghost row.
    */
   #missingWorkflowCounts = new Map<string, number>();
+
+  /**
+   * Consecutive ticks each schedule has been skipped because the local target
+   * definition is stale (see `#ensureTargetCurrent`). Doubles as the
+   * "already logged" marker so a straggler doesn't re-log every tick, and as
+   * the counter that escalates a skip that is never being picked up by anyone.
+   *
+   * Scoped to the fire window (`nextFireAt`) the skips were observed against.
+   * A window that advances is proof some other instance claimed and fired the
+   * previous one, so the count restarts rather than accumulating across
+   * unrelated fires — otherwise a long-lived straggler would escalate even
+   * though every fire is being served correctly by a current-build instance.
+   */
+  #staleDefinitionCounts = new Map<string, { fireAt: number; count: number }>();
 
   constructor({
     schedulesStore,
@@ -62,7 +83,7 @@ export class Scheduler extends MastraBase {
     };
   }
 
-  /** Start the periodic tick loop. Runs an immediate tick first. */
+  /** Start the tick loop. Runs an immediate tick first. */
   async start(): Promise<void> {
     if (this.#started) return;
     this.#started = true;
@@ -71,37 +92,16 @@ export class Scheduler extends MastraBase {
     // over into a new start() since the workflow registry may now look
     // different.
     this.#missingWorkflowCounts.clear();
+    this.#staleDefinitionCounts.clear();
 
     try {
-      // Run one tick immediately so newly-due schedules don't wait the full interval.
-      await this.#runTick();
-
-      // If stop() ran concurrently with the warm-up tick, don't arm a new
-      // interval afterwards — the caller has already asked us to shut down.
-      if (this.#stopping || !this.#started) return;
-
-      this.#intervalHandle = setInterval(() => {
-        // Swallow rejections here so a tick failure can't surface as an
-        // unhandled promise rejection and crash the host process. #processTick
-        // already logs its own errors and notifies onError, so we only need a
-        // belt-and-braces logger.error for anything that escapes.
-        void this.#runTick().catch(err => {
-          this.logger.error('Scheduler tick crashed', { error: err });
-        });
-      }, this.#config.tickIntervalMs);
-
-      // Don't keep the process alive just because the scheduler is polling.
-      // The process should be able to exit when all other work is done.
-      // Without .unref(), the setInterval prevents clean shutdown in
-      // scripts that create a Mastra instance (which auto-creates the
-      // notification dispatch workflow with a cron schedule) and exit
-      // after a single agent.generate() call.
-      // Optional call: on runtimes where setInterval returns a number
-      // (e.g. Cloudflare Workers) there is no unref and nothing to release.
-      this.#intervalHandle.unref?.();
+      // Run one tick immediately so newly-due schedules don't wait, then arm
+      // the timer for the next one.
+      this.#wakeRequested = true;
+      await this.#runLoop();
     } catch (err) {
       // Reset state so a future start() can retry. Without this, a failed
-      // warm-up tick would leave #started=true with no interval armed and
+      // warm-up tick would leave #started=true with no timer armed and
       // every subsequent start() call would silently no-op.
       this.#started = false;
       this.#stopping = false;
@@ -114,11 +114,15 @@ export class Scheduler extends MastraBase {
     if (!this.#started) return;
     this.#stopping = true;
 
-    if (this.#intervalHandle) {
-      clearInterval(this.#intervalHandle);
-      this.#intervalHandle = undefined;
-    }
+    this.#clearTimer();
 
+    if (this.#loop) {
+      try {
+        await this.#loop;
+      } catch {
+        // tick errors are already logged; swallow during shutdown
+      }
+    }
     if (this.#inflightTick) {
       try {
         await this.#inflightTick;
@@ -138,13 +142,104 @@ export class Scheduler extends MastraBase {
 
   /**
    * Run a single tick. Public for tests; production callers should rely
-   * on the interval started by `start()`.
+   * on the timer started by `start()`.
    */
   async tick(): Promise<void> {
     await this.#runTick();
   }
 
+  /**
+   * Tick now and re-arm the timer. Call when a schedule was created, resumed
+   * or moved earlier, since the scheduler may be sleeping until a later fire.
+   */
+  wake(): void {
+    if (!this.#started || this.#stopping) return;
+    this.#wakeRequested = true;
+    if (this.#loop) return;
+    this.#clearTimer();
+    // Swallow rejections so a tick failure can't surface as an unhandled
+    // rejection and crash the host process. #processTick already logs its
+    // own errors; this is a belt-and-braces log for anything that escapes.
+    void this.#runLoop().catch(err => {
+      this.logger.error('Scheduler tick crashed', { error: err });
+    });
+  }
+
   // -------- Internals --------
+
+  /**
+   * Tick, then sleep until the earliest active schedule is due instead of
+   * polling storage on a fixed interval. A wake that lands mid-loop ticks
+   * again before the timer is armed.
+   */
+  #runLoop(): Promise<void> {
+    const loop = this.#loopOnce().finally(() => {
+      if (this.#loop === loop) this.#loop = undefined;
+    });
+    this.#loop = loop;
+    return loop;
+  }
+
+  async #loopOnce(): Promise<void> {
+    let delay: number | undefined;
+    do {
+      this.#wakeRequested = false;
+      try {
+        await this.#runTick();
+      } catch (err) {
+        // A crashed tick must not stop the scheduler: retry at the tick interval.
+        this.logger.error('Scheduler tick crashed', { error: err });
+        this.#lastTickBusy = true;
+      }
+      if (this.#stopping || !this.#started) return;
+      delay = await this.#nextDelay();
+    } while (this.#wakeRequested && !this.#stopping && this.#started);
+    if (this.#stopping || !this.#started) return;
+
+    this.#clearTimer();
+    // No active schedules: stay idle until `wake()`.
+    if (delay === undefined) return;
+    this.#timerHandle = setTimeout(() => {
+      this.#timerHandle = undefined;
+      this.wake();
+    }, delay);
+    // Don't keep the process alive solely because it has active schedules.
+    // Optional call: on runtimes where setTimeout returns a number
+    // (e.g. Cloudflare Workers) there is no unref and nothing to release.
+    this.#timerHandle.unref?.();
+  }
+
+  /**
+   * How long to sleep before the next tick. Keeps the fixed interval while
+   * schedules are due (fires, retries, skipped targets), on storage errors,
+   * and for a scheduler explicitly enabled with `enabled: true` (a dedicated
+   * scheduler that must find rows written by processes it shares no pubsub
+   * with). Otherwise waits for the earliest active `nextFireAt` and relies on
+   * `wake()` for new schedules; with no active schedules it returns undefined
+   * and no timer is armed, so an idle app never touches storage.
+   */
+  async #nextDelay(): Promise<number | undefined> {
+    const interval = this.#config.tickIntervalMs;
+    if (this.#config.enabled === true || this.#lastTickBusy) return interval;
+    let next: Schedule[];
+    try {
+      // Every adapter returns due rows ordered by nextFireAt, so asking for one
+      // row with an unbounded `now` is a bounded earliest-fire lookup.
+      next = await this.#schedulesStore.listDueSchedules(Number.MAX_SAFE_INTEGER, 1);
+    } catch (err) {
+      this.logger.error('Failed to look up the next scheduled fire', { error: err });
+      return interval;
+    }
+    if (next.length === 0) return undefined;
+    return Math.max(interval, Math.min(next[0]!.nextFireAt - Date.now(), MAX_TIMER_DELAY_MS));
+  }
+
+  #clearTimer(): void {
+    if (this.#timerHandle) {
+      clearTimeout(this.#timerHandle);
+      this.#timerHandle = undefined;
+    }
+  }
 
   async #runTick(): Promise<void> {
     if (this.#stopping || this.#inflightTick) return;
@@ -157,12 +252,14 @@ export class Scheduler extends MastraBase {
 
   async #processTick(): Promise<void> {
     let due: Schedule[];
+    this.#lastTickBusy = true;
     try {
       due = await this.#schedulesStore.listDueSchedules(Date.now(), this.#config.batchSize);
     } catch (err) {
       this.logger.error('Failed to list due schedules', { error: err });
       return;
     }
+    this.#lastTickBusy = due.length > 0;
 
     for (const schedule of due) {
       if (this.#stopping) break;
@@ -186,7 +283,7 @@ export class Scheduler extends MastraBase {
     const predicate = this.#config.isTargetReady;
     if (!predicate) return true;
 
-    if (predicate(schedule.target)) {
+    if (await predicate(schedule.target)) {
       this.#missingWorkflowCounts.delete(schedule.id);
       return true;
     }
@@ -237,17 +334,104 @@ export class Scheduler extends MastraBase {
     return false;
   }
 
+  /**
+   * Stale-build fence (#19169). Scheduled runs execute `localOnly` in the
+   * claiming process against its own workflow registry, so an instance whose
+   * local target definition differs from the one recorded on the schedule
+   * row must not claim the fire — it would silently run an outdated step
+   * graph. Returning `false` skips the CAS claim entirely, leaving
+   * `nextFireAt` untouched so an instance with a matching definition can
+   * claim the fire on its own tick.
+   *
+   * Fails open when no predicate is configured or when the predicate
+   * throws — fencing is a safety net, not a reason to stop firing.
+   */
+  #ensureTargetCurrent(schedule: Schedule): boolean {
+    const predicate = this.#config.isTargetCurrent;
+    if (!predicate) return true;
+
+    let current: boolean;
+    try {
+      current = predicate(schedule.target);
+    } catch (err) {
+      this.logger.error('isTargetCurrent predicate threw; treating target as current', {
+        scheduleId: schedule.id,
+        error: err,
+      });
+      return true;
+    }
+
+    if (current) {
+      this.#staleDefinitionCounts.delete(schedule.id);
+      return true;
+    }
+
+    // Only count skips against the same unclaimed fire window. If `nextFireAt`
+    // has moved on, an instance with a matching definition claimed the last
+    // fire and this is a fresh window, not a continuing stall.
+    const prevEntry = this.#staleDefinitionCounts.get(schedule.id);
+    const prev = prevEntry?.fireAt === schedule.nextFireAt ? prevEntry.count : 0;
+    const next = prev + 1;
+    this.#staleDefinitionCounts.set(schedule.id, { fireAt: schedule.nextFireAt, count: next });
+
+    const targetSummary =
+      schedule.target.type === 'workflow'
+        ? { workflowId: schedule.target.workflowId }
+        : { agentId: schedule.target.agentId };
+    const limit = this.#config.staleSkipsBeforeEscalation ?? DEFAULT_STALE_SKIPS_BEFORE_ESCALATION;
+
+    if (prev === 0) {
+      this.logger.warn(
+        'Local target definition differs from the schedule row; leaving fire for an instance running the current build',
+        { scheduleId: schedule.id, targetType: schedule.target.type, ...targetSummary },
+      );
+    } else if (next === limit) {
+      // Nobody has claimed this fire for `limit` consecutive ticks, which
+      // means no running instance matches the row (bad rollout, or a hash the
+      // reconciler wrote that no build reproduces). We deliberately do NOT
+      // force the fire — running a stale graph is the bug this fence exists to
+      // prevent — but a schedule that silently never runs is just as bad, so
+      // escalate to an alertable error and leave a trail in schedule history.
+      this.logger.error(
+        'Schedule has been skipped repeatedly because no local target definition matches the schedule row; it will not fire until an instance running the recorded build is available',
+        { scheduleId: schedule.id, targetType: schedule.target.type, ...targetSummary, consecutiveStaleSkips: next },
+      );
+      void this.#recordStaleSkip(schedule, next);
+    }
+
+    return false;
+  }
+
+  /**
+   * Best-effort history entry for an escalated stale skip so the stall is
+   * visible to anyone inspecting the schedule, not just in process logs.
+   */
+  async #recordStaleSkip(schedule: Schedule, consecutiveStaleSkips: number): Promise<void> {
+    try {
+      await this.#schedulesStore.recordTrigger({
+        scheduleId: schedule.id,
+        runId: `sched_${schedule.id}_${schedule.nextFireAt}`,
+        scheduledFireAt: schedule.nextFireAt,
+        actualFireAt: Date.now(),
+        outcome: 'failed',
+        error: `Skipped: no local target definition matches the schedule row after ${consecutiveStaleSkips} consecutive ticks`,
+        triggerKind: 'schedule-fire',
+      });
+    } catch (err) {
+      this.logger.warn('Failed to record stale-definition skip', { scheduleId: schedule.id, error: err });
+    }
+  }
+
   async #fireSchedule(schedule: Schedule): Promise<void> {
     if (!(await this.#ensureTargetReady(schedule))) return;
+    if (!this.#ensureTargetCurrent(schedule)) return;
 
     const actualFireAt = Date.now();
 
     let newNextFireAt: number;
+    let completed: boolean;
     try {
-      newNextFireAt = computeNextFireAt(schedule.cron, {
-        timezone: schedule.timezone,
-        after: actualFireAt,
-      });
+      ({ nextFireAt: newNextFireAt, completed } = computeNextFire(schedule, actualFireAt));
     } catch (err) {
       this.logger.error('Failed to compute next fire time for schedule', {
         scheduleId: schedule.id,
@@ -269,6 +453,7 @@ export class Scheduler extends MastraBase {
         newNextFireAt,
         actualFireAt,
         runId,
+        completed ? 'completed' : undefined,
       );
     } catch (err) {
       this.logger.error('Failed to claim due schedule fire', {
@@ -286,11 +471,30 @@ export class Scheduler extends MastraBase {
       return;
     }
 
+    this.logger.info('Claimed schedule occurrence', {
+      scheduleId: schedule.id,
+      runId,
+      scheduledFireAt: schedule.nextFireAt,
+    });
+
     let triggerStatus: ScheduleTrigger['outcome'] = 'published';
     let triggerError: string | undefined;
 
     try {
-      await this.#publishTargetStart(schedule, runId);
+      for (let attempt = 0; attempt < 3; attempt++) {
+        try {
+          await this.#publishTargetStart(schedule, runId);
+          break;
+        } catch (err) {
+          if (attempt === 2) throw err;
+          await new Promise(resolve => setTimeout(resolve, 100 * 2 ** attempt));
+        }
+      }
+      this.logger.info('Published schedule occurrence', {
+        scheduleId: schedule.id,
+        runId,
+        scheduledFireAt: schedule.nextFireAt,
+      });
     } catch (err) {
       triggerStatus = 'failed';
       triggerError = err instanceof Error ? err.message : String(err);
@@ -298,6 +502,9 @@ export class Scheduler extends MastraBase {
         scheduleId: schedule.id,
         runId,
         targetType: schedule.target.type,
+        scheduledFireAt: schedule.nextFireAt,
+        publicationOutcome: 'unknown',
+        automaticReplay: false,
         error: err,
       });
       this.#notifyError(err, schedule.id);
@@ -348,18 +555,39 @@ export class Scheduler extends MastraBase {
   async #publishTargetStart(schedule: Schedule, claimId: string): Promise<void> {
     switch (schedule.target.type) {
       case 'workflow': {
-        const { workflowId, inputData, initialState, requestContext } = schedule.target;
-        await this.#pubsub.publish(TOPIC_WORKFLOWS, {
-          type: 'workflow.start',
-          runId: claimId,
-          data: {
-            workflowId,
+        const { workflowId, inputData, initialState, requestContext, resourceId, definitionHash } = schedule.target;
+        // Claim/execute affinity (#19169). When this process also consumes
+        // workflow events, keep the fire local so the instance that proved
+        // the target ready and current is the one that runs it. A
+        // scheduler-only process has no local consumer, so it must publish
+        // to the shared topic — the `scheduleDefinitionHash` below is what
+        // protects that hop, letting a stale consumer refuse the fire
+        // instead of executing its own outdated graph.
+        const localOnly = this.#config.canExecuteLocally?.() === true;
+        await this.#pubsub.publish(
+          TOPIC_WORKFLOWS,
+          {
+            type: 'workflow.start',
             runId: claimId,
-            prevResult: { status: 'success', output: inputData ?? {} },
-            requestContext: requestContext ?? {},
-            initialState: initialState ?? {},
+            data: {
+              workflowId,
+              runId: claimId,
+              prevResult: { status: 'success', output: inputData ?? {} },
+              requestContext: requestContext ?? {},
+              initialState: initialState ?? {},
+              ...(resourceId ? { resourceId } : {}),
+              // Only stamped when the row carries a hash, so legacy and
+              // imperative schedules stay unfenced (fail open).
+              ...(definitionHash ? { scheduleDefinitionHash: definitionHash } : {}),
+              scheduleTrigger: {
+                scheduleId: schedule.id,
+                scheduledFireAt: schedule.nextFireAt,
+                triggerKind: 'schedule-fire',
+              } satisfies ScheduledWorkflowTrigger,
+            },
           },
-        });
+          localOnly ? { localOnly: true } : undefined,
+        );
         return;
       }
       case 'agent': {

@@ -1,13 +1,12 @@
 {
   "name": "@mastra/brightdata",
-  "version": "0.3.0",
+  "version": "0.3.2",
   "description": "Bright Data web search and web fetch tools for Mastra agents",
   "type": "module",
   "main": "./dist/index.js",
   "types": "./dist/index.d.ts",
   "files": [
-    "dist",
-    "CHANGELOG.md"
+    "dist"
   ],
   "exports": {
     ".": {
@@ -23,10 +22,10 @@
     "./package.json": "./package.json"
   },
   "scripts": {
-    "build:lib": "tsup --silent --config tsup.config.ts",
+    "build:lib": "tsdown --silent --config tsdown.config.ts",
     "build:watch": "pnpm build:lib --watch",
-    "lint": "oxlint . && eslint .",
-    "lint:fix": "oxlint --fix . && eslint --fix .",
+    "lint": "oxlint --type-aware .",
+    "lint:fix": "oxlint --type-aware --fix .",
     "test": "vitest run"
   },
   "keywords": [
@@ -58,7 +57,7 @@
     "@internal/lint": "workspace:*",
     "@internal/types-builder": "workspace:*",
     "@mastra/core": "workspace:*",
-    "tsup": "^8.5.1",
+    "tsdown": "0.23.1",
     "typescript": "catalog:",
     "vitest": "catalog:",
     "zod": "catalog:"

@@ -1,6 +1,6 @@
 ---
 title: "Reference: BrowserProvider | Editor"
-description: "Reference for BrowserProvider, the interface that registers a browser implementation with MastraEditor."
+description: "BrowserProvider is the interface a package implements to register a browser with MastraEditor."
 packages:
   - "@mastra/core"
 ---
@@ -55,7 +55,7 @@ new MastraEditor({
     name: 'createBrowser',
     type: '(config: TConfig) => MastraBrowser | Promise<MastraBrowser>',
     description:
-      'Create a runtime `MastraBrowser` instance from the stored config. Called once per agent hydration; the resulting instance is cached alongside the agent.',
+      'Create a runtime `MastraBrowser` instance from the stored config. For a static browser config, it is called once per agent hydration and the resulting instance is cached alongside the agent.',
   },
 ]}
 />
@@ -63,7 +63,8 @@ new MastraEditor({
 ## Implementing a provider
 
 ```typescript title="src/providers/my-browser.ts"
-import type { BrowserProvider, MastraBrowser } from '@mastra/core/editor'
+import type { BrowserProvider } from '@mastra/core/editor'
+import type { MastraBrowser } from '@mastra/core/browser'
 
 export const myBrowserProvider: BrowserProvider<{ apiKey: string }> = {
   id: 'my-browser',
@@ -83,7 +84,7 @@ export const myBrowserProvider: BrowserProvider<{ apiKey: string }> = {
 }
 ```
 
-Once registered, admins can pin the provider as a Builder default via [`BuilderAgentDefaults.browser`](/reference/editor/agent-builder/builder-agent-defaults):
+Once registered, admins can pin the provider as a Builder default via [`BuilderAgentDefaults.browser`](https://agent-builder.mastra.ai/reference/builder-agent-defaults):
 
 ```typescript
 new MastraEditor({
@@ -101,6 +102,6 @@ new MastraEditor({
 
 ## Related
 
-- [Browser](/docs/agent-builder/browser) — concept and worked examples.
-- [StorageBrowserRef](/reference/editor/storage-browser-ref) — stored configuration consumed by `createBrowser`.
-- [MastraEditor class](/reference/editor/mastra-editor) — provider registry.
+- [Browser](https://agent-builder.mastra.ai/browser): Concept and worked examples.
+- [StorageBrowserRef](/reference/editor/storage-browser-ref): Stored configuration consumed by `createBrowser`.
+- [MastraEditor class](/reference/editor/mastra-editor): Provider registry.

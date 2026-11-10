@@ -28,6 +28,7 @@ vi.mock('./fastembed.js', () => ({
   EmbeddingModel: {
     BGESmallENV15: 'fast-bge-small-en-v1.5',
     BGEBaseENV15: 'fast-bge-base-en-v1.5',
+    MLE5Large: 'fast-multilingual-e5-large',
   },
   FlagEmbedding: {
     init: mocks.init,
@@ -93,6 +94,19 @@ test('keeps separate cached models for small and base embeddings', async () => {
   });
 });
 
+test('caches the multilingual e5 model', async () => {
+  const { getCachedModel } = await import('./model-cache.js');
+
+  await getCachedModel('MLE5Large');
+  await getCachedModel('MLE5Large');
+
+  expect(mocks.init).toHaveBeenCalledTimes(1);
+  expect(mocks.init).toHaveBeenCalledWith({
+    model: 'fast-multilingual-e5-large',
+    cacheDir: expect.stringContaining('fastembed-models'),
+  });
+});
+
 test('warmup downloads models without initializing ONNX sessions', async () => {
   const { warmupFastEmbedModels } = await import('./model-cache.js');
 
@@ -100,4 +114,24 @@ test('warmup downloads models without initializing ONNX sessions', async () => {
 
   expect(mocks.retrieveModel).toHaveBeenCalledTimes(2);
   expect(mocks.init).not.toHaveBeenCalled();
+});
+
+test('resolves the cache directory from the current home on each load', async () => {
+  vi.stubEnv('HOME', '/tmp/fastembed-home-a');
+  mocks.init.mockRejectedValueOnce(new Error('Config file not found'));
+  const { getCachedModel } = await import('./model-cache.js');
+
+  try {
+    await expect(getCachedModel('BGESmallENV15')).rejects.toThrow('Config file not found');
+
+    vi.stubEnv('HOME', '/tmp/fastembed-home-b');
+    await getCachedModel('BGESmallENV15');
+
+    expect(mocks.init).toHaveBeenLastCalledWith({
+      model: 'fast-bge-small-en-v1.5',
+      cacheDir: expect.stringContaining('/tmp/fastembed-home-b/'),
+    });
+  } finally {
+    vi.unstubAllEnvs();
+  }
 });

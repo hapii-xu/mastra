@@ -3,16 +3,25 @@ import type { ObservabilityStorage, SpanRecord, TraceSpan } from '@mastra/core/s
 import { beforeAll, beforeEach, describe, expect, it } from 'vitest';
 import { createSpan, createChildSpan, createFeedbackRecord, SpanType, EntityType, DEFAULT_BASE_DATE } from './data';
 
-export function createObservabilityTests({ storage }: { storage: MastraStorage }) {
+export function createObservabilityTests({
+  storage,
+  capabilities = {},
+}: {
+  storage: MastraStorage;
+  capabilities?: { scopedTraceDeletion?: boolean };
+}) {
   // Skip tests if storage doesn't have observability domain
   const describeObservability = storage.stores?.observability ? describe : describe.skip;
 
-  // Adapters that only support the `insert-only` tracing strategy cannot
-  // satisfy updateSpan / batchUpdateSpans by contract — every span is
-  // persisted as a single immutable row. Skip those describe blocks so the
-  // rest of the suite still runs.
-  const isInsertOnly = storage.stores?.observability?.runtimeTracingStrategy === 'insert-only';
-  const describeUpdate = isInsertOnly ? describe.skip : describe;
+  // Adapters on the `insert-only` or `event-sourced` tracing strategies cannot
+  // satisfy updateSpan / batchUpdateSpans by contract — spans are persisted as
+  // immutable rows and a change is a new row, not an edit. Skip those describe
+  // blocks so the rest of the suite still runs.
+  const strategy = storage.stores?.observability?.runtimeTracingStrategy;
+  const describeUpdate = strategy === 'insert-only' || strategy === 'event-sourced' ? describe.skip : describe;
+  // batchUpdateUnendedSpans is optional; run its contract only for adapters that implement it.
+  const describeUnendedUpdate =
+    typeof storage.stores?.observability?.batchUpdateUnendedSpans === 'function' ? describeUpdate : describe.skip;
 
   let observabilityStorage: ObservabilityStorage;
 
@@ -527,6 +536,53 @@ export function createObservabilityTests({ storage }: { storage: MastraStorage }
       });
     });
 
+    // Issue #27479: a recovering process ends spans another process started, without
+    // reading them first. Only rows that exist and haven't ended may change.
+    describeUnendedUpdate('batchUpdateUnendedSpans', () => {
+      it('ends a running span and reports it as updated', async () => {
+        await observabilityStorage.batchCreateSpans({
+          records: [createSpan({ traceId: 'trace-1', spanId: 'span-1', endedAt: null })],
+        });
+        const endedAt = new Date(DEFAULT_BASE_DATE.getTime() + 5000);
+
+        const result = await observabilityStorage.batchUpdateUnendedSpans!({
+          records: [{ traceId: 'trace-1', spanId: 'span-1', updates: { endedAt, output: { status: 'interrupted' } } }],
+        });
+
+        expect(result.updated).toEqual([{ traceId: 'trace-1', spanId: 'span-1' }]);
+        const stored = await observabilityStorage.getSpan({ traceId: 'trace-1', spanId: 'span-1' });
+        expect(stored?.span.endedAt?.getTime()).toBe(endedAt.getTime());
+        expect(stored?.span.output).toEqual({ status: 'interrupted' });
+      });
+
+      it('leaves ended spans unchanged and skips spans that were never stored', async () => {
+        const originalEnd = new Date(DEFAULT_BASE_DATE.getTime() + 1000);
+        await observabilityStorage.batchCreateSpans({
+          records: [
+            createSpan({ traceId: 'trace-1', spanId: 'ended', endedAt: originalEnd, output: 'original' }),
+            createSpan({ traceId: 'trace-1', spanId: 'running', endedAt: null }),
+          ],
+        });
+        const endedAt = new Date(DEFAULT_BASE_DATE.getTime() + 5000);
+
+        const result = await observabilityStorage.batchUpdateUnendedSpans!({
+          records: [
+            { traceId: 'trace-1', spanId: 'ended', updates: { endedAt, output: 'second end' } },
+            { traceId: 'trace-1', spanId: 'missing', updates: { endedAt, output: 'second end' } },
+            { traceId: 'trace-1', spanId: 'running', updates: { endedAt, output: 'done' } },
+          ],
+        });
+
+        expect(result.updated).toEqual([{ traceId: 'trace-1', spanId: 'running' }]);
+        const ended = await observabilityStorage.getSpan({ traceId: 'trace-1', spanId: 'ended' });
+        expect(ended?.span.output).toBe('original');
+        expect(ended?.span.endedAt?.getTime()).toBe(originalEnd.getTime());
+        expect(await observabilityStorage.getSpan({ traceId: 'trace-1', spanId: 'missing' })).toBeNull();
+        const running = await observabilityStorage.getSpan({ traceId: 'trace-1', spanId: 'running' });
+        expect(running?.span.output).toBe('done');
+      });
+    });
+
     describe('batchDeleteTraces', () => {
       it('should delete traces and all their spans', async () => {
         await observabilityStorage.batchCreateSpans({
@@ -547,6 +603,19 @@ export function createObservabilityTests({ storage }: { storage: MastraStorage }
 
       it('should handle deleting non-existent traces gracefully', async () => {
         await expect(observabilityStorage.batchDeleteTraces({ traceIds: ['non-existent'] })).resolves.not.toThrow();
+      });
+
+      // Adapters without tenant columns must reject scoped deletes instead of
+      // silently performing an unscoped (cross-tenant-hazard) delete.
+      const itScoped = capabilities.scopedTraceDeletion ? it.skip : it;
+      itScoped('should reject tenant-scoped deletion when scope is not supported', async () => {
+        await expect(
+          observabilityStorage.batchDeleteTraces({ traceIds: ['trace-1'], organizationId: 'org-1' }),
+        ).rejects.toThrow(/tenant-scoped trace deletion/);
+
+        await expect(
+          observabilityStorage.batchDeleteTraces({ traceIds: ['trace-1'], resourceId: 'res-1' }),
+        ).rejects.toThrow(/tenant-scoped trace deletion/);
       });
     });
 

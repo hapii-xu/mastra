@@ -1,25 +1,25 @@
 ---
 title: "Reference: Memory.summarizeThread() | Memory"
-description: "Documentation for the `Memory.summarizeThread()` method in Mastra, which summarizes a thread's conversation in one shot and extracts structured values from it."
+description: "Call Memory.summarizeThread() to produce a thread summary in one operation and extract configured structured values from its messages."
 packages:
   - "@mastra/memory"
 ---
 
 # Memory.summarizeThread()
 
-The `.summarizeThread()` method summarizes a thread's conversation in one shot. It loads the thread's messages from storage and distills them with the same Observer plumbing that powers [Observational Memory](/reference/memory/observational-memory) — as a standalone call, without Observational Memory attached to an agent.
+The `.summarizeThread()` method summarizes a thread's conversation in one shot. It loads the thread's messages from storage and distills them with the same Observer plumbing that powers [Observational Memory](/reference/memory/observational-memory): as a standalone call, without Observational Memory attached to an agent.
 
 Messages load page-by-page starting from the newest, bounded by `lastMessages` and `maxInputTokens`, so summarizing a long thread doesn't read its entire history from storage.
 
-Nothing is written back to memory. The summary and extracted values are returned to you (and to each extractor's `onExtracted` hook), so you decide where they go — for example your own database.
+Nothing is written back to memory. The summary and extracted values are returned to you (and to each extractor's `onExtracted` hook), so you decide where they go: for example your own database.
 
-Use this when a session ends and you want a summary or structured extraction of the whole conversation, such as a voice call at hang-up. To summarize messages you already have in hand (without loading them from a thread), use the standalone [`summarizeConversation()`](/reference/memory/summarizeConversation) function instead — it takes the same options with `messages` in place of `threadId`.
+Use this when a session ends and you want a summary or structured extraction of the whole conversation, such as a voice call at hang-up. For messages you already have in hand (without loading them from a thread), use the standalone [`summarizeConversation()`](/reference/memory/summarizeConversation) function instead. It takes the same options with `messages` in place of `threadId`.
 
 ## Usage example
 
 ```typescript
 const result = await memory.summarizeThread({
-  model: '__GATEWAY_OPENAI_MODEL_MINI__',
+  model: '__GATEWAY_OPENAI_MODEL_LUNA__',
   threadId: 'thread-123',
   instructions: 'Summarize this voicemail call for the business owner.',
 })
@@ -38,7 +38,7 @@ const result = await memory.summarizeThread({
   {
     name: 'model',
     type: 'string | LanguageModel | DynamicModel',
-    description: "Model that runs the summarization, such as a router string like '__GATEWAY_OPENAI_MODEL_MINI__'.",
+    description: "Model that runs the summarization, such as a router string like '__GATEWAY_OPENAI_MODEL_LUNA__'.",
     isOptional: false,
   },
   {
@@ -146,7 +146,7 @@ const callSummary = new Extractor({
 
 export async function onCallEnd(threadId: string, resourceId: string) {
   await memory.summarizeThread({
-    model: '__GATEWAY_OPENAI_MODEL_MINI__',
+    model: '__GATEWAY_OPENAI_MODEL_LUNA__',
     threadId,
     resourceId,
     instructions: 'Summarize this voicemail call for the business owner.',

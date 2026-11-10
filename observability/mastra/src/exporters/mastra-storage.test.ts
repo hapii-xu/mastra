@@ -1,3 +1,4 @@
+import { Mastra } from '@mastra/core';
 import { ErrorCategory, ErrorDomain, MastraError } from '@mastra/core/error';
 import { SpanType, TracingEventType, EntityType } from '@mastra/core/observability';
 import type {
@@ -9,9 +10,12 @@ import type {
   LogEvent,
   ScoreEvent,
   FeedbackEvent,
+  ObservabilityDropEvent,
 } from '@mastra/core/observability';
-import { serializeSpanAttributes } from '@mastra/core/storage';
+import { InMemoryStore, serializeSpanAttributes } from '@mastra/core/storage';
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
+import { Observability } from '../default';
+import { BaseExporter } from './base';
 import { MastraStorageExporter } from './mastra-storage';
 
 // Mock Mastra and logger
@@ -230,7 +234,7 @@ describe('MastraStorageExporter', () => {
         );
       });
 
-      it('should log error if storage not available during init()', async () => {
+      it('should log a warning if storage is not available during init()', async () => {
         const mockMastraWithoutStorage = {
           getStorage: vi.fn().mockReturnValue(null),
         } as any;
@@ -242,6 +246,74 @@ describe('MastraStorageExporter', () => {
         expect(mockLogger.warn).toHaveBeenCalledWith(
           'MastraStorageExporter disabled: Storage not available. Traces will not be persisted.',
         );
+      });
+
+      it('should recover when observability storage becomes available after init', async () => {
+        mockObservabilityStore.observabilityStrategy = {
+          preferred: 'realtime',
+          supported: ['realtime', 'batch-with-updates', 'insert-only'],
+        };
+        mockStorage.getStore.mockResolvedValueOnce(undefined).mockResolvedValueOnce(mockObservabilityStore);
+
+        const exporter = new MastraStorageExporter({ logger: mockLogger });
+        await exporter.init({ mastra: mockMastra });
+
+        await exporter.exportTracingEvent(createMockEvent(TracingEventType.SPAN_STARTED));
+
+        expect(mockStorage.getStore).toHaveBeenCalledTimes(2);
+        expect(mockObservabilityStore.batchCreateSpans).toHaveBeenCalledOnce();
+        expect(mockLogger.info).toHaveBeenCalledWith(
+          'MastraStorageExporter recovered: Observability storage is available. Traces will be persisted.',
+        );
+      });
+
+      it('should recover after observability storage initialization throws', async () => {
+        mockObservabilityStore.observabilityStrategy = {
+          preferred: 'realtime',
+          supported: ['realtime', 'batch-with-updates', 'insert-only'],
+        };
+        mockStorage.getStore
+          .mockRejectedValueOnce(new Error('storage unavailable'))
+          .mockResolvedValueOnce(mockObservabilityStore);
+
+        const exporter = new MastraStorageExporter({ logger: mockLogger });
+        await expect(exporter.init({ mastra: mockMastra })).resolves.not.toThrow();
+
+        await exporter.exportTracingEvent(createMockEvent(TracingEventType.SPAN_STARTED));
+
+        expect(mockStorage.getStore).toHaveBeenCalledTimes(2);
+        expect(mockObservabilityStore.batchCreateSpans).toHaveBeenCalledOnce();
+        expect(mockLogger.warn).toHaveBeenCalledWith(
+          'MastraStorageExporter unavailable: Failed to initialize observability storage. Traces will not be persisted until storage becomes available.',
+          { error: 'storage unavailable' },
+        );
+      });
+
+      it('should share a concurrent storage recovery attempt', async () => {
+        mockObservabilityStore.observabilityStrategy = {
+          preferred: 'realtime',
+          supported: ['realtime', 'batch-with-updates', 'insert-only'],
+        };
+        let resolveStorage: (storage: typeof mockObservabilityStore) => void = () => {};
+        const recoveredStorage = new Promise<typeof mockObservabilityStore>(resolve => {
+          resolveStorage = resolve;
+        });
+        mockStorage.getStore.mockResolvedValueOnce(undefined).mockReturnValueOnce(recoveredStorage);
+
+        const exporter = new MastraStorageExporter({ logger: mockLogger });
+        await exporter.init({ mastra: mockMastra });
+
+        const firstExport = exporter.exportTracingEvent(
+          createMockEvent(TracingEventType.SPAN_STARTED, 'trace-1', 'span-1'),
+        );
+        const secondExport = exporter.exportTracingEvent(
+          createMockEvent(TracingEventType.SPAN_STARTED, 'trace-2', 'span-2'),
+        );
+        resolveStorage(mockObservabilityStore);
+        await Promise.all([firstExport, secondExport]);
+
+        expect(mockStorage.getStore).toHaveBeenCalledTimes(2);
+        expect(mockObservabilityStore.batchCreateSpans).toHaveBeenCalledTimes(2);
       });
     });
 
@@ -266,6 +338,40 @@ describe('MastraStorageExporter', () => {
             }),
           ]),
         });
+      });
+
+      it('should store bridged root spans without their external parent', async () => {
+        mockObservabilityStore.observabilityStrategy = {
+          preferred: 'realtime',
+          supported: ['realtime', 'batch-with-updates', 'insert-only'],
+        };
+        const exporter = new MastraStorageExporter({ strategy: 'realtime', logger: mockLogger });
+        await exporter.init({ mastra: mockMastra });
+
+        const rootEvent = createMockEvent(TracingEventType.SPAN_STARTED, 'trace-1', 'root-span');
+        rootEvent.exportedSpan.isRootSpan = true;
+        rootEvent.exportedSpan.externalParentSpanId = 'external-parent';
+
+        const resumedRootEvent = createMockEvent(TracingEventType.SPAN_STARTED, 'trace-1', 'resumed-root-span');
+        resumedRootEvent.exportedSpan.isRootSpan = true;
+        resumedRootEvent.exportedSpan.parentSpanId = 'suspended-span';
+
+        const childEvent = createMockEvent(TracingEventType.SPAN_STARTED, 'trace-1', 'child-span');
+        childEvent.exportedSpan.isRootSpan = false;
+        childEvent.exportedSpan.parentSpanId = 'root-span';
+
+        await exporter.exportTracingEvent(rootEvent);
+        await exporter.exportTracingEvent(resumedRootEvent);
+        await exporter.exportTracingEvent(childEvent);
+
+        const records = mockObservabilityStore.batchCreateSpans.mock.calls.flatMap((call: any) => call[0].records);
+        expect(records).toEqual(
+          expect.arrayContaining([
+            expect.objectContaining({ spanId: 'root-span', parentSpanId: null }),
+            expect.objectContaining({ spanId: 'resumed-root-span', parentSpanId: 'suspended-span' }),
+            expect.objectContaining({ spanId: 'child-span', parentSpanId: 'root-span' }),
+          ]),
+        );
       });
     });
 
@@ -806,6 +912,70 @@ describe('MastraStorageExporter', () => {
 
         await exporter.shutdown();
       });
+
+      it('should wait for a timer-started write that is still in flight', async () => {
+        const exporter = new MastraStorageExporter({
+          strategy: 'batch-with-updates',
+          maxBatchSize: 10,
+          logger: mockLogger,
+        });
+        await exporter.init({ mastra: mockMastra });
+
+        let releaseWrite!: () => void;
+        mockObservabilityStore.batchCreateSpans.mockReturnValueOnce(
+          new Promise<void>(resolve => {
+            releaseWrite = resolve;
+          }),
+        );
+
+        await exporter.exportTracingEvent(createMockEvent(TracingEventType.SPAN_STARTED));
+        // Fire the batch timer: the write takes the batch out of the buffer and is now in flight
+        expect(timers).toHaveLength(1);
+        timers[0].fn();
+        expect(mockObservabilityStore.batchCreateSpans).toHaveBeenCalledTimes(1);
+
+        let flushed = false;
+        const flushing = exporter.flush().then(() => {
+          flushed = true;
+        });
+        await new Promise(resolve => setImmediate(resolve));
+        expect(flushed).toBe(false);
+
+        releaseWrite();
+        await flushing;
+        expect(mockObservabilityStore.batchCreateSpans).toHaveBeenCalledTimes(1);
+      });
+
+      it('should write span updates deferred behind an in-flight create', async () => {
+        const exporter = new MastraStorageExporter({
+          strategy: 'batch-with-updates',
+          maxBatchSize: 10,
+          logger: mockLogger,
+        });
+        await exporter.init({ mastra: mockMastra });
+
+        let releaseWrite!: () => void;
+        mockObservabilityStore.batchCreateSpans.mockReturnValueOnce(
+          new Promise<void>(resolve => {
+            releaseWrite = resolve;
+          }),
+        );
+
+        await exporter.exportTracingEvent(createMockEvent(TracingEventType.SPAN_STARTED));
+        timers[0].fn();
+        // The span ends while its create is still being written
+        await exporter.exportTracingEvent(createMockEvent(TracingEventType.SPAN_ENDED));
+
+        const flushing = exporter.flush();
+        await new Promise(resolve => setImmediate(resolve));
+        releaseWrite();
+        await flushing;
+
+        expect(mockObservabilityStore.batchUpdateSpans).toHaveBeenCalledTimes(1);
+        expect(mockObservabilityStore.batchUpdateSpans).toHaveBeenCalledWith({
+          records: [expect.objectContaining({ traceId: 'trace-1', spanId: 'span-1' })],
+        });
+      });
     });
 
     describe('Shutdown', () => {
@@ -823,6 +993,71 @@ describe('MastraStorageExporter', () => {
         await exporter.shutdown();
 
         expect(mockObservabilityStore.batchCreateSpans).toHaveBeenCalled();
+      });
+
+      it('shutdown should wait for a timer-started write that is still in flight', async () => {
+        const exporter = new MastraStorageExporter({
+          strategy: 'batch-with-updates',
+          maxBatchSize: 10,
+          logger: mockLogger,
+        });
+        await exporter.init({ mastra: mockMastra });
+
+        let releaseWrite!: () => void;
+        mockObservabilityStore.batchCreateSpans.mockReturnValueOnce(
+          new Promise<void>(resolve => {
+            releaseWrite = resolve;
+          }),
+        );
+
+        await exporter.exportTracingEvent(createMockEvent(TracingEventType.SPAN_STARTED));
+        timers[0].fn();
+
+        let done = false;
+        const shuttingDown = exporter.shutdown().then(() => {
+          done = true;
+        });
+        await new Promise(resolve => setImmediate(resolve));
+        expect(done).toBe(false);
+
+        releaseWrite();
+        await shuttingDown;
+        expect(mockObservabilityStore.batchCreateSpans).toHaveBeenCalledTimes(1);
+      });
+
+      it('should join the writes still running when it stops after a few rounds', async () => {
+        const exporter = new MastraStorageExporter({ strategy: 'realtime', logger: mockLogger });
+        await exporter.init({ mastra: mockMastra });
+
+        // Like a server under non-stop traffic: a new event (and, in realtime mode, its write)
+        // arrives before the current write finishes, so a write is always in flight. Writes 1-3
+        // each start the next one; write 4 starts during round 3 and is the last, so flush()
+        // hits the cap with a write still running.
+        let writesInFlight = 0;
+        let writesStarted = 0;
+        mockObservabilityStore.batchCreateSpans.mockImplementation(
+          () =>
+            new Promise<void>(resolve => {
+              writesInFlight++;
+              const startNext = ++writesStarted <= 3;
+              setImmediate(() => {
+                if (startNext) void exporter.exportTracingEvent(createMockEvent(TracingEventType.SPAN_STARTED));
+                setImmediate(() => {
+                  writesInFlight--;
+                  resolve();
+                });
+              });
+            }),
+        );
+        void exporter.exportTracingEvent(createMockEvent(TracingEventType.SPAN_STARTED));
+        await new Promise(resolve => setImmediate(resolve));
+
+        await exporter.flush();
+
+        expect(mockLogger.warn).toHaveBeenCalledWith(expect.stringContaining('rounds'), expect.anything());
+        expect(writesInFlight).toBe(0);
+        expect(mockObservabilityStore.batchCreateSpans).toHaveBeenCalledTimes(4);
+        mockObservabilityStore.batchCreateSpans.mockImplementation(async () => {});
       });
     });
 
@@ -1557,6 +1792,270 @@ describe('MastraStorageExporter', () => {
           message: 'test log',
         },
       };
+    }
+  });
+});
+
+/** Collects the exporter pipeline's drop events, like a user's monitoring exporter would. */
+class DropRecorder extends BaseExporter {
+  name = 'drop-recorder';
+  drops: ObservabilityDropEvent[] = [];
+
+  protected async _exportTracingEvent(): Promise<void> {}
+
+  onDroppedEvent(event: ObservabilityDropEvent): void {
+    this.drops.push(event);
+  }
+}
+
+// Issue #27479: under update-based strategies, a span started by one exporter instance
+// couldn't be ended by another. Durable-agent crash recovery hits this: the recovering
+// process rebuilds the crashed run's spans and ends them as interrupted, but its exporter
+// never saw SPAN_STARTED, so it deferred the end until retries ran out and dropped it.
+describe.each(['batch-with-updates', 'realtime'] as const)(
+  'MastraStorageExporter spans from another process (%s)',
+  strategy => {
+    function openProcess(storage: InMemoryStore, maxRetries = 0) {
+      const dropRecorder = new DropRecorder();
+      const observability = new Observability({
+        configs: {
+          default: {
+            serviceName: 'span-recovery',
+            exporters: [new MastraStorageExporter({ strategy, maxRetries, maxBatchWaitMs: 60_000 }), dropRecorder],
+          },
+        },
+      });
+      const mastra = new Mastra({ storage, observability, logger: false });
+      return { mastra, tracing: observability.getDefaultInstance()!, drops: dropRecorder.drops };
+    }
+
+    async function getStoredSpan(storage: InMemoryStore, span: { traceId: string; id: string }) {
+      const observabilityStore = await storage.getStore('observability');
+      const stored = await observabilityStore?.getSpan({ traceId: span.traceId, spanId: span.id });
+      return stored?.span ?? null;
+    }
+
+    it('ends a span that a crashed process started and flushed', async () => {
+      const storage = new InMemoryStore();
+      const crashed = openProcess(storage);
+      const recovering = openProcess(storage);
+      try {
+        const span = crashed.tracing.startSpan({ type: SpanType.AGENT_RUN, name: 'agent run before crash' });
+        const snapshot = structuredClone(span.exportSpan());
+        await crashed.tracing.flush();
+        expect((await getStoredSpan(storage, span))?.endedAt).toBeNull();
+
+        const rebuilt = recovering.tracing.rebuildSpan(snapshot);
+        rebuilt.update({ attributes: { recovered: true } });
+        rebuilt.end({ output: { status: 'interrupted', reason: 'run recovered after its process stopped' } });
+        await recovering.tracing.flush();
+
+        const stored = await getStoredSpan(storage, span);
+        expect(stored?.endedAt).toBeInstanceOf(Date);
+        expect(stored?.output).toEqual({ status: 'interrupted', reason: 'run recovered after its process stopped' });
+        expect(stored?.attributes).toMatchObject({ recovered: true });
+        expect(recovering.drops).toEqual([]);
+      } finally {
+        await recovering.mastra.shutdown();
+        await crashed.mastra.shutdown();
+      }
+    });
+
+    it('leaves an ended span unchanged and reports the second end as dropped', async () => {
+      const storage = new InMemoryStore();
+      const first = openProcess(storage);
+      const second = openProcess(storage);
+      try {
+        const span = first.tracing.startSpan({ type: SpanType.GENERIC, name: 'finished operation' });
+        const snapshot = structuredClone(span.exportSpan());
+        span.end({ output: 'original result' });
+        await first.tracing.flush();
+        const endedAt = (await getStoredSpan(storage, span))?.endedAt;
+        expect(endedAt).toBeInstanceOf(Date);
+
+        // Ending an ended span is caller error: the stored span must not change.
+        second.tracing.rebuildSpan(snapshot).end({ output: 'second result' });
+        await second.tracing.flush();
+
+        const stored = await getStoredSpan(storage, span);
+        expect(stored?.output).toBe('original result');
+        expect(stored?.endedAt).toEqual(endedAt);
+        expect(second.drops).toEqual([
+          expect.objectContaining({ signal: 'tracing', reason: 'span-not-updatable', count: 1 }),
+        ]);
+      } finally {
+        await second.mastra.shutdown();
+        await first.mastra.shutdown();
+      }
+    });
+
+    it('reports the second of two ends for one span in the same flush as dropped', async () => {
+      const storage = new InMemoryStore();
+      const crashed = openProcess(storage);
+      const recovering = openProcess(storage);
+      try {
+        const span = crashed.tracing.startSpan({ type: SpanType.AGENT_RUN, name: 'agent run before crash' });
+        const snapshot = structuredClone(span.exportSpan());
+        await crashed.tracing.flush();
+
+        recovering.tracing.rebuildSpan(snapshot).end({ output: 'first end' });
+        recovering.tracing.rebuildSpan(snapshot).end({ output: 'second end' });
+        await recovering.tracing.flush();
+
+        expect((await getStoredSpan(storage, span))?.output).toBe('first end');
+        expect(recovering.drops).toEqual([
+          expect.objectContaining({ signal: 'tracing', reason: 'span-not-updatable', count: 1 }),
+        ]);
+      } finally {
+        await recovering.mastra.shutdown();
+        await crashed.mastra.shutdown();
+      }
+    });
+
+    it('does not create a span that was never stored', async () => {
+      const storage = new InMemoryStore();
+      const recovering = openProcess(storage);
+      try {
+        // Known limit: the original process crashed before its create was flushed, so there's
+        // no row to end. Build the snapshot from a span whose create never reached this store.
+        const unstored = openProcess(new InMemoryStore());
+        const source = unstored.tracing.startSpan({ type: SpanType.GENERIC, name: 'never flushed' });
+        const snapshot = structuredClone(source.exportSpan());
+        await unstored.mastra.shutdown();
+
+        recovering.tracing.rebuildSpan(snapshot).end({ output: { status: 'interrupted' } });
+        await recovering.tracing.flush();
+
+        expect(await getStoredSpan(storage, source)).toBeNull();
+        expect(recovering.drops).toEqual([
+          expect.objectContaining({ signal: 'tracing', reason: 'span-not-updatable', count: 1 }),
+        ]);
+      } finally {
+        await recovering.mastra.shutdown();
+      }
+    });
+
+    it('holds back an end until its own create is stored', async () => {
+      const storage = new InMemoryStore();
+      const { mastra, tracing, drops } = openProcess(storage, 3);
+      const observabilityStore = (await storage.getStore('observability'))!;
+      const createSpans = observabilityStore.batchCreateSpans.bind(observabilityStore);
+      let releaseCreate!: () => void;
+      const createGate = new Promise<void>(resolve => {
+        releaseCreate = resolve;
+      });
+      let createStarted!: () => void;
+      const createInFlight = new Promise<void>(resolve => {
+        createStarted = resolve;
+      });
+      const slowCreate = vi.spyOn(observabilityStore, 'batchCreateSpans').mockImplementation(async args => {
+        createStarted();
+        await createGate;
+        await createSpans(args);
+      });
+      try {
+        const span = tracing.startSpan({ type: SpanType.GENERIC, name: 'slow create' });
+        if (strategy === 'batch-with-updates') void tracing.flush();
+        await createInFlight;
+
+        // The end is flushed while the create is still being written.
+        span.end({ output: 'done' });
+        void tracing.flush();
+        await new Promise(resolve => setImmediate(resolve));
+        releaseCreate();
+        await tracing.flush();
+        await tracing.flush();
+
+        const stored = await getStoredSpan(storage, span);
+        expect(stored?.endedAt).toBeInstanceOf(Date);
+        expect(stored?.output).toBe('done');
+        expect(drops).toEqual([]);
+      } finally {
+        slowCreate.mockRestore();
+        await mastra.shutdown();
+      }
+    });
+
+    it('keeps ending its own spans when the store has no conditional update', async () => {
+      const storage = new InMemoryStore();
+      const observabilityStore = (await storage.getStore('observability'))!;
+      // Simulates an older store version that predates batchUpdateUnendedSpans.
+      Object.defineProperty(observabilityStore, 'batchUpdateUnendedSpans', { value: undefined });
+      const { mastra, tracing, drops } = openProcess(storage);
+      try {
+        const span = tracing.startSpan({ type: SpanType.GENERIC, name: 'older store' });
+        span.end({ output: 'done' });
+        await tracing.flush();
+
+        const stored = await getStoredSpan(storage, span);
+        expect(stored?.endedAt).toBeInstanceOf(Date);
+        expect(stored?.output).toBe('done');
+        expect(drops).toEqual([]);
+      } finally {
+        await mastra.shutdown();
+      }
+    });
+  },
+);
+
+describe('MastraStorageExporter service name', () => {
+  it('stores the configured service name on spans whose metadata does not set one', async () => {
+    const storage = new InMemoryStore();
+    const observability = new Observability({
+      configs: { default: { serviceName: 'checkout-api', exporters: [new MastraStorageExporter()] } },
+    });
+    const mastra = new Mastra({ storage, observability, logger: false });
+    try {
+      const tracing = observability.getDefaultInstance()!;
+      const checkout = tracing.startSpan({ type: SpanType.AGENT_RUN, name: 'checkout agent' });
+      checkout.createChildSpan({ type: SpanType.GENERIC, name: 'charge card' }).end();
+      checkout.end();
+      const refund = tracing.startSpan({
+        type: SpanType.AGENT_RUN,
+        name: 'refund agent',
+        metadata: { serviceName: 'refunds-api' },
+      });
+      refund.end();
+      await tracing.flush();
+
+      const store = (await storage.getStore('observability'))!;
+      const checkoutTrace = await store.getTrace({ traceId: checkout.traceId });
+      expect(checkoutTrace?.spans.map(span => span.serviceName)).toEqual(['checkout-api', 'checkout-api']);
+      const refundTrace = await store.getTrace({ traceId: refund.traceId });
+      expect(refundTrace?.spans.map(span => span.serviceName)).toEqual(['refunds-api']);
+      const filtered = await store.listTraces({ filters: { serviceName: 'checkout-api' } });
+      expect(filtered.spans.map(span => span.traceId)).toEqual([checkout.traceId]);
+    } finally {
+      await mastra.shutdown();
+    }
+  });
+
+  it('stores a service name set on update or end when the row is written at span end', async () => {
+    const storage = new InMemoryStore();
+    const observability = new Observability({
+      configs: {
+        default: { serviceName: 'checkout-api', exporters: [new MastraStorageExporter({ strategy: 'insert-only' })] },
+      },
+    });
+    const mastra = new Mastra({ storage, observability, logger: false });
+    try {
+      const tracing = observability.getDefaultInstance()!;
+      const updated = tracing.startSpan({ type: SpanType.AGENT_RUN, name: 'updated agent' });
+      updated.update({ metadata: { serviceName: 'billing-api' } });
+      updated.end();
+      const ended = tracing.startSpan({ type: SpanType.AGENT_RUN, name: 'ended agent' });
+      ended.end({ metadata: { serviceName: 'refunds-api' } });
+      await tracing.flush();
+
+      const store = (await storage.getStore('observability'))!;
+      expect((await store.getTrace({ traceId: updated.traceId }))?.spans.map(span => span.serviceName)).toEqual([
+        'billing-api',
+      ]);
+      expect((await store.getTrace({ traceId: ended.traceId }))?.spans.map(span => span.serviceName)).toEqual([
+        'refunds-api',
+      ]);
+    } finally {
+      await mastra.shutdown();
     }
   });
 });

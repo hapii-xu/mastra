@@ -1,7 +1,7 @@
 import { MastraError } from '../../../error/index.js';
 import { parseModelRouterId } from '../gateway-resolver.js';
 import type { GatewayAuthRequest, GatewayAuthResult, MastraModelGatewayInterface, ProviderConfig } from './base.js';
-import { findGatewayForModel, getGatewayId, shouldEnableGateway } from './gateway-helpers.js';
+import { findGatewayForModel, getGatewayId, hasAuthCredentials, shouldEnableGateway } from './gateway-helpers.js';
 
 /**
  * MastraError IDs that represent expected "auth not available" states —
@@ -50,6 +50,8 @@ export interface GatewayModel {
   provider: string;
   /** Model name without provider prefix */
   modelName: string;
+  /** ISO release date, when supplied by the model catalog. */
+  releaseDate?: string;
   /** Whether the provider has valid authentication */
   hasApiKey: boolean;
   /** Environment variable for the provider's API key */
@@ -155,7 +157,7 @@ export class GatewayManager {
         }
       : rawGatewayAuth;
 
-    if (gatewayAuth?.apiKey || gatewayAuth?.headers || gatewayAuth?.bearerToken) {
+    if (hasAuthCredentials(gatewayAuth)) {
       return {
         ...gatewayAuth,
         source: gatewayAuth.source ?? 'gateway',
@@ -178,7 +180,7 @@ export class GatewayManager {
   async hasAuth(routerId: string): Promise<boolean> {
     try {
       const auth = await this.resolveAuth(routerId);
-      return Boolean(auth.apiKey || auth.bearerToken || auth.headers);
+      return hasAuthCredentials(auth);
     } catch (error) {
       if (isExpectedMissingAuthError(error)) {
         return false;
@@ -235,6 +237,7 @@ export class GatewayManager {
           id: `${provider}/${modelName}`,
           provider,
           modelName,
+          releaseDate: providerConfig.modelReleaseDates?.[modelName],
           hasApiKey,
           apiKeyEnvVar: apiKeyEnvVar || undefined,
         });

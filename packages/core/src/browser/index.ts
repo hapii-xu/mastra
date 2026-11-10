@@ -2,19 +2,28 @@
 // MastraBrowser Base Class
 // ============================================================================
 
-export { MastraBrowser } from './browser';
+export {
+  MastraBrowser,
+  BrowserProfileInUseError,
+  DEFAULT_BROWSER_VIEWPORT,
+  resolveViewportSize,
+  resolveLaunchViewport,
+} from './browser';
 export type {
   BrowserStatus,
   BrowserLifecycleHook,
   BrowserConfig,
   BrowserConfigBase,
   CdpUrlProvider,
+  BrowserViewport,
+  BrowserViewportSize,
   ScreencastOptions,
   ScreencastStream,
   ScreencastFrameData,
   ScreencastEvents,
   MouseEventParams,
   KeyboardEventParams,
+  BrowserCookie,
 } from './browser';
 
 // ============================================================================

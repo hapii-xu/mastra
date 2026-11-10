@@ -1,32 +1,58 @@
 # create-factory
 
-Scaffolding CLI for the **Mastra Factory** — an open-source, agent-powered software delivery environment built on [Mastra](https://mastra.ai).
+Mastra Factory is an open source environment for building software with coding agents. Connect your repository to turn issues into plans, implementations, and reviewed pull requests.
+
+`create-factory` is the recommended way to scaffold your Mastra Factory. By default,
+
+## Installation
+
+> [!IMPORTANT]
+> Make sure that you have Node.js 22.13.0 or later installed on your system.
+
+Run the latest version directly with your package manager.
+
+Using npm:
 
 ```bash
-npm create factory
+npx create-factory@latest
 ```
 
-The CLI is intentionally minimal: it asks for a project name, clones the [softwarefactory-template](https://github.com/mastra-ai/softwarefactory-template), installs dependencies, and initializes git. That's it — run `npm run dev` and finish setup (model providers, integrations, database) from the web UI on first load.
+Using Yarn:
 
-## Flags
-
-```text
-Usage: create-factory [options] [project-name]
-
-Create a new Mastra Factory project
-
-Arguments:
-  project-name                Directory name of the project
-
-Options:
-  --template <template-name>  Create a project from a template (public GitHub URL) (default: "https://github.com/mastra-ai/softwarefactory-template")
-  --no-platform               Skip Mastra platform sign-in, project, and Neon provisioning
-  --org <org>                 Mastra organization id or name — skips the interactive org picker
-  --region <region>           Platform project region (eu or us); prompts when omitted
-  -v, --version               output the version number
-  -h, --help                  display help for command
+```bash
+yarn dlx create-factory@latest
 ```
 
-## License
+Using pnpm:
 
-Apache-2.0
+```bash
+pnpm create factory@latest
+```
+
+## Usage
+
+The interactive setup asks where to create the project and helps configure your Mastra Factory project.
+
+By default, the setup wizard scaffolds the [platform template](https://github.com/mastra-ai/template-factory) and provisions Mastra platform resources during setup, enabling you to fully run Mastra Factory on platform or locally with cloud-backed capabilities. If you prefer to [self-host](https://factory.mastra.ai/deployment#self-host) Mastra Factory, run the setup with the `--no-platform` flag. It scaffolds the [self-hosted template](https://github.com/mastra-ai/template-factory-self-hosted) instead, which uses PostgreSQL, WorkOS, a GitHub App, and local sandboxes. Either way, the setup writes a freshly generated `FACTORY_CREDENTIAL_ENCRYPTION_KEY` to `.env` when the template uses one, so stored credentials are encrypted from the first start.
+
+```bash
+npx create-factory@latest -- --no-platform
+```
+
+Pass `--help` to see all options:
+
+```bash
+npx create-factory@latest --help
+```
+
+## Documentation
+
+- [create-factory CLI reference](https://factory.mastra.ai/reference/create-factory)
+
+## Changelog
+
+See the [package changelog](https://github.com/mastra-ai/mastra/blob/main/mastracode/mastra-factory/CHANGELOG.md) for version history and release notes.
+
+## Support
+
+We have an [open community Discord](https://discord.gg/mastra-ai). Come and say hello and let us know if you have any questions or need any help getting things running.

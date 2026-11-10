@@ -1,6 +1,8 @@
-import { describe, expect, it } from 'vitest';
+import type { TUI } from '@earendil-works/pi-tui';
+import stripAnsi from 'strip-ansi';
+import { describe, expect, it, vi } from 'vitest';
 import type { ModelItem } from '../model-selector.js';
-import { makeCustomModelItem } from '../model-selector.js';
+import { makeCustomModelItem, ModelSelectorComponent } from '../model-selector.js';
 
 const models: ModelItem[] = [
   {
@@ -62,5 +64,90 @@ describe('makeCustomModelItem', () => {
       hasApiKey: false,
       apiKeyEnvVar: undefined,
     });
+  });
+
+  it('selects an unmatched bare model id', () => {
+    const onSelect = vi.fn();
+    const selector = new ModelSelectorComponent({
+      tui: { requestRender: vi.fn() } as unknown as TUI,
+      models,
+      onSelect,
+      onCancel: vi.fn(),
+    });
+
+    for (const character of 'unmatched-bare-id') selector.handleInput(character);
+
+    expect(
+      selector
+        .render(100)
+        .map(line => stripAnsi(line))
+        .join('\n'),
+    ).toContain('Use: unmatched-bare-id');
+    selector.handleInput('\r');
+    expect(onSelect).toHaveBeenCalledWith(expect.objectContaining({ id: 'unmatched-bare-id' }));
+  });
+});
+
+describe('MastraCode gateway catalog models', () => {
+  const customProviderModels: ModelItem[] = ['gemma-4-31b', 'gemma-4-9b'].map(modelName => ({
+    id: `mastracode/acme-local/${modelName}`,
+    provider: 'mastracode/acme-local',
+    modelName,
+    hasApiKey: true,
+  }));
+
+  function createSelector(catalog: ModelItem[]) {
+    const onSelect = vi.fn();
+    const selector = new ModelSelectorComponent({
+      tui: { requestRender: vi.fn() } as unknown as TUI,
+      models: catalog,
+      onSelect,
+      onCancel: vi.fn(),
+    });
+    const screen = () =>
+      selector
+        .render(100)
+        .map(line => stripAnsi(line))
+        .join('\n');
+    return { selector, onSelect, screen };
+  }
+
+  it('lists and selects a typed custom provider model under its canonical id', () => {
+    const { selector, onSelect, screen } = createSelector([...models, ...customProviderModels]);
+
+    for (const character of 'acme-local/gemma-4-31b') selector.handleInput(character);
+
+    expect(screen()).not.toContain('Use: acme-local/gemma-4-31b');
+    expect(screen()).not.toContain('mastracode/');
+    expect(screen()).toContain('→ acme-local/gemma-4-31b');
+    selector.handleInput('\r');
+    expect(onSelect).toHaveBeenCalledWith(
+      expect.objectContaining({ id: 'acme-local/gemma-4-31b', provider: 'acme-local' }),
+    );
+  });
+
+  it('keeps the authenticated entry when a canonical id is listed twice', () => {
+    const { selector, onSelect } = createSelector([
+      { id: 'ollama/llama-4', provider: 'ollama', modelName: 'llama-4', hasApiKey: false },
+      { id: 'mastracode/ollama/llama-4', provider: 'mastracode/ollama', modelName: 'llama-4', hasApiKey: true },
+    ]);
+
+    for (const character of 'ollama/llama-4') selector.handleInput(character);
+    selector.handleInput('\r');
+
+    expect(onSelect).toHaveBeenCalledTimes(1);
+    expect(onSelect).toHaveBeenCalledWith(
+      expect.objectContaining({ id: 'ollama/llama-4', provider: 'ollama', hasApiKey: true }),
+    );
+  });
+
+  it('saves a typed id that matches no catalog row exactly as typed', () => {
+    const { selector, onSelect, screen } = createSelector([...models, ...customProviderModels]);
+
+    for (const character of 'acme-local/gemma-5') selector.handleInput(character);
+
+    expect(screen()).toContain('Use: acme-local/gemma-5');
+    selector.handleInput('\r');
+    expect(onSelect).toHaveBeenCalledWith(expect.objectContaining({ id: 'acme-local/gemma-5' }));
   });
 });

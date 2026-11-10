@@ -1,8 +1,7 @@
 ---
 title: "Reference: Answer relevancy scorer | Evals"
-description: Documentation for the Answer Relevancy Scorer in Mastra, which evaluates how well LLM outputs address the input query.
+description: "Use createAnswerRelevancyScorer() to evaluate how directly an LLM response addresses the input query, with configurable model and scoring options."
 packages:
-  - "@mastra/core"
   - "@mastra/evals"
 ---
 
@@ -16,23 +15,37 @@ The `createAnswerRelevancyScorer()` function accepts a single options object wit
   content={[
   {
     name: 'model',
-    type: 'LanguageModel',
+    type: 'MastraModelConfig',
     required: true,
     description: 'Configuration for the model used to evaluate relevancy.',
   },
   {
-    name: 'uncertaintyWeight',
-    type: 'number',
+    name: 'options',
+    type: "Record<'uncertaintyWeight' | 'scale', number>",
     required: false,
-    defaultValue: '0.3',
-    description: "Weight given to 'unsure' verdicts in scoring (0-1).",
-  },
-  {
-    name: 'scale',
-    type: 'number',
-    required: false,
-    defaultValue: '1',
-    description: 'Maximum score value.',
+    defaultValue: '{ uncertaintyWeight: 0.3, scale: 1 }',
+    description: 'Configuration options for the scorer.',
+    properties: [
+      {
+        type: "Record<'uncertaintyWeight' | 'scale', number>",
+        parameters: [
+          {
+            name: 'uncertaintyWeight',
+            type: 'number',
+            required: false,
+            defaultValue: '0.3',
+            description: "Weight given to 'unsure' verdicts in scoring (0-1).",
+          },
+          {
+            name: 'scale',
+            type: 'number',
+            required: false,
+            defaultValue: '1',
+            description: 'Maximum score value.',
+          },
+        ],
+      },
+    ],
   },
 ]}
 />
@@ -93,7 +106,7 @@ The scorer evaluates relevancy through query-answer alignment, considering compl
 ### Scoring Process
 
 1. **Statement Preprocess:**
-   - Breaks output into meaningful statements while preserving context.
+   - Breaks output into useful statements while preserving context.
 1. **Relevance Analysis:**
    - Each statement is evaluated as:
      - "yes": Full weight for direct matches
@@ -104,12 +117,12 @@ The scorer evaluates relevancy through query-answer alignment, considering compl
 
 ### Score Interpretation
 
-A relevancy score between 0 and 1:
+A relevancy score between 0 and `scale` (0 to 1 with the default scale). The ranges below assume the default scale:
 
 - **1.0**: The response fully answers the query with relevant and focused information.
-- **0.7–0.9**: The response mostly answers the query but may include minor unrelated content.
-- **0.4–0.6**: The response partially answers the query, mixing relevant and unrelated information.
-- **0.1–0.3**: The response includes minimal relevant content and largely misses the intent of the query.
+- **0.7 to 0.9**: The response mostly answers the query but may include minor unrelated content.
+- **0.4 to 0.6**: The response partially answers the query, mixing relevant and unrelated information.
+- **0.1 to 0.3**: The response includes minimal relevant content and largely misses the intent of the query.
 - **0.0**: The response is entirely unrelated and doesn't answer the query.
 
 ## Example

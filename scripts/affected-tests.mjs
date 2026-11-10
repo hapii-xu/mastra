@@ -16,13 +16,17 @@
  */
 
 import { execSync } from 'node:child_process';
-import { existsSync, readFileSync, readdirSync } from 'node:fs';
-import { resolve, relative, dirname, join } from 'node:path';
+import { existsSync } from 'node:fs';
+import { createRequire } from 'node:module';
+import { resolve, relative, dirname, join, sep } from 'node:path';
 import { fileURLToPath } from 'node:url';
-import ts from 'typescript';
+import ts from 'typescript-classic';
+import { cacheMadgeSpecifiers, openExtractionCache } from './affected-tests-cache.mjs';
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 const ROOT = resolve(__dirname, '..');
+const require = createRequire(import.meta.url);
+const { buildWorkspaceSourceAliases } = require('./workspace-source-aliases.cjs');
 
 // ---------------------------------------------------------------------------
 // CLI argument parsing
@@ -264,6 +268,14 @@ const webpackConfigPath = resolve(__dirname, 'madge.webpack.config.cjs');
 // madge is CJS — default import
 const madge = (await import('madge')).default;
 
+// Per-file extraction cache. What madge parses out of a file (its import
+// specifiers) and what parseFile() extracts (exported names, symbol edges)
+// depend only on the file's text and extension, so they are cached by content
+// hash. Specifier resolution still runs live every time: it depends on the
+// file set, package.json files and the alias table, not on one file's text.
+const extractionCache = openExtractionCache(process.env.AFFECTED_TESTS_CACHE);
+cacheMadgeSpecifiers(extractionCache);
+
 const testAbsolutePaths = testFiles.map(f => resolve(ROOT, f));
 
 const res = await madge(testAbsolutePaths, {
@@ -330,19 +342,6 @@ for (const [node, deps] of Object.entries(graph)) {
 
 const ALL = '*';
 const EXTENSIONS = ['.ts', '.tsx', '.js', '.jsx', '.mjs', '.cjs'];
-const SKIP_DIRS = new Set([
-  'node_modules',
-  'dist',
-  'build',
-  '.pnpm',
-  '.turbo',
-  '.git',
-  '.next',
-  '.mastra',
-  '.claude',
-  '.mastracode',
-  '.agents',
-]);
 
 function toRel(root, path) {
   return path.replace(`${root}/`, '').replaceAll('\\', '/');
@@ -350,47 +349,6 @@ function toRel(root, path) {
 
 function normalizeRel(path) {
   return path.replaceAll('\\', '/').replace(/^\.\//, '');
-}
-
-function findPackageJsonFiles(dir) {
-  const results = [];
-  let entries;
-  try {
-    entries = readdirSync(dir, { withFileTypes: true });
-  } catch {
-    return results;
-  }
-
-  for (const entry of entries) {
-    if (entry.isFile() && entry.name === 'package.json') {
-      results.push(join(dir, entry.name));
-      continue;
-    }
-    if (!entry.isDirectory()) continue;
-    if (SKIP_DIRS.has(entry.name)) continue;
-    if (entry.name === '__fixtures__' || entry.name === 'fixtures' || entry.name === 'test-fixtures') continue;
-    results.push(...findPackageJsonFiles(join(dir, entry.name)));
-  }
-
-  return results;
-}
-
-function buildAliasMap(root) {
-  const alias = new Map();
-  for (const pkgJsonPath of findPackageJsonFiles(root)) {
-    const pkgDir = dirname(pkgJsonPath);
-    const srcDir = join(pkgDir, 'src');
-    if (!existsSync(srcDir)) continue;
-    if (pkgDir.includes('__fixtures__') || pkgDir.includes('/fixtures/')) continue;
-
-    try {
-      const json = JSON.parse(readFileSync(pkgJsonPath, 'utf-8'));
-      if (json.name) alias.set(json.name, srcDir);
-    } catch {
-      // ignore malformed package.json files in fixture-like directories
-    }
-  }
-  return alias;
 }
 
 function scriptKindFor(file) {
@@ -436,13 +394,15 @@ function addNamedEdge(edges, moduleName, kind, names, typeOnly = false) {
 
 function parseFile(root, file) {
   const fullPath = resolve(root, file);
-  let text;
-  try {
-    text = readFileSync(fullPath, 'utf-8');
-  } catch {
-    return { exportedNames: new Set(), moduleEdges: [] };
-  }
+  const parsed = extractionCache.get(fullPath, 'symbols', text => {
+    const { exportedNames, moduleEdges } = parseFileText(fullPath, file, text);
+    return { exportedNames: [...exportedNames], moduleEdges };
+  });
+  if (!parsed) return { exportedNames: new Set(), moduleEdges: [] };
+  return { exportedNames: new Set(parsed.exportedNames), moduleEdges: parsed.moduleEdges };
+}
 
+function parseFileText(fullPath, file, text) {
   const source = ts.createSourceFile(fullPath, text, ts.ScriptTarget.Latest, true, scriptKindFor(file));
   const exportedNames = new Set();
   const moduleEdges = [];
@@ -542,13 +502,13 @@ function resolveModuleToGraphDep(root, fromFile, moduleName, deps, aliasMap) {
   if (moduleName.startsWith('.')) {
     basePath = resolve(root, dirname(fromFile), moduleName);
   } else {
-    const matchingAlias = [...aliasMap.keys()]
-      .filter(name => moduleName === name || moduleName.startsWith(`${name}/`))
-      .sort((a, b) => b.length - a.length)[0];
+    const matchingAlias = aliasMap
+      .filter(alias => moduleName === alias.name || (!alias.exact && moduleName.startsWith(`${alias.name}/`)))
+      .sort((a, b) => b.name.length - a.name.length)[0];
 
     if (matchingAlias) {
-      const suffix = moduleName === matchingAlias ? '' : moduleName.slice(matchingAlias.length + 1);
-      basePath = join(aliasMap.get(matchingAlias), suffix);
+      const suffix = moduleName === matchingAlias.name ? '' : moduleName.slice(matchingAlias.name.length + 1);
+      basePath = join(matchingAlias.target, suffix);
     }
   }
 
@@ -567,7 +527,7 @@ function edgeKey(from, to) {
 }
 
 function buildSymbolIndex({ graph, root }) {
-  const aliasMap = buildAliasMap(root);
+  const aliasMap = buildWorkspaceSourceAliases(root);
   const fileSymbols = new Map();
   const edges = new Map();
 
@@ -814,8 +774,91 @@ if (flags.includeTypeOnlyTypeTests && flags.ignoreTypeOnlySymbols) {
 const selectedResult = flags.fileLevel ? fileLevelResult : symbolAwareResult;
 
 // ---------------------------------------------------------------------------
+// Guard: colocated tests the graph failed to reach
+// ---------------------------------------------------------------------------
+
+// A changed source file with a test at its colocated path, where that test
+// imports the source, must select that test. When neither traversal finds it
+// the graph itself is missing the edge — the failure mode behind #24218, where
+// unmapped `.js` specifiers made whole packages look dependency-free and select
+// zero tests. Deliberately narrow: the test must import the source (so
+// same-named tests don't trip it) and must be missing from the file-level
+// result too (so symbol-aware pruning, e.g. type-only-only imports, doesn't).
+const testFileSet = new Set(testFiles);
+
+// Matches every source extension the detector knows about, so specifiers and
+// paths normalize the same way for `.js`, `.mjs` and `.mts` alike.
+const SOURCE_EXT_RE = /\.(?:ts|tsx|js|jsx|mts|cts|mjs|cjs)$/;
+
+function colocatedTestsFor(changedRel) {
+  if (/\.(test|spec)\.(ts|tsx)$/.test(changedRel) || changedRel.endsWith('.test-d.ts')) return [];
+  const withoutExt = changedRel.replace(SOURCE_EXT_RE, '');
+  const dir = dirname(withoutExt);
+  const base = withoutExt.slice(dir === '.' ? 0 : dir.length + 1);
+  const prefixes = dir === '.' ? [''] : [`${dir}/`, `${dir}/__tests__/`, `${dir}/tests/`];
+  const found = [];
+  for (const prefix of prefixes) {
+    for (const suffix of ['.test.ts', '.test.tsx', '.spec.ts', '.spec.tsx']) {
+      const candidate = `${prefix}${base}${suffix}`;
+      if (testFileSet.has(candidate)) found.push(candidate);
+    }
+  }
+  return found;
+}
+
+// Repository-relative path a relative import points at, extensionless, or
+// undefined when the specifier is bare or aliased and so cannot be mapped
+// without the workspace alias table.
+function resolveRelativeSpecifier(testRel, specifier) {
+  const noExt = specifier.replace(SOURCE_EXT_RE, '');
+  if (!noExt.startsWith('./') && !noExt.startsWith('../')) return undefined;
+  const target = resolve(dirname(resolve(ROOT, testRel)), noExt);
+  return relative(ROOT, target).split(sep).join('/');
+}
+
+function importsSource(testRel, changedRel) {
+  const changedNoExt = changedRel.replace(SOURCE_EXT_RE, '');
+  const changedBase = changedNoExt.split('/').pop();
+  // Parse rather than pattern-match: a string literal that happens to contain
+  // an import statement must not count, and side-effect imports have no `from`.
+  const { moduleEdges } = parseFile(ROOT, testRel);
+  return moduleEdges.some(({ moduleName }) => {
+    const resolved = resolveRelativeSpecifier(testRel, moduleName);
+    // Relative imports are matched on their resolved path, so a same-named
+    // module elsewhere in the repo cannot pass for the changed source.
+    if (resolved !== undefined) return resolved === changedNoExt;
+    // Aliased imports fall back to the module basename.
+    return moduleName.replace(SOURCE_EXT_RE, '').split('/').pop() === changedBase;
+  });
+}
+
+const unreachableColocated = [];
+for (const changedRel of changedRelative) {
+  for (const testRel of colocatedTestsFor(changedRel)) {
+    if (fileLevelResult.affected.has(testRel) || selectedResult.affected.has(testRel)) continue;
+    if (!importsSource(testRel, changedRel)) continue;
+    unreachableColocated.push({ changed: changedRel, test: testRel });
+  }
+}
+
+if (unreachableColocated.length > 0) {
+  const details = unreachableColocated
+    .map(({ changed, test }) => `  ${changed}\n    is imported by ${test}, but that test was not selected`)
+    .join('\n');
+  console.error(
+    `Error: ${unreachableColocated.length} colocated test(s) not selected for changed source file(s):\n\n` +
+      `${details}\n\n` +
+      'The module graph is missing the edge between them, so this selection is incomplete. ' +
+      'Check that scripts/madge.webpack.config.cjs can resolve the specifier style these files use.',
+  );
+  process.exit(1);
+}
+
+// ---------------------------------------------------------------------------
 // Output
 // ---------------------------------------------------------------------------
+
+extractionCache.save();
 
 const elapsed = Date.now() - startTime;
 const affectedSorted = [...selectedResult.affected].sort();
@@ -863,20 +906,18 @@ if (flags.json) {
     }
   }
   console.log(JSON.stringify(output, null, 2));
+} else if (flags.verbose) {
+  console.error(`\n${affectedSorted.length} affected test(s) found in ${elapsed}ms:\n`);
+  for (const testRel of affectedSorted) {
+    const chain = selectedResult.chains.get(testRel) || [];
+    console.log(`${testRel}`);
+    if (chain.length > 1) {
+      console.log(`  chain: ${chain.join(' → ')}`);
+    }
+    console.log('');
+  }
 } else {
-  if (flags.verbose) {
-    console.error(`\n${affectedSorted.length} affected test(s) found in ${elapsed}ms:\n`);
-    for (const testRel of affectedSorted) {
-      const chain = selectedResult.chains.get(testRel) || [];
-      console.log(`${testRel}`);
-      if (chain.length > 1) {
-        console.log(`  chain: ${chain.join(' → ')}`);
-      }
-      console.log('');
-    }
-  } else {
-    for (const testRel of affectedSorted) {
-      console.log(testRel);
-    }
+  for (const testRel of affectedSorted) {
+    console.log(testRel);
   }
 }

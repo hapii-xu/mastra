@@ -1,4 +1,18 @@
-export * from './workflow';
+export {
+  createMappingStep,
+  createStepFromAgent,
+  createStepFromClassifier,
+  createStepFromTool,
+  predicateToCondition,
+  mapVariable,
+  createStep,
+  cloneStep,
+  isProcessor,
+  Workflow,
+  Run,
+} from './workflow';
+export type { AgentStepOptions, AnyWorkflow, ClassifierStepOptions, ClassifierStepOutput } from './workflow';
+export { getEntryId, getEntryWorkflow } from './step-entry';
 export * from './execution-engine';
 export * from './default';
 export * from './step';
@@ -7,3 +21,8 @@ export * from './utils';
 export * from './scheduler';
 export * from './state-reader';
 export * from './create';
+export * from './dynamic';
+export * from './predicate';
+
+/** @internal Framework outcome classification; custom spans may use their own values. */
+export { workflowTermination } from './execution-outcome';

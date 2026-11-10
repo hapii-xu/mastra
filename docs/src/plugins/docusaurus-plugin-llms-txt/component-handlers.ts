@@ -77,8 +77,11 @@ export function handleTabsContainer(
     }
   }
 
-  // Find tab panels (divs with role="tabpanel")
-  const tabPanels = findAllElementsByRole(node, 'tabpanel')
+  // Find tab panels (divs with role="tabpanel"). Only look at the panels that
+  // belong to this container: nested tab groups (for example a framework tab
+  // containing an npm2yarn code block) render their own tabpanels, and
+  // collecting those recursively shifts every label onto the wrong panel.
+  const tabPanels = findDirectTabPanels(node)
 
   // Generate output: pair labels with content
   for (let i = 0; i < tabPanels.length; i++) {
@@ -246,29 +249,12 @@ export function handleCardGrid(_state: State, node: Element): BlockContent | Arr
 // ============================================
 
 /**
- * Check if an element is a CardGrid items container (grid with card items)
- * Structure: <div class="grid grid-cols-1 ..."><a><div data-slot="card">...</div></a>...</div>
+ * Check if an element is a CardGrid items container.
+ * Card grids expose an explicit data-slot contract so the rendered structure can
+ * use either generic containers or semantic list markup.
  */
 export function isCardGridItems(node: Element): boolean {
-  const classNames = node.properties?.className as string[] | undefined
-  if (!classNames) return false
-
-  // Check for grid layout class
-  const hasGridClass = classNames.some(cls => cls.startsWith('grid') && cls !== 'card__grid')
-  if (!hasGridClass) return false
-
-  // Check if it contains card items (a > div[data-slot=card])
-  for (const child of node.children) {
-    if (child.type === 'element' && child.tagName === 'a') {
-      for (const grandchild of child.children) {
-        if (grandchild.type === 'element' && grandchild.properties?.dataSlot === 'card') {
-          return true
-        }
-      }
-    }
-  }
-
-  return false
+  return node.properties?.dataSlot === 'card-grid'
 }
 
 /**
@@ -288,34 +274,33 @@ export function handleCardGridItems(
     }>
   }> = []
 
-  // Find all card links
-  for (const child of node.children) {
-    if (child.type === 'element' && child.tagName === 'a') {
-      const href = child.properties?.href as string | undefined
-      if (!href) continue
+  // Find links that contain card markup. This supports both direct links and
+  // semantic list structures such as ul > li > a.
+  const links = findAllElementsByTag(node, 'a')
+  for (const link of links) {
+    const href = link.properties?.href as string | undefined
+    if (!href || !findElementByDataSlot(link, 'card')) continue
 
-      // Find the card title
-      const cardTitle = findElementByDataSlot(child, 'card-title')
-      const title = cardTitle ? getTextContent(cardTitle).trim() : ''
+    const cardTitle = findElementByDataSlot(link, 'card-title')
+    const title = cardTitle ? getTextContent(cardTitle).trim() : ''
 
-      if (title) {
-        listItems.push({
-          type: 'listItem',
-          spread: false,
-          children: [
-            {
-              type: 'paragraph',
-              children: [
-                {
-                  type: 'link',
-                  url: href.startsWith('/') ? `https://mastra.ai${href}` : href,
-                  children: [{ type: 'text', value: title }],
-                },
-              ],
-            },
-          ],
-        })
-      }
+    if (title) {
+      listItems.push({
+        type: 'listItem',
+        spread: false,
+        children: [
+          {
+            type: 'paragraph',
+            children: [
+              {
+                type: 'link',
+                url: href.startsWith('/') ? `https://mastra.ai${href}` : href,
+                children: [{ type: 'text', value: title }],
+              },
+            ],
+          },
+        ],
+      })
     }
   }
 
@@ -488,6 +473,27 @@ function findElementByRole(node: Element, role: string): Element | null {
     }
   }
   return null
+}
+
+/**
+ * Find the tabpanels owned by a tabs container.
+ *
+ * The panels sit in a wrapper element alongside the tablist, and each panel can
+ * itself contain another tabs container (for example a framework tab whose
+ * content is an npm2yarn code block with its own npm/pnpm/Yarn/Bun tabs).
+ * Recursing would mix those inner panels into this container's `tabPanels`,
+ * so only the panels that are direct children of the wrapper are returned.
+ */
+function findDirectTabPanels(node: Element): Element[] {
+  const isTabPanel = (child: ElementContent): child is Element =>
+    child.type === 'element' && child.properties?.role === 'tabpanel'
+
+  const wrapper = node.children.find(
+    (child): child is Element =>
+      child.type === 'element' && child.properties?.role !== 'tablist' && child.children.some(isTabPanel),
+  )
+
+  return wrapper ? wrapper.children.filter(isTabPanel) : []
 }
 
 /**

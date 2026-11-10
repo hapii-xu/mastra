@@ -18,28 +18,51 @@
  */
 
 import type { MastraCodeConfig, MountedMastraCode } from '@mastra/code-sdk';
+import type { AgentChannels, AgentControllerChannelsConfig, ChannelAdapterConfig } from '@mastra/core/channels';
+import type { InputProcessor, OutputProcessor } from '@mastra/core/processors';
 import type { RequestContext } from '@mastra/core/request-context';
-import type { ApiRoute } from '@mastra/core/server';
+import type { ApiRoute, IUserProvider } from '@mastra/core/server';
 import type { FactoryStorage } from '@mastra/core/storage';
 import type { MastraWorker } from '@mastra/core/worker';
+import type { FactorySandbox } from '@mastra/core/workspace';
 
+import type { BoardRegistry } from '../boards/index.js';
 import type { Intake } from '../capabilities/intake.js';
 import type { VersionControl } from '../capabilities/version-control.js';
 import type { RouteAuth } from '../routes/route.js';
-import type { FactoryRules } from '../rules/types.js';
-import type { SandboxFleet } from '../sandbox/fleet.js';
+import type { SessionRetirementCoordinator } from '../sandbox/session-retirement.js';
 import type { StateSigner } from '../state-signing.js';
 import type { AuditEventRow } from '../storage/domains/audit/base.js';
 import type { AuditEmitter } from '../storage/domains/audit/domain.js';
+import type { ChannelIdentityStorage } from '../storage/domains/channel-identity/base.js';
+import type { CommentsDomain } from '../storage/domains/comments/domain.js';
+import type { WorkItemFeedPublisher } from '../storage/domains/comments/feed-sync.js';
+import type { ModelCredentialsStorage } from '../storage/domains/credentials/base.js';
 import type { IntakeStorage } from '../storage/domains/intake/base.js';
 import type { IntegrationStorageHandle } from '../storage/domains/integrations/base.js';
+import type { MemorySettingsStorage } from '../storage/domains/memory-settings/base.js';
+import type { ModelDefaultsStorage } from '../storage/domains/model-defaults/base.js';
 import type { FactoryProjectsStorage } from '../storage/domains/projects/base.js';
 import type { SourceControlStorageHandle } from '../storage/domains/source-control/base.js';
+import type { VoiceSettingsStorage } from '../storage/domains/voice-settings/base.js';
 import type { WorkItemsStorage } from '../storage/domains/work-items/base.js';
+
+/** A push to a repository linked to a project, as a version-control integration reports it. */
+export interface RepositoryPushEvent {
+  orgId: string;
+  factoryProjectId: string;
+  projectRepository: { id: string; inEnvironment: boolean };
+  /** The pushed git ref, for example `refs/heads/main`. */
+  ref: string;
+  /** The repository's default branch as the provider reports it. */
+  defaultBranch: string;
+}
 
 /** Factory-owned hooks integrations may invoke. */
 export interface IntegrationHooks {
   emitAudit?: AuditEmitter['emit'];
+  /** Hand a push off for an environment build; never blocks the webhook and never throws. */
+  onRepositoryPush?: (event: RepositoryPushEvent) => void;
 }
 
 /**
@@ -64,12 +87,14 @@ export interface IntegrationPostToolContext {
 export interface IntegrationContext {
   /** Host auth seam — integration routes resolve callers through this. */
   auth: RouteAuth;
+  /** Optional user directory for resolving persisted user ids to display profiles. */
+  users?: Pick<IUserProvider, 'getUser' | 'getUsers'>;
   /**
-   * Sandbox fleet for per-project sandboxes. Always constructed at boot; a
-   * fleet built without a machine config reports `enabled: false` and
-   * sandbox-backed routes respond 503.
+   * The deploy's sandbox callback for per-project and per-session
+   * sandboxes. Absent when no sandbox is configured — sandbox-backed
+   * routes respond 503.
    */
-  fleet: SandboxFleet;
+  sandbox?: FactorySandbox;
   /**
    * Root factory storage backend and source of the `appDbConfigured`
    * diagnostic. Absent when the host runs without an application database.
@@ -84,26 +109,97 @@ export interface IntegrationContext {
    * every integration's OAuth flow signs and verifies with the same secret.
    */
   stateSigner?: StateSigner;
+  /** Shared source-control session retirement lifecycle used by integration routes. */
+  sessionRetirement?: SessionRetirementCoordinator;
+  /** Work-items domain slice — deleting a session strips the refs work items hold on it. */
+  workItems?: Pick<WorkItemsStorage, 'clearSessionReferences' | 'hasRunBindingForSession'>;
+  /** Feed slice for ingesting platform messages; present once work items are ready. */
+  feed?: Pick<CommentsDomain, 'createComment'>;
   /** Persistence handles pre-scoped to this integration's stable id. */
   storage: {
     generic: IntegrationStorageHandle;
     sourceControl: SourceControlStorageHandle;
+    /**
+     * The factory's source-control-owning integration's storage handle
+     * (today: GitHub when registered; the handle carries its own
+     * `integrationId`). Channel integrations use it to make sessions
+     * repo-backed without the entry hand-wiring a source-control slice.
+     * Absent when no source-control owner is registered.
+     */
+    sourceControlOwner?: SourceControlStorageHandle;
+    /** Every registered source-control partition, for project-aware provider selection. */
+    sourceControls: readonly SourceControlStorageHandle[];
     /** Factory projects domain — e.g. resolving a project's default model. */
     projects: FactoryProjectsStorage;
+    /**
+     * Observational-memory settings domain, so a session an integration starts
+     * adopts the same memory configuration the web kickoff applies.
+     */
+    memorySettings: MemorySettingsStorage;
+    /**
+     * Per-user default model. A channel integration reads the linked sender's
+     * default to start a session on the model that user chose rather than the
+     * factory's shared default.
+     */
+    modelDefaults: ModelDefaultsStorage;
     /** Cross-integration intake selection (which sources are synced). */
     intake: IntakeStorage;
+    /**
+     * Reverse index from a chat-platform sender to a Mastra tenant. Channel
+     * integrations resolve an inbound sender through this to run under the
+     * right user's credentials.
+     */
+    channelIdentity: ChannelIdentityStorage;
+    /** Tenant model credentials, so a channel can transcribe a voice clip with the sender's STT key. */
+    modelCredentials: ModelCredentialsStorage;
+    /** Per-user and per-Factory speech-to-text model choice (Settings → Models → Voice input). */
+    voiceSettings: VoiceSettingsStorage;
   };
   /**
-   * Factory rule runtime available when the work-item domain is ready.
+   * Factory runtime available when the work-item domain is ready.
    * Integrations attach their own provider event rules to their ingress
    * surfaces instead of relying on provider-specific services in the host.
    */
-  rules?: {
-    config: FactoryRules;
+  runtime?: {
+    /** Operator-maintained provenance label stamped on audit rows. */
+    configVersion: string;
     workItems: WorkItemsStorage;
+    /** Installed boards, so integrations read phase semantics instead of matching names. */
+    boards: BoardRegistry;
   };
   /** System hooks integrations may invoke. */
   hooks?: IntegrationHooks;
+}
+
+/**
+ * One adapter entry in a {@link FactoryChannelsConfig} adapter map.
+ *
+ * Core's adapter-map entry is `ChannelAdapterConfig | Adapter<any, any>`, and
+ * `ChannelAdapterConfig` is itself a union — so this MUST be a type alias, not
+ * an interface extends (illegal on unions). Factory's contract deliberately
+ * EXCLUDES the bare-`Adapter` shorthand core accepts: entries use the config
+ * form so future per-platform extras (e.g. a `resolveWorkspaceId`, connect
+ * handlers) have a home. Today the alias adds no fields; it is the stable
+ * extension point.
+ */
+export type FactoryChannelAdapterEntry = ChannelAdapterConfig;
+
+/**
+ * The channels contribution a {@link FactoryIntegration} returns from
+ * `channels()`. A config object, not a built instance — the factory constructs
+ * the `AgentControllerChannels` at the attach site.
+ *
+ * The adapter-map key is the platform identity (`'slack'`, `'discord'`, …).
+ * One integration = one platform = one entry is the norm: the map shape is
+ * inherited from core (one `AgentControllerChannels` instance drives multiple
+ * adapters) and is where cross-integration merging will happen later — it is
+ * NOT an invitation for a single integration to bundle multiple platforms.
+ * Note the top-level `handlers` and resolvers are shared across all adapters
+ * in the map. Entries use the config form; the bare-`Adapter` shorthand core
+ * accepts is deliberately excluded (see {@link FactoryChannelAdapterEntry}).
+ */
+export interface FactoryChannelsConfig extends Omit<AgentControllerChannelsConfig, 'adapters'> {
+  adapters: Record<string, FactoryChannelAdapterEntry>;
 }
 
 /**
@@ -124,7 +220,16 @@ export interface FactoryIntegration {
    * agent tools, intake capability calls — reach storage without a service
    * locator. Mirrors `sourceControl.initialize`.
    */
-  initialize?(args: { storage: IntegrationStorageHandle; projects: FactoryProjectsStorage; auth: RouteAuth }): void;
+  initialize?(args: {
+    storage: IntegrationStorageHandle;
+    projects: FactoryProjectsStorage;
+    auth: RouteAuth;
+    /** Cross-integration intake selection/binding domain, for per-request authorization. */
+    intake: IntakeStorage;
+    sourceControl?: SourceControlStorageHandle;
+    /** The controller's chat channels, once it has mounted. */
+    channels?: () => AgentChannels | null | undefined;
+  }): void;
   /**
    * The integration's full HTTP surface (status, OAuth, webhooks, feature
    * routes), as Mastra `apiRoutes`. Called once at boot; the factory folds
@@ -143,6 +248,13 @@ export interface FactoryIntegration {
    */
   sessionTools?(args: { requestContext: RequestContext }): IntegrationTools;
   /**
+   * Processors the integration adds to every session run. Input processors
+   * run before Factory's own state processors and output processors before
+   * the credential stamp, in the order integrations are configured. Each
+   * processor decides per run whether it applies.
+   */
+  processors?: { input?: InputProcessor[]; output?: OutputProcessor[] };
+  /**
    * Optional provider-owned observer for successful or failed tool calls.
    * The factory invokes every configured observer independently so one
    * integration cannot prevent another from observing the same tool result.
@@ -158,6 +270,31 @@ export interface FactoryIntegration {
    * duplicates fail the `new Mastra(...)` construction loudly.
    */
   workers?(ctx: IntegrationContext): MastraWorker[];
+  /**
+   * Chat-platform channels this integration contributes (Slack, Discord, …).
+   * Called once at boot for READY integrations only; the factory constructs an
+   * `AgentControllerChannels` from the returned config and attaches it to the
+   * mounted agent controller via `setChannels`, so inbound platform messages
+   * reach the same agents the web UI drives.
+   *
+   * An integration providing this slot also declares a dependency on the
+   * `channel-identity` domain, which the factory folds into its readiness
+   * gate — so an integration whose reverse index isn't migrated yet reports
+   * not-ready and its channels never attach, rather than dispatching runs it
+   * can't resolve a tenant for.
+   *
+   * Only one integration may provide channels; the factory fails loud at boot
+   * on a second, because `setChannels` replaces rather than merges and the
+   * loser would silently never receive a message.
+   */
+  channels?(ctx: IntegrationContext): FactoryChannelsConfig;
+  /**
+   * Mirrors web feed comments outward — to the platform thread a work item is
+   * bound to, a webhook, or an issue tracker. Collected from every READY
+   * integration independent of `channels()`: an integration may publish without
+   * owning a chat channel.
+   */
+  feedPublisher?(ctx: IntegrationContext): WorkItemFeedPublisher;
   /**
    * Non-secret config snapshot (booleans + names only, never values). The
    * factory merges it into system diagnostics/startup logs.

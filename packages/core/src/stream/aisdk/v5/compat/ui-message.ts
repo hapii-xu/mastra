@@ -171,6 +171,7 @@ export function convertFullStreamChunkToUIMessageStream<UI_MESSAGE extends UIMes
         output: part.output,
         ...(part.providerExecuted != null ? { providerExecuted: part.providerExecuted } : {}),
         ...(part.dynamic != null ? { dynamic: part.dynamic } : {}),
+        ...(part.preliminary != null ? { preliminary: part.preliminary } : {}),
       };
     }
 
@@ -220,6 +221,8 @@ export function convertFullStreamChunkToUIMessageStream<UI_MESSAGE extends UIMes
       if (sendFinish) {
         return {
           type: 'finish' as const,
+          // Matches the AI SDK UI converter, which keeps the finish reason on the terminal chunk.
+          ...(part.finishReason != null ? { finishReason: part.finishReason } : {}),
           ...(messageMetadataValue != null ? { messageMetadata: messageMetadataValue } : {}),
         } as InferUIMessageChunk<UI_MESSAGE>;
       }
@@ -231,7 +234,7 @@ export function convertFullStreamChunkToUIMessageStream<UI_MESSAGE extends UIMes
     }
 
     case 'tool-input-end': {
-      return;
+      return undefined;
     }
 
     case 'raw': {

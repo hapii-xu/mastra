@@ -1,5 +1,3 @@
-import { randomUUID } from 'node:crypto';
-
 import { ErrorCategory, ErrorDomain, MastraError } from '@mastra/core/error';
 import {
   AgentsStorage,
@@ -61,6 +59,11 @@ export class AgentsMSSQL extends AgentsStorage {
     }
     await this.db.createTable({ tableName: TABLE_AGENTS, schema: AGENTS_SCHEMA });
     await this.db.createTable({ tableName: TABLE_AGENT_VERSIONS, schema: AGENT_VERSIONS_SCHEMA });
+    await this.db.alterTable({
+      tableName: TABLE_AGENT_VERSIONS,
+      schema: AGENT_VERSIONS_SCHEMA,
+      ifNotExists: ['modelList'],
+    });
     await this.createDefaultIndexes();
     await this.createCustomIndexes();
   }
@@ -175,6 +178,7 @@ export class AgentsMSSQL extends AgentsStorage {
         row.instructions as string | null | undefined,
       ) as AgentVersion['instructions'],
       model: this.parseJson(row.model, 'model') as AgentVersion['model'],
+      modelList: this.parseJson(row.modelList, 'modelList') as AgentVersion['modelList'],
       tools: this.parseJson(row.tools, 'tools') as AgentVersion['tools'],
       defaultOptions: this.parseJson(row.defaultOptions, 'defaultOptions') as AgentVersion['defaultOptions'],
       workflows: this.parseJson(row.workflows, 'workflows') as AgentVersion['workflows'],
@@ -192,6 +196,7 @@ export class AgentsMSSQL extends AgentsStorage {
       workspace: this.parseJson(row.workspace, 'workspace') as AgentVersion['workspace'],
       skills: this.parseJson(row.skills, 'skills') as AgentVersion['skills'],
       skillsFormat: (row.skillsFormat as 'xml' | 'json' | 'markdown' | null | undefined) ?? undefined,
+      durable: this.parseJson(row.durable, 'durable') as AgentVersion['durable'],
       changedFields: this.parseJson(row.changedFields, 'changedFields') as AgentVersion['changedFields'],
       changeMessage: (row.changeMessage as string | null | undefined) ?? undefined,
       createdAt: row.createdAt instanceof Date ? row.createdAt : new Date(row.createdAt as string),
@@ -233,7 +238,7 @@ export class AgentsMSSQL extends AgentsStorage {
         },
       });
       const { id: _id, authorId: _authorId, metadata: _metadata, ...snapshotConfig } = agent;
-      const versionId = randomUUID();
+      const versionId = globalThis.crypto.randomUUID();
       await this.createVersion({
         id: versionId,
         agentId: agent.id,
@@ -446,8 +451,9 @@ export class AgentsMSSQL extends AgentsStorage {
           versionNumber: input.versionNumber,
           name: input.name ?? null,
           description: input.description ?? null,
-          instructions: this.serializeInstructions(input.instructions as string | string[] | undefined) ?? null,
-          model: input.model,
+          instructions: this.serializeInstructions(input.instructions as string | string[] | undefined) ?? '',
+          model: input.model ?? {},
+          modelList: input.modelList ?? null,
           tools: input.tools ?? null,
           defaultOptions: input.defaultOptions ?? null,
           workflows: input.workflows ?? null,
@@ -462,6 +468,7 @@ export class AgentsMSSQL extends AgentsStorage {
           workspace: input.workspace ?? null,
           skills: input.skills ?? null,
           skillsFormat: input.skillsFormat ?? null,
+          durable: input.durable ?? null,
           changedFields: input.changedFields ?? null,
           changeMessage: input.changeMessage ?? null,
           createdAt: now,

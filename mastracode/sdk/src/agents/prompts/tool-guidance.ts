@@ -6,14 +6,23 @@
 
 import { MC_TOOLS } from '../../tool-names.js';
 
+const DEFAULT_PLANS_DIR = '.mastracode/plans';
+
 interface ToolGuidanceOptions {
   hasWebSearch?: boolean;
+  /** `web_extract` is registered (Parallel/Tavily); provider-executed search has no extract tool. */
+  hasWebExtract?: boolean;
+  hasSubagents?: boolean;
   /** Tool names that have been denied — omit their guidance sections. */
   deniedTools?: Set<string>;
+  /** Workspace-relative directory where plan mode can write plans. */
+  plansDir?: string;
 }
 
 export function buildToolGuidance(modeId: string, options: ToolGuidanceOptions = {}): string {
   const denied = options.deniedTools ?? new Set<string>();
+  // Name the dir with `/` so the win32 default (`.mastracode\plans`) still matches DEFAULT_PLANS_DIR.
+  const plansDir = (options.plansDir ?? DEFAULT_PLANS_DIR).replaceAll('\\', '/');
   const sections: string[] = [];
 
   sections.push(`# Tool Usage Rules
@@ -29,7 +38,7 @@ You have access to the following tools. Use the RIGHT tool for the job:`);
   if (!denied.has(MC_TOOLS.VIEW)) {
     readTools.push(`
 **${MC_TOOLS.VIEW}** — Read file contents
-- Use this to read files before editing them. NEVER propose changes to code you haven't read.
+- Use this to read file contents. Don't propose changes to code you haven't seen; reading with shell commands (cat, sed, rg) also works.
 - Use \`offset\` (1-indexed start line) and \`limit\` (number of lines) for large files.
 - Example: Read lines 50-100: \`{ path: "src/big-file.ts", offset: 50, limit: 51 }\`
 - To list directories, use \`${MC_TOOLS.FIND_FILES}\` instead.`);
@@ -62,6 +71,7 @@ You have access to the following tools. Use the RIGHT tool for the job:`);
 - Prefer dedicated tools for: file reading (${MC_TOOLS.VIEW}), file search (${MC_TOOLS.SEARCH_CONTENT}/${MC_TOOLS.FIND_FILES}), file editing (${MC_TOOLS.STRING_REPLACE_LSP}/${MC_TOOLS.WRITE_FILE}).
 - Commands have a 30-second default timeout. Use \`timeout\` for longer commands, \`cwd\` for working directory.
 - Use the \`tail\` parameter or pipe to \`| tail -N\` to limit output — the full output streams to the user, only the tail is returned to you. If you're building any kind of package you should be tailing.
+- Always set \`description\` to a 5-10 word summary of what the command does; the user sees it instead of the raw command. Put it first in the arguments, before \`command\`, so the user sees it while the rest of the call streams in. Write each one as the next step in a running narrative that can lean on earlier commands (e.g. "Searching open PRs for failing CI", then "Drilling into the first of 15 failures").
 - Good: Run independent commands in parallel when possible.
 - Bad: Running \`cat file.txt\` — use the ${MC_TOOLS.VIEW} tool instead.`);
   }
@@ -99,7 +109,6 @@ You have access to the following tools. Use the RIGHT tool for the job:`);
     if (!denied.has(MC_TOOLS.STRING_REPLACE_LSP)) {
       writeTools.push(`
 **${MC_TOOLS.STRING_REPLACE_LSP}** — Edit files by replacing exact text
-- You MUST read a file with \`${MC_TOOLS.VIEW}\` before editing it.
 - \`old_string\` must be an exact match of existing text in the file.
 - Provide enough surrounding context in \`old_string\` to make it unique.
 - Use \`replace_all: true\` to replace all occurrences (default: false, requires unique match).
@@ -112,7 +121,7 @@ You have access to the following tools. Use the RIGHT tool for the job:`);
       writeTools.push(`
 **${MC_TOOLS.WRITE_FILE}** — Create new files or overwrite existing ones
 - Use this to create new files.
-- If overwriting an existing file, you MUST have read it first with \`${MC_TOOLS.VIEW}\`.
+- Overwriting replaces the whole file, so make sure you know its current contents first.
 - Prefer editing existing files over creating new ones.`);
     }
 
@@ -126,10 +135,16 @@ You have access to the following tools. Use the RIGHT tool for the job:`);
   if (options.hasWebSearch) {
     const webTools: string[] = [];
     if (!denied.has('web_search')) webTools.push('**web_search**');
-    if (!denied.has('web_extract')) webTools.push('**web_extract**');
+    if (options.hasWebExtract && !denied.has('web_extract')) webTools.push('**web_extract**');
     if (webTools.length > 0) {
+      const purpose =
+        webTools.length === 2
+          ? 'Search the web / extract page content'
+          : webTools[0] === '**web_search**'
+            ? 'Search the web'
+            : 'Extract page content';
       sections.push(`
-${webTools.join(' / ')} — Search the web / extract page content
+${webTools.join(' / ')} — ${purpose}
 - Use for looking up documentation, error messages, package APIs.`);
     }
   }
@@ -213,12 +228,26 @@ ${patchToolGuidance}
 - Call this tool when your plan is complete. Do NOT just describe your plan in text — you MUST call this tool.
 - The plan will be rendered as markdown and the user can approve, reject, or request changes.
 - On approval, the system automatically switches to the default mode so you can implement.
-- Takes one argument: \`path\` (the plan markdown file you wrote under \`.mastracode/plans/\`). Do NOT pass the plan body — it lives in the file.`);
+- Takes one argument: \`path\` (the plan markdown file you wrote under \`${plansDir}/\`). Do NOT pass the plan body — it lives in the file.`);
+  }
+
+  // Outside plan mode nothing else names the plans directory (the submit_plan
+  // tool example is directory-neutral), so state it here. Explore (`fast`) mode
+  // is read-only and has neither submit_plan nor file writes.
+  if (modeId !== 'plan' && modeId !== 'fast' && !denied.has('submit_plan')) {
+    const elsewhere =
+      plansDir === DEFAULT_PLANS_DIR
+        ? ''
+        : `, never under \`${DEFAULT_PLANS_DIR}/\`. Plans anywhere else cannot be shown to the user`;
+    sections.push(`
+**submit_plan** — Submit a plan for user review
+- Write plan files under \`${plansDir}/\` (e.g. \`${plansDir}/add-dark-mode.md\`)${elsewhere}.
+- Pass that file's \`path\` to \`submit_plan\`. Do NOT pass the plan body — it lives in the file.`);
   }
 
   if (modeId === 'plan') {
     sections.push(`
-**Plan file access** — Your plan lives in a markdown file under \`.mastracode/plans/\` (e.g. \`add-dark-mode-toggle.md\`)
+**Plan file access** — Your plan lives in a markdown file under \`${plansDir}/\` (e.g. \`add-dark-mode-toggle.md\`)
 - Use \`write_file\` to create the plan file, \`view\` to read it, and \`string_replace_lsp\` for targeted edits.
 - On first submission: write the plan to the file, then call \`submit_plan\` with its \`path\`.
 - On revision: read the existing file, edit specific sections, re-read, then call \`submit_plan\` with the same \`path\`.
@@ -227,7 +256,7 @@ ${patchToolGuidance}
 
   // --- Subagent tool (all modes) ---
 
-  if (!denied.has('subagent')) {
+  if (options.hasSubagents !== false && !denied.has('subagent')) {
     sections.push(`
 **subagent** — Delegate a focused task to a specialized subagent
 - Only use subagents when you will spawn **multiple subagents in parallel**. If you only need one task done, do it yourself.

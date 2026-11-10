@@ -1,6 +1,6 @@
 ---
 title: "Reference: Context relevance scorer | Evals"
-description: Documentation for the Context Relevance Scorer in Mastra. Evaluates the relevance and utility of provided context for generating agent responses using weighted relevance scoring.
+description: "The createContextRelevanceScorerLLM() function creates a scorer that evaluates how relevant and useful provided context was for generating agent responses."
 packages:
   - "@mastra/evals"
 ---
@@ -18,7 +18,7 @@ It's especially useful for these use cases:
 Best for evaluating context quality in:
 
 - Chat systems where context usage matters
-- RAG pipelines needing nuanced relevance assessment
+- RAG pipelines needing detailed relevance assessment
 - Systems where missing context affects quality
 
 ## Context selection optimization
@@ -117,7 +117,7 @@ Note: Either `context` or `contextExtractor` must be provided. If both are provi
 
 ### Weighted Relevance Scoring
 
-Context Relevance uses a sophisticated scoring algorithm that considers:
+Context Relevance uses a advanced scoring algorithm that considers:
 
 1. **Relevance Levels**: Each context piece is classified with weighted values:
    - `high` = 1.0 (directly addresses the query)
@@ -133,7 +133,7 @@ Context Relevance uses a sophisticated scoring algorithm that considers:
 
 ### Scoring Formula
 
-```
+```text
 Base Score = Σ(relevance_weights) / (num_contexts × 1.0)
 Usage Penalty = count(unused_high_relevance) × unusedHighRelevanceContext
 Missing Penalty = min(count(missing_context) × missingContextPerItem, maxMissingContextPenalty)
@@ -152,7 +152,7 @@ Final Score = max(0, Base Score - Usage Penalty - Missing Penalty) × scale
 
 - **0.9-1.0**: Excellent - all context highly relevant and used
 - **0.7-0.8**: Good - mostly relevant with minor gaps
-- **0.4-0.6**: Mixed - significant irrelevant or unused context
+- **0.4-0.6**: Mixed - substantial irrelevant or unused context
 - **0.2-0.3**: Poor - mostly irrelevant context
 - **0.0-0.1**: Very poor - no relevant context found
 
@@ -192,7 +192,7 @@ Use results to improve your system:
 Control how penalties are applied for unused and missing context:
 
 ```typescript
-import { createContextRelevanceScorerLLM } from '@mastra/evals'
+import { createContextRelevanceScorerLLM } from '@mastra/evals/scorers/prebuilt'
 
 // Stricter penalty configuration
 const strictScorer = createContextRelevanceScorerLLM({
@@ -322,7 +322,7 @@ const scorer = createContextRelevanceScorerLLM({
 This example shows excellent context relevance where all context directly supports the response:
 
 ```typescript
-import { createContextRelevanceScorerLLM } from '@mastra/evals'
+import { createContextRelevanceScorerLLM } from '@mastra/evals/scorers/prebuilt'
 
 const scorer = createContextRelevanceScorerLLM({
   model: '__GATEWAY_OPENAI_MODEL__',
@@ -369,7 +369,7 @@ console.log(result)
 This example shows moderate relevance with some context being irrelevant or unused:
 
 ```typescript
-import { createContextRelevanceScorerLLM } from '@mastra/evals'
+import { createContextRelevanceScorerLLM } from '@mastra/evals/scorers/prebuilt'
 
 const scorer = createContextRelevanceScorerLLM({
   model: '__GATEWAY_OPENAI_MODEL__',
@@ -458,7 +458,7 @@ console.log(customResult)
 This example shows poor context relevance with mostly irrelevant information:
 
 ```typescript
-import { createContextRelevanceScorerLLM } from '@mastra/evals'
+import { createContextRelevanceScorerLLM } from '@mastra/evals/scorers/prebuilt'
 
 const scorer = createContextRelevanceScorerLLM({
   model: '__GATEWAY_OPENAI_MODEL__',
@@ -503,10 +503,10 @@ console.log(result)
 
 ### Dynamic context extraction
 
-Extract context dynamically based on the run input:
+Extract context at runtime based on the run input:
 
 ```typescript
-import { createContextRelevanceScorerLLM } from '@mastra/evals'
+import { createContextRelevanceScorerLLM } from '@mastra/evals/scorers/prebuilt'
 
 const scorer = createContextRelevanceScorerLLM({
   model: '__GATEWAY_OPENAI_MODEL__',
@@ -549,7 +549,7 @@ const scorer = createContextRelevanceScorerLLM({
 Integrate with RAG pipelines to evaluate retrieved context:
 
 ```typescript
-import { createContextRelevanceScorerLLM } from '@mastra/evals'
+import { createContextRelevanceScorerLLM } from '@mastra/evals/scorers/prebuilt'
 
 const scorer = createContextRelevanceScorerLLM({
   model: '__GATEWAY_OPENAI_MODEL__',

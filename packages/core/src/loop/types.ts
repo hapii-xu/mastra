@@ -3,20 +3,24 @@ import type { LanguageModelV4CallOptions } from '@ai-sdk/provider-v7';
 import type {
   CallSettings,
   IdGenerator,
+  ModelMessage,
   StopCondition as StopConditionV5,
   ToolChoice,
   ToolSet,
 } from '@internal/ai-sdk-v5';
 import type { StopCondition as StopConditionV6 } from '@internal/ai-v6';
 import { z } from 'zod/v4';
+import type { Agent } from '../agent';
 import type { IsTaskCompleteConfig, OnIterationCompleteHandler } from '../agent/agent.types';
 import type { MessageInput, MessageList } from '../agent/message-list';
 import type { SaveQueueManager } from '../agent/save-queue';
-import type { CreatedAgentSignal } from '../agent/signals';
+import type { PendingSignalListener, AgentSignalType, CreatedAgentSignal } from '../agent/signals';
+import type { AgentStreamPublisher } from '../agent/streams/publisher';
 import type { GoalConfig, StructuredOutputOptions } from '../agent/types';
 import type { ActorSignal } from '../auth/ee';
 import type { AgentBackgroundConfig, BackgroundTaskManager, BackgroundTaskManagerConfig } from '../background-tasks';
 import type { ModelRouterModelId } from '../llm/model';
+import type { MastraModelSettings } from '../llm/model/model-settings';
 import type { ModelMethodType } from '../llm/model/model.loop.types';
 import type { MastraLanguageModelV2, OpenAICompatibleConfig, SharedProviderOptions } from '../llm/model/shared.types';
 import type { IMastraLogger } from '../logger';
@@ -26,6 +30,7 @@ import type { IModelSpanTracker, ObservabilityContext } from '../observability';
 import type {
   ErrorProcessorOrWorkflow,
   InputProcessorOrWorkflow,
+  LLMRequestProcessorOrWorkflow,
   OutputProcessorOrWorkflow,
   ProcessInputStepArgs,
   ProcessInputStepResult,
@@ -34,18 +39,44 @@ import type {
 import type { RequestContext } from '../request-context';
 import type {
   ChunkType,
+  LanguageModelUsage,
   MastraOnFinishCallback,
   MastraOnStepFinishCallback,
+  MastraStreamTransformOptions,
   ModelManagerModelConfig,
+  ProviderMetadata,
   StreamChunkType,
   StreamTransportRef,
 } from '../stream/types';
-import type { RequireToolApproval, ToolPayloadTransformPolicy } from '../tools';
+import type { MCPToolExecutionContext, RequireToolApproval, ToolPayloadTransformPolicy } from '../tools';
 import type { MastraIdGenerator } from '../types';
-import type { OutputWriter } from '../workflows/types';
+import type { OutputWriter, WorkflowRunState } from '../workflows/types';
 import type { Workspace } from '../workspace/workspace';
 
 type StopCondition = StopConditionV5<any> | StopConditionV6<any>;
+
+/**
+ * Strategy for deciding whether a step's tool-call batch must run sequentially
+ * when an approval/suspend-capable tool is involved.
+ *
+ * - `'available'` (default): any approval/suspend tool available in the step
+ *   forces sequential execution, even if the model did not call it this step.
+ *   Conservative — preserves the historical default.
+ * - `'called'`: concurrency is resolved from the tools the model actually
+ *   called this step. A batch of only safe tools parallelizes even while an
+ *   approval/suspend tool stays registered; a batch that calls an
+ *   approval/suspend tool still runs sequentially. A run-wide
+ *   `requireToolApproval` policy still forces sequential.
+ */
+export type ToolCallConcurrencyStrategy = 'available' | 'called';
+
+/**
+ * Tool-call concurrency configuration.
+ *
+ * - `number`: the concurrency limit, using the default `'available'` strategy.
+ * - object: pick the `limit` and/or `strategy` explicitly.
+ */
+export type ToolCallConcurrency = number | { limit?: number; strategy?: ToolCallConcurrencyStrategy };
 
 /**
  * Goal configuration threaded into the loop, resolved from the agent's `goal`
@@ -93,6 +124,8 @@ export type StreamInternal = {
   resourceId?: string;
   /** @deprecated Use `runScope.get(MEMORY_KEY)` from `loop/run-scope-keys`. */
   memory?: MastraMemory; // MastraMemory from memory/memory
+  /** @deprecated Use `runScope.get(FIXED_MEMORY_KEY)` from `loop/run-scope-keys`. */
+  fixedMemory?: boolean;
   /** @deprecated Use `runScope.get(THREAD_EXISTS_KEY)` from `loop/run-scope-keys`. */
   threadExists?: boolean;
   // Tools modified by prepareStep/processInputStep - stored here to avoid workflow serialization
@@ -104,6 +137,18 @@ export type StreamInternal = {
   // Workspace from prepareStep/processInputStep - stored here to avoid workflow serialization
   /** @deprecated Use `runScope.get(STEP_WORKSPACE_KEY)` from `loop/run-scope-keys`. */
   stepWorkspace?: Workspace;
+  /** @deprecated Use `runScope.get(TOOL_APPROVAL_VERDICTS_KEY)` from `loop/run-scope-keys`. */
+  toolApprovalVerdicts?: Map<string, boolean>;
+  /** @deprecated Use `runScope.get(STEP_USAGE_KEY)` from `loop/run-scope-keys`. */
+  stepUsage?: LanguageModelUsage;
+  /** @deprecated Use `runScope.get(STEP_PROVIDER_METADATA_KEY)` from `loop/run-scope-keys`. */
+  stepProviderMetadata?: ProviderMetadata;
+  /** @deprecated Use `runScope.get(STEP_MODEL_MESSAGES_KEY)` from `loop/run-scope-keys`. */
+  stepModelMessages?: ModelMessage[];
+  /** @deprecated Use `runScope.get(STEP_RESPONSE_MESSAGE_ID_KEY)` from `loop/run-scope-keys`. */
+  stepResponseMessageId?: string;
+  /** @deprecated Use `runScope.get(EAGER_TOOL_EXECUTION_KEY)` from `loop/run-scope-keys`. */
+  eagerToolExecutionCoordinator?: import('./workflows/agentic-execution/eager-tool-execution').EagerToolExecutionCoordinator;
   // Set to true when a delegation hook calls ctx.bail() to signal the loop should stop
   /** @deprecated Use `runScope.get(DELEGATION_BAILED_KEY)` from `loop/run-scope-keys`. */
   _delegationBailed?: boolean;
@@ -129,6 +174,8 @@ export type StreamInternal = {
   skipBgTaskWait?: boolean;
   /** @deprecated Use `runScope.get(DRAIN_PENDING_SIGNALS_KEY)` from `loop/run-scope-keys`. */
   drainPendingSignals?: (runId: string, scope?: 'pending' | 'pre-run') => CreatedAgentSignal[];
+  /** @deprecated Use `runScope.get(SUBSCRIBE_PENDING_SIGNALS_KEY)` from `loop/run-scope-keys`. */
+  subscribePendingSignals?: (runId: string, listener: PendingSignalListener) => () => void;
   // Signal inputs already stored in the initial message list that still need
   // stream data-part echoes before the first model step.
   /** @deprecated Use `runScope.get(INITIAL_SIGNAL_ECHOES_KEY)` from `loop/run-scope-keys`. */
@@ -160,17 +207,58 @@ export type LoopConfig<OUTPUT = undefined> = {
   onError?: ({ error }: { error: Error | string }) => Promise<void> | void;
   onFinish?: MastraOnFinishCallback<OUTPUT>;
   onStepFinish?: MastraOnStepFinishCallback<OUTPUT>;
-  onAbort?: (event: any) => Promise<void> | void;
+  /**
+   * Called when the run is cancelled mid-stream. `steps` holds the steps that completed before the
+   * abort; `text` holds the assistant text streamed so far for the step that was in flight.
+   */
+  onAbort?: (event: { steps: any[]; text?: string }) => Promise<void> | void;
   abortSignal?: AbortSignal;
+  /**
+   * @internal The object this run's steps report themselves as running under: the signal the thread runtime prepared
+   * for the run. Later replacements of `abortSignal` — the publisher's signal, then a total timeout — are derived from
+   * it and the runtime never asks about those, so they must not stand in for it.
+   */
+  stepOwner?: object;
   returnScorerData?: boolean;
   prepareStep?: PrepareStepFunction;
 };
 
+/**
+ * A suspended `agentic-loop` run that the agent already claimed in storage
+ * (`suspended -> running`) before resuming it, so concurrent resumes of the
+ * same run cannot both execute the suspended tool.
+ * @internal
+ */
+export type AgentLoopResumeClaim = {
+  /** The suspended snapshot the claim was taken on. Absent when the store cannot claim atomically. */
+  snapshot?: WorkflowRunState;
+  /**
+   * Marks the claim started right before the resumed run executes. Throws when the claim was
+   * taken over in the meantime, in which case the run must not execute.
+   */
+  start?: () => Promise<void>;
+  /** Called right before the resumed run starts executing steps. */
+  onExecutionStarted?: () => void;
+  /** Ends the claim. Idempotent; hands the suspension back only if the run never started. */
+  release: () => Promise<void>;
+};
+
 export type LoopOptions<TOOLS extends ToolSet = ToolSet, OUTPUT = undefined> = {
+  /** @internal Live per-run tracing state, never part of step I/O or snapshots. */
+  tracingScope?: import('../mastra/run-scope').RunScope;
+  /** @internal End owned spans when the stream fails without a subsequent finish callback. */
+  onTracingTerminalError?: (error: Error) => void;
+  /** @internal Observes a terminal stream tripwire without invoking user lifecycle hooks. */
+  onTracingTripwire?: (
+    tripwire: import('../stream/types').StepTripwireData,
+    usage: import('../stream/types').LanguageModelUsage,
+    text: string,
+  ) => void;
   mastra?: Mastra;
   resumeContext?: {
     resumeData: any;
     snapshot: any;
+    claim?: AgentLoopResumeClaim;
   };
   toolCallId?: string;
   models: ModelManagerModelConfig[];
@@ -181,26 +269,24 @@ export type LoopOptions<TOOLS extends ToolSet = ToolSet, OUTPUT = undefined> = {
   toolCallStreaming?: boolean;
   messageList: MessageList;
   includeRawChunks?: boolean;
-  modelSettings?: Omit<CallSettings, 'abortSignal'> & {
-    /**
-     * Reasoning effort level for the model. Controls how much reasoning
-     * the model performs before generating a response.
-     *
-     * Only effective with LanguageModelV4 (AI SDK v7) model providers that support reasoning.
-     * When used with older model providers (V2/V3), this option is a no-op.
-     *
-     * @default undefined (provider default behavior)
-     */
-    reasoning?: ReasoningLevel;
-  };
+  experimentalTransform?: MastraStreamTransformOptions<OUTPUT>;
+  /** @internal Forwarded only to the caller-facing output. */
+  hideSignals?: boolean | AgentSignalType[];
+  modelSettings?: MastraModelSettings;
   toolChoice?: ToolChoice<TOOLS>;
   activeTools?: Array<keyof TOOLS>;
   options?: LoopConfig<OUTPUT>;
   providerOptions?: SharedProviderOptions;
   outputProcessors?: OutputProcessorOrWorkflow[];
   inputProcessors?: InputProcessorOrWorkflow[];
-  llmRequestInputProcessors?: InputProcessorOrWorkflow[];
+  llmRequestInputProcessors?: LLMRequestProcessorOrWorkflow[];
   errorProcessors?: ErrorProcessorOrWorkflow[];
+  /**
+   * Whether the caller configured error processors themselves (constructor or
+   * call-time), excluding framework-supplied defaults. Gates the implicit
+   * retry-cap warning so bare agents with only default processors stay quiet.
+   */
+  hasConfiguredErrorProcessors?: boolean;
   tools?: TOOLS;
   experimental_generateMessageId?: () => string;
   stopWhen?: StopCondition | Array<StopCondition>;
@@ -214,16 +300,35 @@ export type LoopOptions<TOOLS extends ToolSet = ToolSet, OUTPUT = undefined> = {
   requireToolApproval?: RequireToolApproval;
   autoResumeSuspendedTools?: boolean;
   agentId: string;
-  toolCallConcurrency?: number;
+  /**
+   * Exact stored version id this run resolved to, when the agent was resolved from a
+   * stored version. Persisted into suspend payloads so a resume re-resolves to the same
+   * version instead of whatever a status selector points at later.
+   */
+  agentVersionId?: string;
+  resolvedScopes?: string[];
+  toolCallConcurrency?: ToolCallConcurrency;
+  eagerToolExecution?: boolean;
+  /**
+   * @internal Aborts with the caller's signal and once more when the run ends. Run
+   * internals that must not outlive the run listen here instead of on `options.abortSignal`,
+   * which is the caller's own signal and may be reused across many runs.
+   */
+  runAbortSignal?: AbortSignal;
+  /** @internal Publishes the run's chunks on its agent stream topic for resumable readers. */
+  streamPublisher?: AgentStreamPublisher;
   agentName?: string;
   requestContext?: RequestContext;
   /** Trusted server-side signal for this loop's FGA checks. */
   actor?: ActorSignal;
+  /** MCP protocol context forwarded to tools executed by this loop. */
+  mcp?: MCPToolExecutionContext;
   methodType: ModelMethodType;
   /**
    * Maximum number of processor-triggered retries allowed for this generation.
    * Input/output processor retries require this to be explicitly set.
-   * Error processor retries from processAPIError default to 10 when errorProcessors are configured and this is not set.
+   * Error processor retries from processAPIError fall back to a safety cap of
+   * `DEFAULT_MAX_PROCESSOR_RETRIES` (3) when errorProcessors are configured and this is not set.
    */
   maxProcessorRetries?: number;
 
@@ -259,6 +364,8 @@ export type LoopOptions<TOOLS extends ToolSet = ToolSet, OUTPUT = undefined> = {
    * Keyed by processor ID.
    */
   processorStates?: Map<string, ProcessorState>;
+  /** The agent running this loop, passed to every processor hook as `agent`. */
+  agent?: Agent<any, any, any, any>;
 } & Partial<ObservabilityContext>;
 
 export type LoopRun<Tools extends ToolSet = ToolSet, OUTPUT = undefined> = LoopOptions<Tools, OUTPUT> & {
@@ -266,9 +373,10 @@ export type LoopRun<Tools extends ToolSet = ToolSet, OUTPUT = undefined> = LoopO
   runId: string;
   startTimestamp: number;
   _internal: StreamInternal;
-  rotateResponseMessageId: () => string;
+  rotateResponseMessageId: (sealMessageId?: string) => string;
   streamState: {
-    serialize: () => any;
+    /** Pass a suspension chunk the step just emitted so the state reflects it. */
+    serialize: (pendingSuspension?: { usage?: LanguageModelUsage }) => any;
     deserialize: (state: any) => void;
   };
   methodType: ModelMethodType;

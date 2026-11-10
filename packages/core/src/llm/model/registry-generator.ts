@@ -6,14 +6,18 @@
 import fs from 'node:fs/promises';
 import path from 'node:path';
 import { getCapabilityFileName } from './capability-file.js';
+import type { ProviderCapabilityFile } from './capability-file.js';
 import type {
   AttachmentCapabilities,
   MastraModelGatewayInterface,
   ProviderConfig,
+  ReasoningCapabilities,
   StructuredOutputCapabilities,
   TemperatureCapabilities,
 } from './gateways/base.js';
 import { getGatewayId, shouldEnableGateway } from './gateways/index.js';
+
+const WINDOWS_RENAME_RETRY_DELAYS_MS = [25, 50, 100, 200, 400];
 
 interface GatewayWithAttachmentCapabilities {
   getAttachmentCapabilities(): AttachmentCapabilities;
@@ -27,31 +31,32 @@ interface GatewayWithStructuredOutputCapabilities {
   getStructuredOutputCapabilities(): StructuredOutputCapabilities;
 }
 
+interface GatewayWithReasoningCapabilities {
+  getReasoningCapabilities(): ReasoningCapabilities;
+}
+
 function hasAttachmentCapabilities(
   gateway: MastraModelGatewayInterface,
 ): gateway is MastraModelGatewayInterface & GatewayWithAttachmentCapabilities {
-  return (
-    'getAttachmentCapabilities' in gateway &&
-    typeof (gateway as { getAttachmentCapabilities?: unknown }).getAttachmentCapabilities === 'function'
-  );
+  return 'getAttachmentCapabilities' in gateway && typeof gateway.getAttachmentCapabilities === 'function';
 }
 
 function hasTemperatureCapabilities(
   gateway: MastraModelGatewayInterface,
 ): gateway is MastraModelGatewayInterface & GatewayWithTemperatureCapabilities {
-  return (
-    'getTemperatureCapabilities' in gateway &&
-    typeof (gateway as { getTemperatureCapabilities?: unknown }).getTemperatureCapabilities === 'function'
-  );
+  return 'getTemperatureCapabilities' in gateway && typeof gateway.getTemperatureCapabilities === 'function';
 }
 
 function hasStructuredOutputCapabilities(
   gateway: MastraModelGatewayInterface,
 ): gateway is MastraModelGatewayInterface & GatewayWithStructuredOutputCapabilities {
-  return (
-    'getStructuredOutputCapabilities' in gateway &&
-    typeof (gateway as { getStructuredOutputCapabilities?: unknown }).getStructuredOutputCapabilities === 'function'
-  );
+  return 'getStructuredOutputCapabilities' in gateway && typeof gateway.getStructuredOutputCapabilities === 'function';
+}
+
+function hasReasoningCapabilities(
+  gateway: MastraModelGatewayInterface,
+): gateway is MastraModelGatewayInterface & GatewayWithReasoningCapabilities {
+  return 'getReasoningCapabilities' in gateway && typeof gateway.getReasoningCapabilities === 'function';
 }
 
 /**
@@ -78,9 +83,24 @@ export async function atomicWriteFile(
     // Write to temp file first
     await fs.writeFile(tempPath, content, encoding);
 
-    // Atomically rename temp file to target path
-    // This is atomic on POSIX when both paths are on the same filesystem
-    await fs.rename(tempPath, filePath);
+    // Atomically rename temp file to target path. Windows scanners can briefly
+    // lock the destination while the write is otherwise complete.
+    for (let attempt = 0; ; attempt += 1) {
+      try {
+        await fs.rename(tempPath, filePath);
+        break;
+      } catch (error) {
+        const delayMs = WINDOWS_RENAME_RETRY_DELAYS_MS[attempt];
+        const retryable =
+          process.platform === 'win32' &&
+          error instanceof Error &&
+          'code' in error &&
+          ((error as NodeJS.ErrnoException).code === 'EPERM' || (error as NodeJS.ErrnoException).code === 'EBUSY');
+
+        if (!retryable || delayMs === undefined) throw error;
+        await new Promise(resolve => setTimeout(resolve, delayMs));
+      }
+    }
   } catch (error) {
     // Clean up temp file if it exists
     try {
@@ -106,6 +126,7 @@ export async function fetchProvidersFromGateways(gateways: MastraModelGatewayInt
   attachmentCapabilities: AttachmentCapabilities;
   temperatureCapabilities: TemperatureCapabilities;
   structuredOutputCapabilities: StructuredOutputCapabilities;
+  reasoningCapabilities: ReasoningCapabilities;
   failedGateways: string[];
 }> {
   const enabledGateways: MastraModelGatewayInterface[] = [];
@@ -121,6 +142,7 @@ export async function fetchProvidersFromGateways(gateways: MastraModelGatewayInt
   const allAttachmentCapabilities: AttachmentCapabilities = {};
   const allTemperatureCapabilities: TemperatureCapabilities = {};
   const allStructuredOutputCapabilities: StructuredOutputCapabilities = {};
+  const allReasoningCapabilities: ReasoningCapabilities = {};
   const failedGateways: string[] = [];
 
   const maxRetries = 3;
@@ -157,6 +179,7 @@ export async function fetchProvidersFromGateways(gateways: MastraModelGatewayInt
     const gatewayStructuredOutputCaps = hasStructuredOutputCapabilities(gateway)
       ? gateway.getStructuredOutputCapabilities()
       : undefined;
+    const gatewayReasoningCaps = hasReasoningCapabilities(gateway) ? gateway.getReasoningCapabilities() : undefined;
 
     for (const [providerId, config] of Object.entries(providers)) {
       // For true gateways, use gateway id as prefix (e.g., "netlify/anthropic")
@@ -182,6 +205,9 @@ export async function fetchProvidersFromGateways(gateways: MastraModelGatewayInt
       if (gatewayStructuredOutputCaps?.[providerId]) {
         allStructuredOutputCapabilities[typeProviderId] = gatewayStructuredOutputCaps[providerId];
       }
+      if (gatewayReasoningCaps?.[providerId]) {
+        allReasoningCapabilities[typeProviderId] = gatewayReasoningCaps[providerId];
+      }
     }
   }
 
@@ -191,6 +217,7 @@ export async function fetchProvidersFromGateways(gateways: MastraModelGatewayInt
     attachmentCapabilities: allAttachmentCapabilities,
     temperatureCapabilities: allTemperatureCapabilities,
     structuredOutputCapabilities: allStructuredOutputCapabilities,
+    reasoningCapabilities: allReasoningCapabilities,
     failedGateways,
   };
 }
@@ -223,6 +250,11 @@ export function generateTypesContent(models: Record<string, string[]>): string {
     })
     .join('\n');
 
+  // The Provider / ModelForProvider / ModelRouterModelId types emitted below cover
+  // the built-in providers only. The public, augmentable versions live in
+  // `src/llm/index.ts`, which re-derives them from the `ProviderModelsMap`
+  // interface so custom gateways can extend them. Keep the two in sync, and
+  // import from `@mastra/core/llm` rather than from the generated file.
   return `/**
  * THIS FILE IS AUTO-GENERATED - DO NOT EDIT
  * Generated from model gateway providers
@@ -284,6 +316,7 @@ export async function writeRegistryFiles(
   attachmentCapabilities?: AttachmentCapabilities,
   temperatureCapabilities?: TemperatureCapabilities,
   structuredOutputCapabilities?: StructuredOutputCapabilities,
+  reasoningCapabilities?: ReasoningCapabilities,
 ): Promise<void> {
   // 0. Ensure directories exist
   const jsonDir = path.dirname(jsonPath);
@@ -305,15 +338,17 @@ export async function writeRegistryFiles(
   await atomicWriteFile(typesPath, typeContent, 'utf-8');
 
   // 3. Write per-provider capability files into a capabilities/ directory
+  const capDir = path.join(jsonDir, 'capabilities');
   const hasCapabilities =
     (attachmentCapabilities && Object.keys(attachmentCapabilities).length > 0) ||
     (temperatureCapabilities && Object.keys(temperatureCapabilities).length > 0) ||
-    (structuredOutputCapabilities && Object.keys(structuredOutputCapabilities).length > 0);
-  if (hasCapabilities) {
-    const capDir = path.join(jsonDir, 'capabilities');
+    (structuredOutputCapabilities && Object.keys(structuredOutputCapabilities).length > 0) ||
+    (reasoningCapabilities && Object.keys(reasoningCapabilities).length > 0);
 
-    // Replace the directory so stale files and legacy nested gateway paths are removed.
-    await fs.rm(capDir, { recursive: true, force: true });
+  // Remove stale files even when the latest registry has no capability data.
+  await fs.rm(capDir, { recursive: true, force: true });
+
+  if (hasCapabilities) {
     await fs.mkdir(capDir, { recursive: true });
 
     // Build a merged capability object per provider
@@ -321,15 +356,17 @@ export async function writeRegistryFiles(
       ...(attachmentCapabilities ? Object.keys(attachmentCapabilities) : []),
       ...(temperatureCapabilities ? Object.keys(temperatureCapabilities) : []),
       ...(structuredOutputCapabilities ? Object.keys(structuredOutputCapabilities) : []),
+      ...(reasoningCapabilities ? Object.keys(reasoningCapabilities) : []),
     ]);
 
     for (const provider of allProviderIds) {
-      const capData: Record<string, string[]> = {};
+      const capData: ProviderCapabilityFile = {};
       if (attachmentCapabilities?.[provider]) capData.attachment = attachmentCapabilities[provider];
       if (temperatureCapabilities?.[provider]) capData.temperature = temperatureCapabilities[provider];
       if (structuredOutputCapabilities?.[provider]) {
         capData.structuredOutput = structuredOutputCapabilities[provider];
       }
+      if (reasoningCapabilities?.[provider]) capData.reasoning = reasoningCapabilities[provider];
 
       const providerFile = path.join(capDir, getCapabilityFileName(provider));
       await atomicWriteFile(providerFile, JSON.stringify(capData, null, 2), 'utf-8');

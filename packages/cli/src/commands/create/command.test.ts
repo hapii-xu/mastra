@@ -23,6 +23,7 @@ function createOptions(overrides: Partial<NormalizedCreateOptions> = {}): Normal
     git: true,
     template: undefined,
     timeout: 60_000,
+    install: true,
     ...overrides,
   };
 }
@@ -65,7 +66,9 @@ async function parseSubcommand(args: string[], onAction = vi.fn()) {
 
 describe('create option parsing', () => {
   it('rejects providers outside the create-specific provider set', () => {
-    expect(() => parseCreateLLMProvider('groq')).toThrow('Choose a valid provider: openai, anthropic, google, xai');
+    expect(() => parseCreateLLMProvider('groq')).toThrow(
+      'Choose a valid provider: mastra, openai, anthropic, google, xai',
+    );
   });
 
   it.each([
@@ -144,6 +147,14 @@ describe('create option validation', () => {
 });
 
 describe('shared create Commander wiring', () => {
+  it('documents incompatible creation mode options in help output', () => {
+    const help = createRoot(vi.fn()).helpInformation().replaceAll(/\s+/g, ' ');
+
+    expect(help).toContain('cannot be used with --template, --llm, or --llm-api-key');
+    expect(help).toContain('cannot be used with --empty or --template');
+    expect(help).toContain('-l, --llm <provider>');
+  });
+
   it('applies the create defaults', async () => {
     const action = vi.fn();
     await parseRoot(['project'], action);
@@ -157,6 +168,7 @@ describe('shared create Commander wiring', () => {
       git: true,
       template: undefined,
       timeout: 60_000,
+      install: true,
     });
   });
 
@@ -187,8 +199,26 @@ describe('shared create Commander wiring', () => {
       git: false,
       template: undefined,
       timeout: 12_345,
+      install: true,
     });
     expect(subAction.mock.calls[0]?.[0]).toEqual(rootAction.mock.calls[0]?.[0]);
+  });
+
+  it('parses --no-install option', async () => {
+    const action = vi.fn();
+    await parseRoot(['project', '--no-install'], action);
+
+    expect(action).toHaveBeenCalledWith({
+      projectName: 'project',
+      empty: false,
+      llmProvider: undefined,
+      llmApiKey: undefined,
+      skills: true,
+      git: true,
+      template: undefined,
+      timeout: 60_000,
+      install: false,
+    });
   });
 });
 

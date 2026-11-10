@@ -27,20 +27,25 @@ Rules:
 - Fixtures MUST be typed with response types re-exported from `@mastra/client-js`
   and live in a nearby `__tests__/fixtures/` folder. No `as any`, no bespoke
   inline types.
+- **Exception**: the end-user connect surface (`/connect/*` routes mounted by
+  `userConnectRoutes()`) is not part of the `@mastra/client-js` SDK. Its
+  fixtures are typed with the route-contract types exported from
+  `@mastra/playground-ui/domains/connect` instead.
 
 ## Commands
 
 ### Local Commands (run from `packages/playground`)
 
 - `pnpm dev`: Start Vite development server
+- `pnpm dev:bundled`: Same, in Vite's experimental bundled dev mode (~50 requests per page instead of ~1,900; much faster when the browser is on another machine)
 - `pnpm build`: Build the playground with Vite
 - `pnpm build:watch`: Build in watch mode
 - `pnpm preview`: Preview the production build
-- `pnpm lint`: Run ESLint
+- `pnpm lint`: Run oxlint
 
 ### Root Commands (run from monorepo root)
 
-- `pnpm dev:playground`: Start dev servers for playground, playground-ui, and react client SDK
+- `pnpm dev:playground:full`: Start dev servers for playground, playground-ui, and react client SDK
 - `pnpm build:cli`: Build the CLI (includes playground and playground-ui as dependencies)
 
 ## Package Architecture

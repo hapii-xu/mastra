@@ -1,8 +1,7 @@
 import { createPrivateKey, generateKeyPairSync } from 'node:crypto';
-import { describe, expect, it, vi } from 'vitest';
+import { describe, expect, it, vi, afterEach } from 'vitest';
 
 import { fakeRouteAuth } from '../../routes/test-utils.js';
-import { SandboxFleet } from '../../sandbox/fleet.js';
 import { createStateSigner } from '../../state-signing.js';
 import { createFactoryStorageForTests } from '../../storage/test-utils.js';
 import { GithubIntegration, normalizePrivateKey } from './integration.js';
@@ -79,12 +78,36 @@ describe('normalizePrivateKey', () => {
 });
 
 describe('GithubIntegration constructor', () => {
+  it('isolates frozen event handlers between installations and caller mutations', () => {
+    const handler = vi.fn();
+    const rules = { issueOpened: handler, issueClosed: null };
+    const first = new GithubIntegration({ ...validConfig(), rules });
+    rules.issueOpened = vi.fn();
+    const second = new GithubIntegration(validConfig());
+    expect(first.rules.issueOpened).toBe(handler);
+    expect(first.rules.issueClosed).toBeNull();
+    expect(second.rules.issueOpened).not.toBe(handler);
+    expect(second.rules.issueClosed).toBeTypeOf('function');
+    expect(Object.isFrozen(first.rules)).toBe(true);
+    expect(first.rules).not.toBe(second.rules);
+  });
+
+  it('rejects invalid event overrides at construction', () => {
+    // @ts-expect-error Verify JavaScript configuration validation.
+    expect(() => new GithubIntegration({ ...validConfig(), rules: { issueOpened: false } })).toThrow();
+  });
   it('constructs from a full config', () => {
     const github = new GithubIntegration(validConfig());
     expect(github.id).toBe('github');
     expect(github.requiresStableStateSigner).toBe(true);
     expect(github.slug).toBe('test-app');
     expect(github.webhookSecret).toBe('hook-secret');
+  });
+
+  it('matches its App comment author case-insensitively', () => {
+    const github = new GithubIntegration(validConfig());
+    expect(github.isFactoryCommentAuthor('TEST-APP[bot]')).toBe(true);
+    expect(github.isFactoryCommentAuthor('person')).toBe(false);
   });
 
   it('throws listing every missing required field', () => {
@@ -99,6 +122,344 @@ describe('GithubIntegration constructor', () => {
   it('normalizes an \\n-escaped private key at construction', () => {
     const escaped = pem.replace(/\n/g, '\\n');
     expect(() => new GithubIntegration({ ...validConfig(), privateKey: escaped })).not.toThrow();
+  });
+});
+
+describe('GithubIntegration collaborator permission', () => {
+  it('reuses a resolved permission per installation, repo, and login; failures are retried', async () => {
+    const github = new GithubIntegration(validConfig());
+    const getCollaboratorPermissionLevel = vi
+      .fn()
+      .mockResolvedValueOnce({ data: { permission: 'write' } })
+      .mockRejectedValueOnce(new Error('rate limited'))
+      .mockResolvedValueOnce({ data: { permission: 'read' } });
+    vi.spyOn(github, 'getInstallationOctokit').mockReturnValue({
+      repos: { getCollaboratorPermissionLevel },
+    } as any);
+
+    await expect(github.getRepositoryCollaboratorPermission(7, 'acme/app', 'Grace')).resolves.toBe('write');
+    await expect(github.getRepositoryCollaboratorPermission(7, 'acme/app', 'grace')).resolves.toBe('write');
+    expect(getCollaboratorPermissionLevel).toHaveBeenCalledTimes(1);
+
+    await expect(github.getRepositoryCollaboratorPermission(7, 'acme/app', 'hank')).resolves.toBeUndefined();
+    await expect(github.getRepositoryCollaboratorPermission(7, 'acme/app', 'hank')).resolves.toBe('read');
+    expect(getCollaboratorPermissionLevel).toHaveBeenCalledTimes(3);
+
+    // The entry expires: a lookup after the TTL goes back to GitHub.
+    vi.useFakeTimers();
+    try {
+      vi.advanceTimersByTime(31 * 60_000);
+      getCollaboratorPermissionLevel.mockResolvedValueOnce({ data: { permission: 'none' } });
+      await expect(github.getRepositoryCollaboratorPermission(7, 'acme/app', 'grace')).resolves.toBe('none');
+      expect(getCollaboratorPermissionLevel).toHaveBeenCalledTimes(4);
+    } finally {
+      vi.useRealTimers();
+    }
+
+    // A different installation is a different token and a different answer.
+    await github.getRepositoryCollaboratorPermission(8, 'acme/app', 'grace');
+    expect(getCollaboratorPermissionLevel).toHaveBeenCalledTimes(5);
+  });
+});
+
+describe('GithubIntegration installation Octokit', () => {
+  afterEach(() => {
+    vi.useRealTimers();
+    vi.unstubAllGlobals();
+  });
+
+  /** Stubbed GitHub API: counts token mints and answers 401 for revoked tokens. */
+  function stubGithubApi() {
+    const revoked = new Set<string>();
+    const minted: string[] = [];
+    const json = (status: number, body: unknown) =>
+      new Response(JSON.stringify(body), { status, headers: { 'content-type': 'application/json' } });
+    vi.stubGlobal(
+      'fetch',
+      vi.fn(async (url: string, init?: RequestInit) => {
+        if (url.endsWith('/app/installations/7/access_tokens')) {
+          const token = `ghs_${minted.length + 1}`;
+          minted.push(token);
+          return json(201, {
+            token,
+            expires_at: new Date(Date.now() + 60 * 60_000).toISOString(),
+            permissions: { metadata: 'read' },
+            repository_selection: 'all',
+          });
+        }
+        const token = new Headers(init?.headers).get('authorization')?.replace(/^token /, '') ?? '';
+        if (revoked.has(token)) return json(401, { message: 'Bad credentials' });
+        return json(200, { total_count: 0, repositories: [] });
+      }),
+    );
+    return { minted, revoked };
+  }
+
+  it('reuses one client and token across calls for the same installation', async () => {
+    const { minted } = stubGithubApi();
+    const github = new GithubIntegration(validConfig());
+
+    await github.getInstallationOctokit(7).apps.listReposAccessibleToInstallation();
+    await github.getInstallationOctokit(7).apps.listReposAccessibleToInstallation();
+
+    expect(github.getInstallationOctokit(7)).toBe(github.getInstallationOctokit(7));
+    expect(minted).toEqual(['ghs_1']);
+  });
+
+  it('mints a fresh token after GitHub rejects the cached one', async () => {
+    const { minted, revoked } = stubGithubApi();
+    const github = new GithubIntegration(validConfig());
+    await github.getInstallationOctokit(7).apps.listReposAccessibleToInstallation();
+
+    // Past auth-app's 5 s replication retry window, so the 401 surfaces.
+    vi.useFakeTimers({ toFake: ['Date'], now: Date.now() + 10_000 });
+    revoked.add('ghs_1');
+    await expect(github.getInstallationOctokit(7).apps.listReposAccessibleToInstallation()).rejects.toMatchObject({
+      status: 401,
+    });
+
+    await github.getInstallationOctokit(7).apps.listReposAccessibleToInstallation();
+    expect(minted).toEqual(['ghs_1', 'ghs_2']);
+  });
+});
+
+describe('GithubIntegration.getInstallationRepo', () => {
+  afterEach(() => {
+    vi.unstubAllGlobals();
+  });
+
+  function stubRepoApi() {
+    const json = (status: number, body: unknown) =>
+      new Response(JSON.stringify(body), { status, headers: { 'content-type': 'application/json' } });
+    const repoRequests: string[] = [];
+    vi.stubGlobal(
+      'fetch',
+      vi.fn(async (url: string) => {
+        if (url.endsWith('/app/installations/7/access_tokens')) {
+          return json(201, {
+            token: 'ghs_1',
+            expires_at: new Date(Date.now() + 60 * 60_000).toISOString(),
+            permissions: { metadata: 'read' },
+            repository_selection: 'all',
+          });
+        }
+        const path = new URL(url).pathname;
+        repoRequests.push(path);
+        const repo = (fullName: string, isPrivate: boolean) => {
+          const [owner, name] = fullName.split('/');
+          return json(200, {
+            id: 456,
+            full_name: fullName,
+            name,
+            owner: { login: owner },
+            default_branch: 'main',
+            private: isPrivate,
+          });
+        };
+        // Installation 7 was granted acme/api only; acme/public is public but outside the grant,
+        // and other/public belongs to a different installation.
+        if (path === '/repos/acme/api/installation') return json(200, { id: 7 });
+        if (path === '/repos/other/public/installation') return json(200, { id: 9 });
+        if (path === '/repos/acme/boom/installation') return json(200, { id: 7 });
+        if (path.endsWith('/installation')) return json(404, { message: 'Not Found' });
+        if (path === '/repos/acme/api') return repo('acme/api', true);
+        if (path === '/repos/acme/public') return repo('acme/public', false);
+        if (path === '/repos/other/public') return repo('other/public', false);
+        if (path === '/repos/acme/gone') return json(404, { message: 'Not Found' });
+        return json(500, { message: 'Server Error' });
+      }),
+    );
+    return repoRequests;
+  }
+
+  it('reads one repository and its installation in a single round trip', async () => {
+    const repoRequests = stubRepoApi();
+    const github = new GithubIntegration(validConfig());
+
+    await expect(github.getInstallationRepo(7, 'acme/api')).resolves.toEqual({
+      id: 456,
+      fullName: 'acme/api',
+      name: 'api',
+      owner: 'acme',
+      defaultBranch: 'main',
+      private: true,
+      installationId: 7,
+    });
+    expect(repoRequests.sort()).toEqual(['/repos/acme/api', '/repos/acme/api/installation']);
+  });
+
+  it('returns null for a public repository the installation was not granted', async () => {
+    stubRepoApi();
+    const github = new GithubIntegration(validConfig());
+
+    await expect(github.getInstallationRepo(7, 'acme/public')).resolves.toBeNull();
+    await expect(github.getInstallationRepo(7, 'other/public')).resolves.toBeNull();
+  });
+
+  it('returns null when the installation cannot see the repository, and throws on upstream failures', async () => {
+    stubRepoApi();
+    const github = new GithubIntegration(validConfig());
+
+    await expect(github.getInstallationRepo(7, 'acme/gone')).resolves.toBeNull();
+    await expect(github.getInstallationRepo(7, 'acme/boom')).rejects.toMatchObject({ status: 500 });
+  });
+});
+
+describe('GithubIntegration collaborator permission coalescing', () => {
+  it('shares one in-flight request between overlapping lookups for the same login', async () => {
+    const github = new GithubIntegration(validConfig());
+    let release!: (value: { data: { permission: string } }) => void;
+    const getCollaboratorPermissionLevel = vi.fn(() => new Promise(resolve => (release = resolve)));
+    vi.spyOn(github, 'getInstallationOctokit').mockReturnValue({
+      repos: { getCollaboratorPermissionLevel },
+    } as any);
+
+    const first = github.getRepositoryCollaboratorPermission(7, 'acme/app', 'grace');
+    const second = github.getRepositoryCollaboratorPermission(7, 'acme/app', 'grace');
+    expect(getCollaboratorPermissionLevel).toHaveBeenCalledTimes(1);
+    release({ data: { permission: 'write' } });
+    await expect(Promise.all([first, second])).resolves.toEqual(['write', 'write']);
+    expect(getCollaboratorPermissionLevel).toHaveBeenCalledTimes(1);
+  });
+});
+
+describe('GithubIntegration collaborator permission cancellation', () => {
+  it("keeps a coalesced lookup alive for other callers when one caller's signal aborts", async () => {
+    const github = new GithubIntegration(validConfig());
+    let release!: (value: { data: { permission: string } }) => void;
+    const getCollaboratorPermissionLevel = vi.fn(() => new Promise(resolve => (release = resolve)));
+    vi.spyOn(github, 'getInstallationOctokit').mockReturnValue({
+      repos: { getCollaboratorPermissionLevel },
+    } as any);
+    const aborter = new AbortController();
+
+    const aborted = github.getRepositoryCollaboratorPermission(7, 'acme/app', 'grace', aborter.signal);
+    const patient = github.getRepositoryCollaboratorPermission(7, 'acme/app', 'grace');
+    aborter.abort();
+    await expect(aborted).resolves.toBeUndefined();
+
+    release({ data: { permission: 'write' } });
+    await expect(patient).resolves.toBe('write');
+    expect(getCollaboratorPermissionLevel).toHaveBeenCalledTimes(1);
+    const [request] = getCollaboratorPermissionLevel.mock.calls[0] as unknown as [{ request: { signal: AbortSignal } }];
+    expect(request.request.signal).not.toBe(aborter.signal);
+    expect(request.request.signal.aborted).toBe(false);
+  });
+});
+
+describe('GithubIntegration triage comment upsert', () => {
+  it('updates the oldest Factory marker across pages and ignores human marker comments', async () => {
+    const github = new GithubIntegration(validConfig());
+    const listComments = vi
+      .fn()
+      .mockResolvedValueOnce({
+        data: [
+          {
+            id: 20,
+            body: '<!-- mastra-factory-triage --> human quote',
+            user: { login: 'person' },
+            html_url: 'https://github.com/acme/app/issues/7#issuecomment-20',
+          },
+          {
+            id: 30,
+            body: '<!-- mastra-factory-triage --> newer',
+            user: { login: 'test-app[bot]' },
+            html_url: 'https://github.com/acme/app/issues/7#issuecomment-30',
+          },
+          ...Array.from({ length: 98 }, (_, index) => ({
+            id: 100 + index,
+            body: 'unmarked',
+            user: { login: 'person' },
+            html_url: `https://github.com/acme/app/issues/7#issuecomment-${100 + index}`,
+          })),
+        ],
+      })
+      .mockResolvedValueOnce({
+        data: [
+          {
+            id: 10,
+            body: '<!-- mastra-factory-triage --> oldest',
+            user: { login: 'TEST-APP[bot]' },
+            html_url: 'https://github.com/acme/app/issues/7#issuecomment-10',
+          },
+        ],
+      });
+    const updateComment = vi.fn(async () => ({
+      data: { id: 10, html_url: 'https://github.com/acme/app/issues/7#issuecomment-10' },
+    }));
+    const createComment = vi.fn();
+    vi.spyOn(github, 'getInstallationOctokit').mockReturnValue({
+      issues: { listComments, updateComment, createComment },
+    } as any);
+
+    await expect(
+      github.upsertFactoryTriageComment({
+        installationId: 7,
+        repository: 'acme/app',
+        issueNumber: 7,
+        body: '<!-- mastra-factory-triage -->\nFinal',
+      }),
+    ).resolves.toEqual({
+      action: 'updated',
+      commentId: '10',
+      url: 'https://github.com/acme/app/issues/7#issuecomment-10',
+    });
+
+    expect(listComments).toHaveBeenNthCalledWith(1, {
+      owner: 'acme',
+      repo: 'app',
+      issue_number: 7,
+      per_page: 100,
+      page: 1,
+    });
+    expect(listComments).toHaveBeenNthCalledWith(2, {
+      owner: 'acme',
+      repo: 'app',
+      issue_number: 7,
+      per_page: 100,
+      page: 2,
+    });
+    expect(updateComment).toHaveBeenCalledWith({
+      owner: 'acme',
+      repo: 'app',
+      comment_id: 10,
+      body: '<!-- mastra-factory-triage -->\nFinal',
+    });
+    expect(createComment).not.toHaveBeenCalled();
+  });
+
+  it('creates a marker comment when no Factory-authored marker exists', async () => {
+    const github = new GithubIntegration(validConfig());
+    const listComments = vi.fn(async () => ({
+      data: [{ id: 9, body: '<!-- mastra-factory-triage --> quoted', user: { login: 'person' } }],
+    }));
+    const createComment = vi.fn(async () => ({
+      data: { id: 42, html_url: 'https://github.com/acme/app/issues/7#issuecomment-42' },
+    }));
+    const updateComment = vi.fn();
+    vi.spyOn(github, 'getInstallationOctokit').mockReturnValue({
+      issues: { listComments, updateComment, createComment },
+    } as any);
+
+    await expect(
+      github.upsertFactoryTriageComment({
+        installationId: 7,
+        repository: 'acme/app',
+        issueNumber: 7,
+        body: '<!-- mastra-factory-triage -->\nPending',
+      }),
+    ).resolves.toEqual({
+      action: 'created',
+      commentId: '42',
+      url: 'https://github.com/acme/app/issues/7#issuecomment-42',
+    });
+    expect(createComment).toHaveBeenCalledWith({
+      owner: 'acme',
+      repo: 'app',
+      issue_number: 7,
+      body: '<!-- mastra-factory-triage -->\nPending',
+    });
+    expect(updateComment).not.toHaveBeenCalled();
   });
 });
 
@@ -444,7 +805,9 @@ describe('GithubIntegration FactoryIntegration surface', () => {
     const github = new GithubIntegration(validConfig());
     const routes = github.routes({
       auth: fakeRouteAuth(),
-      fleet: new SandboxFleet(),
+      // Only presence is read here (`!!sandbox` gates route mounting); the
+      // callback is never invoked by this test.
+      sandbox: (() => ({})) as never,
       stateSigner: createStateSigner('secret'),
       storage: {
         generic: integrations.forIntegration(github.id),
@@ -559,5 +922,161 @@ describe('GithubIntegration FactoryIntegration surface', () => {
         }),
       ).resolves.toBeNull();
     });
+  });
+});
+
+describe('GithubIntegration merge reconciler', () => {
+  it('maps a merged pull request to a closed reconcile state', async () => {
+    const github = new GithubIntegration(validConfig());
+    const get = vi.fn(async () => ({ data: { ...pullRequestData(), state: 'closed', merged: true } }));
+    vi.spyOn(github, 'getInstallationOctokit').mockReturnValue({ pulls: { get } } as any);
+
+    await expect(
+      github.fetchPullRequestState({ installationId: 7, repository: 'acme/app', number: 34 }),
+    ).resolves.toEqual({
+      title: 'Ship intake',
+      url: 'https://github.com/acme/app/pull/34',
+      state: 'closed',
+      draft: false,
+      merged: true,
+      assignees: [],
+      requestedReviewers: [],
+      labels: [],
+      headBranch: 'feat/intake',
+      baseBranch: 'main',
+      author: 'ada',
+      createdAt: '2026-07-01T00:00:00Z',
+    });
+  });
+
+  // A fabricated merge would move a card to done and fire merge rules.
+  it('returns undefined rather than a state when the pull request cannot be read', async () => {
+    const github = new GithubIntegration(validConfig());
+    const get = vi.fn(async () => {
+      throw new Error('bad credentials');
+    });
+    vi.spyOn(github, 'getInstallationOctokit').mockReturnValue({ pulls: { get } } as any);
+
+    await expect(
+      github.fetchPullRequestState({ installationId: 7, repository: 'acme/app', number: 34 }),
+    ).resolves.toBeUndefined();
+  });
+});
+
+describe('GithubIntegration OAuth', () => {
+  it('allows 30 seconds for the OAuth token exchange', async () => {
+    const github = new GithubIntegration(validConfig());
+    const timeout = vi.spyOn(AbortSignal, 'timeout');
+    const fetch = vi
+      .spyOn(globalThis, 'fetch')
+      .mockResolvedValue(new Response(JSON.stringify({ access_token: 'user-token' }), { status: 200 }));
+
+    await expect(github.exchangeOAuthCode('code', 'https://example.com/auth/github/callback')).resolves.toBe(
+      'user-token',
+    );
+    expect(timeout).toHaveBeenCalledWith(10_000);
+
+    timeout.mockRestore();
+    fetch.mockRestore();
+  });
+});
+
+describe('GithubIntegration open issue discovery', () => {
+  const openIssue = (number: number) => ({
+    number,
+    title: `Issue ${number}`,
+    html_url: `https://github.com/acme/api/issues/${number}`,
+    state: 'open',
+    assignees: [{ login: 'ada' }],
+    labels: ['bug', { name: 'triage' }],
+    user: { login: 'grace' },
+    created_at: '2026-10-01T00:00:00Z',
+    updated_at: '2026-10-02T00:00:00Z',
+  });
+
+  it('lists open issues without pull requests, following pages until a short page', async () => {
+    const github = new GithubIntegration(validConfig());
+    const fullPage = Array.from({ length: 100 }, (_, index) => openIssue(index + 1));
+    const listForRepo = vi
+      .fn()
+      .mockResolvedValueOnce({ data: fullPage })
+      .mockResolvedValueOnce({ data: [openIssue(101), { ...openIssue(102), pull_request: {} }] });
+    vi.spyOn(github, 'getInstallationOctokit').mockReturnValue({ issues: { listForRepo } } as any);
+
+    const issues = await github.listOpenIssueStates({ installationId: 7, repository: 'acme/api' });
+
+    expect(listForRepo).toHaveBeenCalledTimes(2);
+    expect(listForRepo).toHaveBeenLastCalledWith({ owner: 'acme', repo: 'api', state: 'open', per_page: 100, page: 2 });
+    expect(issues).toHaveLength(101);
+    expect(issues.at(-1)).toEqual({
+      number: 101,
+      title: 'Issue 101',
+      url: 'https://github.com/acme/api/issues/101',
+      state: 'open',
+      assignees: ['ada'],
+      labels: ['bug', 'triage'],
+      author: 'grace',
+      createdAt: '2026-10-01T00:00:00Z',
+      updatedAt: '2026-10-02T00:00:00Z',
+    });
+  });
+
+  it('stops after five pages', async () => {
+    const github = new GithubIntegration(validConfig());
+    const fullPage = Array.from({ length: 100 }, (_, index) => openIssue(index + 1));
+    const listForRepo = vi.fn().mockResolvedValue({ data: fullPage });
+    vi.spyOn(github, 'getInstallationOctokit').mockReturnValue({ issues: { listForRepo } } as any);
+
+    await github.listOpenIssueStates({ installationId: 7, repository: 'acme/api' });
+
+    expect(listForRepo).toHaveBeenCalledTimes(5);
+  });
+});
+
+describe('GithubIntegration workers', () => {
+  const originalEnv = { ...process.env };
+
+  function context() {
+    return {
+      controller: {},
+      storage: {
+        generic: {},
+        sourceControl: {
+          projectRepositories: { listConfiguredExternalKeys: async () => [], listByExternalRepository: async () => [] },
+          repositories: { findByExternalId: async () => null },
+        },
+        projects: { listAll: async () => [] },
+        intake: {},
+      },
+      runtime: { configVersion: 'test-v1', workItems: {} },
+    } as any;
+  }
+
+  afterEach(() => {
+    for (const key of Object.keys(process.env)) {
+      if (!(key in originalEnv)) delete process.env[key];
+    }
+    Object.assign(process.env, originalEnv);
+  });
+
+  it('registers a single reconcile worker that folds PR and issue sweeps', () => {
+    const github = new GithubIntegration(validConfig());
+    expect(github.workers(context()).map(worker => worker.name)).toEqual(['github-pull-request-reconcile']);
+  });
+
+  it('allows issue reconciliation when legacy reconciliation is disabled', () => {
+    process.env.MASTRACODE_GITHUB_RECONCILE_ENABLED = 'false';
+    process.env.MASTRACODE_GITHUB_ISSUE_RECONCILE_ENABLED = 'true';
+    const github = new GithubIntegration(validConfig());
+
+    expect(github.workers(context()).map(worker => worker.name)).toEqual(['github-pull-request-reconcile']);
+  });
+
+  it('does not register a worker when both child reconcilers are disabled', () => {
+    process.env.MASTRACODE_GITHUB_PR_RECONCILE_ENABLED = 'false';
+    process.env.MASTRACODE_GITHUB_ISSUE_RECONCILE_ENABLED = 'false';
+    const github = new GithubIntegration(validConfig());
+
+    expect(github.workers(context())).toEqual([]);
   });
 });

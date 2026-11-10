@@ -1,6 +1,7 @@
+import { existsSync } from 'node:fs';
 import { writeFile } from 'node:fs/promises';
 import { builtinModules } from 'node:module';
-import { join, relative } from 'node:path';
+import { dirname, join, relative } from 'node:path';
 import { Deployer } from '@mastra/deployer';
 import type { analyzeBundle } from '@mastra/deployer/analyze';
 import type { BundlerOptions } from '@mastra/deployer/bundler';
@@ -27,6 +28,22 @@ function nodeBuiltinsExternal(): Plugin {
       return null;
     },
   };
+}
+
+/**
+ * Whether a package is in a node_modules directory at or above `fromDirectory`, which is where
+ * wrangler looks for it. Node's own resolution isn't used because it also searches NODE_PATH,
+ * which pnpm sets for package binaries like `mastra build`.
+ */
+function isInstalled(packageName: string, fromDirectory: string): boolean {
+  for (let dir = fromDirectory; ; dir = dirname(dir)) {
+    if (existsSync(join(dir, 'node_modules', packageName, 'package.json'))) {
+      return true;
+    }
+    if (dirname(dir) === dir) {
+      return false;
+    }
+  }
 }
 
 /** @deprecated */
@@ -166,9 +183,38 @@ export default stream;
 `;
     await writeFile(join(outputDirectory, this.outputDir, readableStreamStubPath), readableStreamStub);
 
+    // Write module stub — Wrangler runs Workers with an undefined import.meta.url,
+    // so eager createRequire(import.meta.url) interop helpers must not call Node's implementation.
+    const moduleStubPath = 'module-stub.mjs';
+    const moduleStub = `// Stub for module.createRequire in Cloudflare Workers
+export function createRequire() {
+  const req = specifier => {
+    throw new Error(\`require(\${specifier}) is not available in Cloudflare Workers\`);
+  };
+  req.resolve = specifier => specifier;
+  return req;
+}
+export default { createRequire };
+`;
+    await writeFile(join(outputDirectory, this.outputDir, moduleStubPath), moduleStub);
+
+    // posthog-node (a @mastra/core dependency) lazily imports its optional peer @opentelemetry/api.
+    // Wrangler bundles every import it finds, so the build fails when the peer isn't installed.
+    // Point it at a module that fails to load, which is how the optional import expects a missing peer to behave.
+    const otelApiStubPath = 'opentelemetry-api-stub.mjs';
+    const stubOtelApi =
+      !userAlias?.['@opentelemetry/api'] && !isInstalled('@opentelemetry/api', join(outputDirectory, this.outputDir));
+    if (stubOtelApi) {
+      const otelApiStub = `// Stub for the optional @opentelemetry/api peer, which isn't installed in this project
+throw new Error('@opentelemetry/api is not installed');
+`;
+      await writeFile(join(outputDirectory, this.outputDir, otelApiStubPath), otelApiStub);
+    }
+
     const wranglerConfig: Unstable_RawConfig = {
       name: 'mastra',
-      compatibility_date: '2025-04-01',
+      // WeakRef and FinalizationRegistry are available from this date.
+      compatibility_date: '2025-05-05',
       compatibility_flags: ['nodejs_compat', 'nodejs_compat_populate_process_env'],
       observability: {
         logs: {
@@ -183,6 +229,9 @@ export default stream;
         typescript: `./${typescriptStubPath}`,
         execa: `./${execaStubPath}`,
         'readable-stream': `./${readableStreamStubPath}`,
+        module: `./${moduleStubPath}`,
+        'node:module': `./${moduleStubPath}`,
+        ...(stubOtelApi ? { '@opentelemetry/api': `./${otelApiStubPath}` } : {}),
         ...userAlias,
       },
     };
@@ -194,6 +243,8 @@ export default stream;
     const jsoncFilePath = join(projectRoot, 'wrangler.jsonc');
     const mainFilePath = join(outputDirectory, this.outputDir, 'index.mjs');
     const tsStubFilePath = join(outputDirectory, this.outputDir, typescriptStubPath);
+    const moduleStubFilePath = join(outputDirectory, this.outputDir, moduleStubPath);
+    const otelApiStubFilePath = join(outputDirectory, this.outputDir, otelApiStubPath);
 
     const wranglerJsoncConfig: Unstable_RawConfig & { placeholder: string } = {
       placeholder: 'PLACEHOLDER',
@@ -203,6 +254,9 @@ export default stream;
       alias: {
         ...wranglerConfig.alias,
         typescript: `./${relative(projectRoot, tsStubFilePath)}`,
+        module: `./${relative(projectRoot, moduleStubFilePath)}`,
+        'node:module': `./${relative(projectRoot, moduleStubFilePath)}`,
+        ...(stubOtelApi ? { '@opentelemetry/api': `./${relative(projectRoot, otelApiStubFilePath)}` } : {}),
       },
     };
 
@@ -229,7 +283,7 @@ export default stream;
           _mastra.__registerInternalWorkflow(scoreTracesWorkflow);
         }
 
-        const app = await createHonoServer(_mastra, { tools: getToolExports(tools) });
+        const app = await createHonoServer(_mastra, { tools: getToolExports(tools), browserStream: false });
         return app.fetch(request, env, context);
       }
     }
@@ -246,11 +300,21 @@ export default stream;
     analyzedBundleInfo: Awaited<ReturnType<typeof analyzeBundle>>,
     toolsPaths: (string | string[])[],
     bundlerOptions: BundlerOptions,
+    additionalEntries: Record<string, string>,
+    toolProjectRoot: string,
   ) {
-    const inputOptions = await super.getBundlerOptions(serverFile, mastraEntryFile, analyzedBundleInfo, toolsPaths, {
-      ...bundlerOptions,
-      enableEsmShim: false,
-    });
+    const inputOptions = await super.getBundlerOptions(
+      serverFile,
+      mastraEntryFile,
+      analyzedBundleInfo,
+      toolsPaths,
+      {
+        ...bundlerOptions,
+        enableEsmShim: false,
+      },
+      additionalEntries,
+      toolProjectRoot,
+    );
 
     const hasPostgresStore = (await this.deps.checkDependencies(['@mastra/pg'])) === `ok`;
 
@@ -259,8 +323,14 @@ export default stream;
         nodeBuiltinsExternal(),
         virtual({
           '#polyfills': `
-process.versions = process.versions || {};
-process.versions.node = '${process.versions.node}';
+try {
+  if (!process.versions) {
+    Object.defineProperty(process, 'versions', { value: {}, configurable: true });
+  }
+  if (!process.versions.node) {
+    Object.defineProperty(process.versions, 'node', { value: '${process.versions.node}', configurable: true });
+  }
+} catch {}
       `,
         }),
         ...inputOptions.plugins,

@@ -6,7 +6,9 @@ import { RegisteredLogger } from '../logger';
 import type { IMastraLogger } from '../logger';
 import type { Mastra } from '../mastra';
 import type { Span, SpanType, TracingPolicy } from '../observability';
+import type { StateBase } from './run-journal';
 import type {
+  NestedWorkflowParent,
   OutputWriter,
   SerializedStepFlowEntry,
   StepResult,
@@ -14,6 +16,8 @@ import type {
   WorkflowRunState,
   WorkflowFinishCallbackResult,
   WorkflowErrorCallbackInfo,
+  WorkflowStartCallbackInfo,
+  WorkflowStateTracingContext,
 } from './types';
 import type { RestartExecutionParams, StepFlowEntry, TimeTravelExecutionParams } from '.';
 
@@ -27,12 +31,28 @@ export interface ExecutionGraph<TEngineType = any> {
 }
 
 export interface ExecutionEngineOptions {
+  /** @internal Explicit suspension context supplied by agent-loop workflows. */
+  resumeTracingContext?: WorkflowStateTracingContext;
   tracingPolicy?: TracingPolicy;
   validateInputs: boolean;
+  emitStepEvents?: boolean;
   shouldPersistSnapshot: (params: {
     stepResults: Record<string, StepResult<any, any, any, any>>;
     workflowStatus: WorkflowRunStatus;
   }) => boolean;
+  evaluatePersistencePredicateBeforeDurableOperation?: boolean;
+
+  /**
+   * Acknowledges that `resume()` calls cannot be de-duplicated via the persisted
+   * resume claim, suppressing the per-resume warning. See `WorkflowOptions.allowUnclaimedResumes`.
+   */
+  allowUnclaimedResumes?: boolean;
+
+  /**
+   * Writes the resume claim even when `shouldPersistSnapshot` excludes `running`.
+   * See `WorkflowOptions.persistResumeClaim`.
+   */
+  persistResumeClaim?: boolean;
 
   /**
    * Transforms the run snapshot immediately before it is persisted.
@@ -41,16 +61,22 @@ export interface ExecutionEngineOptions {
   pruneSnapshot?: (params: { snapshot: WorkflowRunState; workflowStatus: WorkflowRunStatus }) => WorkflowRunState;
 
   /**
+   * Called and awaited before a run starts executing. Errors are propagated, which
+   * aborts the run before any step executes.
+   */
+  onStart?: (info: WorkflowStartCallbackInfo) => Promise<void> | void;
+
+  /**
    * Called when workflow execution completes (success, failed, suspended, or tripwire).
    * Errors thrown in this callback are caught and logged, not propagated.
    */
-  onFinish?: (result: WorkflowFinishCallbackResult) => Promise<void> | void;
+  onFinish?(result: WorkflowFinishCallbackResult<1 | 2>): Promise<void> | void;
 
   /**
    * Called only when workflow execution fails (failed or tripwire status).
    * Errors thrown in this callback are caught and logged, not propagated.
    */
-  onError?: (errorInfo: WorkflowErrorCallbackInfo) => Promise<void> | void;
+  onError?(errorInfo: WorkflowErrorCallbackInfo<1 | 2>): Promise<void> | void;
 }
 /**
  * Execution engine abstract class for building and executing workflow graphs
@@ -59,10 +85,40 @@ export interface ExecutionEngineOptions {
 export abstract class ExecutionEngine extends MastraBase {
   public mastra?: Mastra;
   public options: ExecutionEngineOptions;
+
+  /**
+   * Per-run overrides of `options.shouldPersistSnapshot`, keyed by runId.
+   *
+   * `options` is shared by every run of a workflow, so persistence is otherwise a
+   * per-workflow decision. Some callers need it per run: an agent output processor
+   * executes its workflow once per streamed chunk, and those runs must never write
+   * snapshots even when the same workflow instance persists normally when the user
+   * starts it directly (#19605).
+   */
+  private runPersistenceOverrides = new Map<string, ExecutionEngineOptions['shouldPersistSnapshot']>();
+
   constructor({ mastra, options }: { mastra?: Mastra; options: ExecutionEngineOptions }) {
     super({ name: 'ExecutionEngine', component: RegisteredLogger.WORKFLOW });
     this.mastra = mastra;
     this.options = options;
+  }
+
+  /** Registers a run-scoped `shouldPersistSnapshot` predicate. */
+  setRunPersistenceOverride(
+    runId: string,
+    shouldPersistSnapshot: ExecutionEngineOptions['shouldPersistSnapshot'],
+  ): void {
+    this.runPersistenceOverrides.set(runId, shouldPersistSnapshot);
+  }
+
+  /** Returns the run-scoped `shouldPersistSnapshot` predicate, if one was registered. */
+  getRunPersistenceOverride(runId: string): ExecutionEngineOptions['shouldPersistSnapshot'] | undefined {
+    return this.runPersistenceOverrides.get(runId);
+  }
+
+  /** Clears the run-scoped predicate (called on run cleanup). */
+  clearRunPersistenceOverride(runId: string): void {
+    this.runPersistenceOverrides.delete(runId);
   }
 
   __registerMastra(mastra: Mastra) {
@@ -75,6 +131,20 @@ export abstract class ExecutionEngine extends MastraBase {
 
   public getLogger(): IMastraLogger {
     return this.logger;
+  }
+
+  /**
+   * Invokes the onStart lifecycle callback if it is defined, before any step runs.
+   * Errors are intentionally propagated so the hook can gate the run (for example a
+   * quota check): the caller rejects and the run never executes.
+   */
+  public async invokeStartCallback(info: Omit<WorkflowStartCallbackInfo, 'mastra' | 'logger'>): Promise<void> {
+    const { onStart } = this.options;
+    if (!onStart) {
+      return;
+    }
+
+    await onStart({ ...info, mastra: this.mastra, logger: this.logger });
   }
 
   /**
@@ -134,7 +204,7 @@ export abstract class ExecutionEngine extends MastraBase {
       try {
         await Promise.resolve(
           onError({
-            status: result.status as 'failed' | 'tripwire',
+            status: result.status,
             error: result.error,
             steps: result.steps,
             tripwire: result.tripwire,
@@ -156,6 +226,7 @@ export abstract class ExecutionEngine extends MastraBase {
   abstract execute<TState, TInput, TOutput>(params: {
     workflowId: string;
     runId: string;
+    parentWorkflow?: NestedWorkflowParent;
     resourceId?: string;
     disableScorers?: boolean;
     graph: ExecutionGraph;
@@ -189,5 +260,11 @@ export abstract class ExecutionEngine extends MastraBase {
       includeResumeLabels?: boolean;
     };
     perStep?: boolean;
+    /** How the run is stored. Engines that don't support version 2 ignore it. @experimental */
+    storageVersion?: 1 | 2;
+    /** For a storage v2 resume or restart, what the store reported for the loaded state. @internal */
+    storedState?: { seq: number; patchBytes: number };
+    /** For a storage v2 nested start or time travel, the version of the parent's state it starts from. @internal */
+    inheritedState?: StateBase;
   }): Promise<TOutput>;
 }

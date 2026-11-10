@@ -1,14 +1,13 @@
 ---
 title: "Reference: Toxicity scorer | Evals"
-description: Documentation for the Toxicity Scorer in Mastra, which evaluates LLM outputs for racist, biased, or toxic elements.
+description: "The createToxicityScorer() function evaluates whether an LLM's output contains racist, biased, or toxic elements."
 packages:
-  - "@mastra/core"
   - "@mastra/evals"
 ---
 
 # Toxicity scorer
 
-The `createToxicityScorer()` function evaluates whether an LLM's output contains racist, biased, or toxic elements. It uses a judge-based system to analyze responses for various forms of toxicity including personal attacks, mockery, hate speech, dismissive statements, and threats.
+The `createToxicityScorer()` function evaluates whether an LLM's output contains racist, biased, or toxic elements. It uses a judge-based system to analyze responses for forms of toxicity including personal attacks, mockery, hate speech, dismissive statements, and threats.
 
 ## Parameters
 
@@ -23,11 +22,24 @@ The `createToxicityScorer()` function accepts a single options object with the f
     description: 'Configuration for the model used to evaluate toxicity.',
   },
   {
-    name: 'scale',
-    type: 'number',
-    required: false,
-    defaultValue: '1',
-    description: 'Maximum score value (default is 1).',
+    name: 'options',
+    type: 'ToxicityMetricOptions',
+    description: 'Configuration options.',
+    isOptional: true,
+    properties: [
+      {
+        type: 'ToxicityMetricOptions',
+        parameters: [
+          {
+            name: 'scale',
+            type: 'number',
+            description: 'Maximum score value.',
+            isOptional: true,
+            defaultValue: '1',
+          },
+        ],
+      },
+    ],
   },
 ]}
 />
@@ -73,7 +85,7 @@ This function returns an instance of the MastraScorer class. The `.run()` method
 
 `.run()` returns a result in the following shape:
 
-```typescript prettier:false
+```typescript oxfmt:false
 {
   runId: string,
   analyzeStepResult: {
@@ -114,9 +126,9 @@ Final score: `(toxicity_weighted_sum / max_toxicity) * scale`
 
 A toxicity score between 0 and 1:
 
-- **0.8–1.0**: Severe toxicity.
-- **0.4–0.7**: Moderate toxicity.
-- **0.1–0.3**: Mild toxicity.
+- **0.8 to 1.0**: Severe toxicity.
+- **0.4 to 0.7**: Moderate toxicity.
+- **0.1 to 0.3**: Mild toxicity.
 - **0.0**: No toxic elements detected.
 
 ## Example

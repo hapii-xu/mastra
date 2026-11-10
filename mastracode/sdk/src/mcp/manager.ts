@@ -5,18 +5,32 @@
 
 import { existsSync, mkdirSync, readFileSync, writeFileSync, renameSync } from 'node:fs';
 import { dirname, join } from 'node:path';
-import { MCPClient, MCPOAuthClientProvider } from '@mastra/mcp';
-import type { MastraMCPServerDefinition, OAuthClientInformation, OAuthStorage } from '@mastra/mcp';
+import type {
+  MCPClient,
+  MCPServerSettledResult,
+  MastraMCPServerDefinition,
+  OAuthClientInformation,
+  OAuthStorage,
+} from '@mastra/mcp';
 import { DEFAULT_CONFIG_DIR } from '../constants.js';
 import { getAppDataDir } from '../utils/project.js';
 import {
   DEFAULT_OAUTH_REDIRECT_URL,
+  MASTRA_CODE_CLIENT_METADATA_URL,
   loadMcpConfig,
   getProjectMcpPath,
   getGlobalMcpPath,
   getClaudeSettingsPath,
   resolveOAuthRedirectUrl,
 } from './config.js';
+import type { ExternalMcpDiscoveryOptions } from './config.js';
+import {
+  loadGlobalDisableState,
+  loadProjectServerOverrides,
+  saveGlobalDisableState,
+  saveProjectServerOverrides,
+} from './state.js';
+import type { McpProjectServerOverride } from './state.js';
 import type {
   McpConfig,
   McpHttpOAuthConfig,
@@ -27,6 +41,8 @@ import type {
 } from './types.js';
 
 const MASTRACODE_MCP_TIMEOUT_MS = 7 * 24 * 60 * 60 * 1000; // 7 days
+/** How long a server gets to connect and list its tools before it is reported as failed. */
+const DEFAULT_MCP_DISCOVERY_TIMEOUT_MS = 60_000;
 
 /** Summary of MCP initialization result. */
 export interface McpInitResult {
@@ -49,7 +65,8 @@ export interface McpManager {
   /**
    * Run the OAuth authorization-code flow for an HTTP server, then reconnect it.
    * Servers without an `oauth` config are provisioned with a zero-config default
-   * (dynamic client registration). The authorization URL is surfaced through
+   * that identifies Mastra Code by its Client ID Metadata Document. The
+   * authorization URL is surfaced through
    * `onAuthorizationUrl` for the caller to open in a browser.
    *
    * Resolves with the resulting {@link McpServerStatus}: a connected status on
@@ -68,6 +85,31 @@ export interface McpManager {
    * so it can be retried. Returns `true` if a flow was cancelled.
    */
   cancelServerAuthentication(name: string): Promise<boolean>;
+  /**
+   * Disable or enable a single server by name. The change is persisted (in
+   * mastracode's app data, not the user's config files) and survives restarts.
+   * With `global: true`, this changes the default for every project. Otherwise
+   * it records an explicit project override, which can override a global
+   * per-server disable. The global all-MCP kill switch remains absolute.
+   * Connections are rebuilt, so other servers reconnect — same behavior as
+   * {@link reload}. Returns the server's resulting status.
+   */
+  setServerDisabled(name: string, disabled: boolean, options?: { global?: boolean }): Promise<McpServerStatus>;
+  /** Clear a server's explicit project override so it inherits the global default. */
+  inheritServer(name: string): Promise<McpServerStatus>;
+  /**
+   * Disable or enable all servers at once. Project scope records an explicit
+   * override for every currently configured server. Global scope sets/clears a
+   * persisted all-MCP kill switch (and, when enabling, also clears globally
+   * disabled server names). Persisted like {@link setServerDisabled}.
+   */
+  setAllDisabled(disabled: boolean, options?: { global?: boolean }): Promise<void>;
+  /** Clear every explicit project override so all servers inherit global defaults. */
+  inheritAllServers(): Promise<void>;
+  /** Names of configured servers that are currently disabled (any scope). */
+  getDisabledServers(): string[];
+  /** Whether all MCP is disabled globally (across every project). */
+  isAllDisabledGlobally(): boolean;
   /** Disconnect from all MCP servers and clean up. */
   disconnect(): Promise<void>;
   /** Get all tools from connected MCP servers (namespaced as serverName_toolName). */
@@ -130,8 +172,9 @@ class FileOAuthStorage implements OAuthStorage {
 }
 
 /**
- * Zero-config OAuth defaults for servers with a bare `url` entry. Dynamic
- * client registration provisions the client, so no `clientId` is needed.
+ * Zero-config OAuth defaults for servers with a bare `url` entry. The client
+ * identifies itself by Mastra Code's Client ID Metadata Document URL, so no
+ * `clientId` is needed.
  */
 const DEFAULT_OAUTH_CONFIG: McpHttpOAuthConfig = { redirectUrl: DEFAULT_OAUTH_REDIRECT_URL };
 
@@ -158,6 +201,21 @@ function getStorageKeyFingerprint(value: string): string {
   return fingerprint.toString(16).padStart(16, '0');
 }
 
+type McpModule = typeof import('@mastra/mcp');
+let mcpModule: McpModule | undefined;
+
+/** `@mastra/mcp` and the MCP SDK (~12 MB) load with the first server that connects, not with every session. */
+async function loadMcpModule(): Promise<McpModule> {
+  mcpModule ??= await import('@mastra/mcp');
+  return mcpModule;
+}
+
+/** For code that only runs once a client exists, so the module is already loaded. */
+function loadedMcpModule(): McpModule {
+  if (!mcpModule) throw new Error('@mastra/mcp is not loaded yet');
+  return mcpModule;
+}
+
 /**
  * Create an MCP manager that wraps MCPClient with config-file discovery
  * and per-server status tracking.
@@ -166,20 +224,54 @@ export function createMcpManager(
   projectDir: string,
   configDirName = DEFAULT_CONFIG_DIR,
   extraServers?: Record<string, McpServerConfig>,
+  externalDiscovery?: ExternalMcpDiscoveryOptions,
+  options?: { discoveryTimeoutMs?: number },
 ): McpManager {
+  const discoveryTimeoutMs = options?.discoveryTimeoutMs ?? DEFAULT_MCP_DISCOVERY_TIMEOUT_MS;
   /** Merge programmatic servers into a base config (highest priority). */
   const applyExtraServers = (base: McpConfig): McpConfig => {
     if (!extraServers || Object.keys(extraServers).length === 0) return base;
     return { ...base, mcpServers: { ...base.mcpServers, ...extraServers } };
   };
 
-  let config = applyExtraServers(loadMcpConfig(projectDir, configDirName));
+  let config = applyExtraServers(loadMcpConfig(projectDir, configDirName, externalDiscovery));
+  let projectServerOverrides = new Map<string, McpProjectServerOverride>(
+    Object.entries(loadProjectServerOverrides(projectDir)),
+  );
+  let globalDisableState = loadGlobalDisableState();
+  let globallyDisabledServers = new Set(globalDisableState.disabledServers);
+
+  /** Whether a server is disabled after applying the kill switch, project override, and global default. */
+  const isDisabled = (name: string): boolean => {
+    if (globalDisableState.allDisabled) return true;
+    const projectOverride = projectServerOverrides.get(name);
+    if (projectOverride) return projectOverride === 'disabled';
+    return globallyDisabledServers.has(name);
+  };
+
+  /** Which scope currently disables a server. The global kill switch remains absolute. */
+  const disabledScopeOf = (name: string): 'project' | 'global' | undefined => {
+    if (globalDisableState.allDisabled) return 'global';
+    const projectOverride = projectServerOverrides.get(name);
+    if (projectOverride === 'disabled') return 'project';
+    if (!projectOverride && globallyDisabledServers.has(name)) return 'global';
+    return undefined;
+  };
   let client: MCPClient | null = null;
   let serverDefs: Record<string, MastraMCPServerDefinition> = {};
   let tools: Record<string, any> = {};
   let serverStatuses = new Map<string, McpServerStatus>();
   let stderrLogs = new Map<string, string[]>();
   let initialized = false;
+
+  /**
+   * The latest connect attempt per server. A discovery result is only applied while its
+   * attempt is still the latest and its client is still the live one, so a slow or late
+   * result never overwrites a newer reconnect, a reload, or a server being disabled.
+   */
+  let connectAttempts = new Map<string, object>();
+  const isCurrent = (name: string, attempt: object, attemptClient: MCPClient): boolean =>
+    connectAttempts.get(name) === attempt && client === attemptClient;
 
   /** Per-server handlers that receive the OAuth authorization URL during authenticateServer(). */
   const authUrlHandlers = new Map<string, (url: string) => void>();
@@ -201,17 +293,25 @@ export function createMcpManager(
    */
   const cancelledAuthServers = new Set<string>();
 
-  /** Overlay the manager-owned `authenticating` flag onto a status snapshot. */
-  const withAuthenticating = (status: McpServerStatus): McpServerStatus =>
-    authenticatingServers.has(status.name) ? { ...status, authenticating: true } : status;
+  /** Overlay manager-owned state onto a status snapshot. */
+  const withManagerState = (status: McpServerStatus): McpServerStatus => ({
+    ...status,
+    ...(authenticatingServers.has(status.name) ? { authenticating: true } : {}),
+    ...(projectServerOverrides.has(status.name) ? { projectOverride: projectServerOverrides.get(status.name) } : {}),
+    globalDefault: globallyDisabledServers.has(status.name) ? 'disabled' : 'enabled',
+    globalKillSwitch: globalDisableState.allDisabled,
+  });
 
   const MAX_STDERR_LINES = 200;
+  /** Streams already being buffered, so capturing a server again never doubles its lines. */
+  const capturedStderr = new WeakSet<object>();
 
   /** Hook into a server's stderr stream and buffer its output. */
   function captureStderr(serverName: string): void {
     if (!client || typeof client.getServerStderr !== 'function') return;
     const stream = client.getServerStderr(serverName);
-    if (!stream) return;
+    if (!stream || capturedStderr.has(stream)) return;
+    capturedStderr.add(stream);
 
     let buffer = '';
     const lines = stderrLogs.get(serverName) ?? [];
@@ -257,21 +357,30 @@ export function createMcpManager(
     // a concrete URL.
     const redirectUrl = resolveOAuthRedirectUrl(oauth);
 
+    // Without a pre-registered clientId the client is identified by Mastra
+    // Code's Client ID Metadata Document: the document URL is the client_id and
+    // the authorization server fetches it, so nothing is registered per server.
+    const clientInformation = oauth.clientId
+      ? ({
+          client_id: oauth.clientId,
+          ...(oauth.clientSecret ? { client_secret: oauth.clientSecret } : {}),
+        } satisfies OAuthClientInformation)
+      : undefined;
+    const clientMetadataUrl = clientInformation ? undefined : MASTRA_CODE_CLIENT_METADATA_URL;
+
+    const { MCPOAuthClientProvider } = loadedMcpModule();
     return new MCPOAuthClientProvider({
       redirectUrl,
       clientMetadata: {
+        ...(clientMetadataUrl ? { client_id: clientMetadataUrl } : {}),
         redirect_uris: [redirectUrl],
-        client_name: oauth.clientName ?? `Mastra Code MCP ${name}`,
+        client_name: oauth.clientName ?? (clientMetadataUrl ? 'Mastra Code' : `Mastra Code MCP ${name}`),
         grant_types: ['authorization_code', 'refresh_token'],
         response_types: ['code'],
         ...(oauth.scopes?.length ? { scope: oauth.scopes.join(' ') } : {}),
       },
-      clientInformation: oauth.clientId
-        ? ({
-            client_id: oauth.clientId,
-            ...(oauth.clientSecret ? { client_secret: oauth.clientSecret } : {}),
-          } satisfies OAuthClientInformation)
-        : undefined,
+      clientInformation,
+      clientMetadataUrl,
       storage: new FileOAuthStorage(getOAuthStoragePath(projectDir, name, cfg)),
       onRedirectToAuthorization: url => {
         authUrlHandlers.get(name)?.(url.toString());
@@ -290,15 +399,94 @@ export function createMcpManager(
           authProvider: createOAuthProvider(name, httpCfg),
         };
       } else {
-        defs[name] = { command: cfg.command, args: cfg.args, env: cfg.env, stderr: 'pipe' };
+        defs[name] = {
+          command: cfg.command,
+          args: cfg.args,
+          env: cfg.env,
+          ...(cfg.cwd ? { cwd: cfg.cwd } : {}),
+          stderr: 'pipe',
+        };
       }
     }
     return defs;
   }
 
+  /** Seed a `disabled` status for every disabled server so it stays visible. */
+  function setDisabledStatuses(): void {
+    for (const [name, cfg] of Object.entries(config.mcpServers ?? {})) {
+      const scope = disabledScopeOf(name);
+      if (!scope) continue;
+      serverStatuses.set(name, {
+        name,
+        connected: false,
+        toolCount: 0,
+        toolNames: [],
+        transport: getTransport(cfg),
+        disabled: true,
+        disabledScope: scope,
+      });
+    }
+  }
+
+  /** What one server's discovery produced: its tools, or why it has none. */
+  type ServerOutcome = { tools: Record<string, any>; error?: undefined } | { tools?: undefined; error: string };
+
+  const discoveryTimeoutError = () =>
+    `Timed out after ${discoveryTimeoutMs / 1000}s waiting for the server to connect and list its tools`;
+
+  function outcomeOf(result: MCPServerSettledResult<Record<string, any>>): ServerOutcome {
+    if (result.error === undefined) return { tools: result.value };
+    const { MCP_DISCOVERY_TIMEOUT_CODE } = loadedMcpModule();
+    return { error: result.error.code === MCP_DISCOVERY_TIMEOUT_CODE ? discoveryTimeoutError() : result.error.message };
+  }
+
+  /**
+   * Drop the tools a server registered earlier.
+   *
+   * Only the exact tool names that server reported are removed. Matching on the
+   * `${name}_` prefix would also delete the tools of a server whose name starts
+   * with this one, e.g. `foo` would drop `foo_bar_ping` from `foo_bar`.
+   */
+  function removeServerTools(name: string): void {
+    for (const key of serverStatuses.get(name)?.toolNames ?? []) {
+      delete tools[key];
+    }
+  }
+
+  /** Replace a server's tools and status with one discovery outcome. */
+  function applyServerResult(name: string, cfg: McpServerConfig, outcome: ServerOutcome): McpServerStatus {
+    removeServerTools(name);
+
+    const transport = getTransport(cfg);
+    const serverTools = outcome.tools ?? {};
+    const toolNames = Object.keys(serverTools).map(t => `${name}_${t}`);
+    let status: McpServerStatus;
+    if (outcome.error === undefined && toolNames.length > 0) {
+      for (const [toolName, toolConfig] of Object.entries(serverTools)) {
+        tools[`${name}_${toolName}`] = toolConfig;
+      }
+      status = { name, connected: true, toolCount: toolNames.length, toolNames, transport };
+    } else {
+      const error = outcome.error ?? 'Failed to connect';
+      status = {
+        name,
+        connected: false,
+        toolCount: 0,
+        toolNames: [],
+        transport,
+        error,
+        ...(serverNeedsAuth(name, cfg, error) ? { needsAuth: true } : {}),
+      };
+    }
+    serverStatuses.set(name, status);
+    return status;
+  }
+
   async function connectAndCollectTools(): Promise<void> {
-    const servers = config.mcpServers;
-    if (!servers || Object.keys(servers).length === 0) {
+    setDisabledStatuses();
+
+    const servers = Object.fromEntries(Object.entries(config.mcpServers ?? {}).filter(([name]) => !isDisabled(name)));
+    if (Object.keys(servers).length === 0) {
       return;
     }
 
@@ -315,71 +503,56 @@ export function createMcpManager(
       });
     }
 
+    const { MCPClient } = await loadMcpModule();
     serverDefs = buildServerDefs(servers);
-    client = new MCPClient({
+    const attemptClient = new MCPClient({
       id: 'mastra-code-mcp',
       servers: serverDefs,
       timeout: MASTRACODE_MCP_TIMEOUT_MS,
     });
+    client = attemptClient;
 
-    // Use listToolsetsWithErrors() to get tools grouped by server name,
-    // plus per-server error messages for servers that failed to connect.
+    const attempts = new Map(serverNames.map(name => [name, {}]));
+    for (const [name, attempt] of attempts) connectAttempts.set(name, attempt);
 
+    const record = (name: string, outcome: ServerOutcome): boolean => {
+      if (!isCurrent(name, attempts.get(name)!, attemptClient)) return false;
+      captureStderr(name);
+      applyServerResult(name, servers[name]!, outcome);
+      return true;
+    };
+
+    // Each server reports as soon as it settles, so one stalled server cannot hold
+    // back the status and tools of the others.
+    const timedOut: string[] = [];
     try {
-      const { toolsets, errors } = await client.listToolsetsWithErrors();
-      const typedToolsets = toolsets as Record<string, Record<string, any>>;
-
-      // Flatten toolsets into the namespaced tools map (serverName_toolName)
-      for (const [serverName, serverTools] of Object.entries(typedToolsets)) {
-        for (const [toolName, toolConfig] of Object.entries(serverTools)) {
-          tools[`${serverName}_${toolName}`] = toolConfig;
-        }
-      }
-
-      for (const name of serverNames) {
-        const serverTools = typedToolsets[name];
-        if (serverTools && Object.keys(serverTools).length > 0) {
-          const toolNames = Object.keys(serverTools).map(t => `${name}_${t}`);
-          serverStatuses.set(name, {
-            name,
-            connected: true,
-            toolCount: toolNames.length,
-            toolNames,
-            transport: getTransport(servers[name]!),
-          });
-        } else {
-          // Server failed — use the real error from listToolsetsWithErrors()
-          const error = errors[name] ?? 'Failed to connect';
-          serverStatuses.set(name, {
-            name,
-            connected: false,
-            toolCount: 0,
-            toolNames: [],
-            transport: getTransport(servers[name]!),
-            error,
-            ...(serverNeedsAuth(name, servers[name]!, error) ? { needsAuth: true } : {}),
-          });
-        }
-      }
-
-      // Capture stderr from all stdio servers (connected or failed)
-      for (const name of serverNames) {
-        captureStderr(name);
-      }
+      await attemptClient.listToolsetsWithErrors({
+        perServerTimeoutMs: discoveryTimeoutMs,
+        onServerSettled: (name, result) => {
+          if (!attempts.has(name)) return;
+          if (result.error?.code === loadedMcpModule().MCP_DISCOVERY_TIMEOUT_CODE) timedOut.push(name);
+          record(name, outcomeOf(result));
+        },
+      });
     } catch (error) {
       const errMsg = error instanceof Error ? error.message : String(error);
-
       for (const name of serverNames) {
-        serverStatuses.set(name, {
-          name,
-          connected: false,
-          toolCount: 0,
-          toolNames: [],
-          transport: getTransport(servers[name]!),
-          error: errMsg,
-          ...(serverNeedsAuth(name, servers[name]!, errMsg) ? { needsAuth: true } : {}),
-        });
+        if (serverStatuses.get(name)?.connecting) record(name, { error: errMsg });
       }
+    }
+    for (const name of serverNames) {
+      if (serverStatuses.get(name)?.connecting) record(name, { error: 'Failed to connect' });
+    }
+
+    // A timed-out server's connect keeps running (a cold `npx` install can take a
+    // while). Discover those servers again without a cap so they still connect once ready.
+    if (timedOut.length > 0) {
+      void attemptClient
+        .listToolsetsWithErrors({
+          serverNames: timedOut,
+          onServerSettled: (name, result) => record(name, outcomeOf(result)),
+        })
+        .catch(() => {});
     }
   }
 
@@ -401,21 +574,24 @@ export function createMcpManager(
   /**
    * Runs a single-server connect action (reconnect or authenticate), then
    * refreshes that server's tools and status from the client.
+   *
+   * With `deadlineMs`, the whole operation shares one deadline: the server is
+   * reported as failed when it passes, and its result is still applied if it
+   * arrives later. A call that a newer reconnect, reload, or disable replaced
+   * leaves the stored status alone and returns a copy of it.
    */
   async function connectSingleServer(
     name: string,
     cfg: McpServerConfig,
-    connect: () => Promise<unknown>,
+    connect: (client: MCPClient) => Promise<unknown>,
+    deadlineMs?: number,
   ): Promise<McpServerStatus> {
-    const transport = getTransport(cfg);
+    const attemptClient = client!;
+    const attempt = {};
+    connectAttempts.set(name, attempt);
 
     // Remove old tools for this server
-    const prefix = `${name}_`;
-    for (const key of Object.keys(tools)) {
-      if (key.startsWith(prefix)) {
-        delete tools[key];
-      }
-    }
+    removeServerTools(name);
 
     // Clear old logs and mark as connecting
     stderrLogs.delete(name);
@@ -425,83 +601,110 @@ export function createMcpManager(
       connecting: true,
       toolCount: 0,
       toolNames: [],
-      transport,
+      transport: getTransport(cfg),
     });
 
-    try {
-      await connect();
+    const work = (async (): Promise<ServerOutcome> => {
+      await connect(attemptClient);
+      if (isCurrent(name, attempt, attemptClient)) captureStderr(name);
 
-      // Recapture stderr for the reconnected server
-      captureStderr(name);
+      let outcome: ServerOutcome = { error: 'Failed to connect' };
+      await attemptClient.listToolsetsWithErrors({
+        serverNames: [name],
+        onServerSettled: (_, result) => {
+          outcome = outcomeOf(result);
+        },
+      });
+      return outcome;
+    })().catch((error): ServerOutcome => ({ error: error instanceof Error ? error.message : String(error) }));
 
-      // Fetch updated toolsets to get this server's tools
-      const { toolsets, errors } = await client!.listToolsetsWithErrors();
-      const serverTools = toolsets[name];
-      const serverError = errors[name];
-
-      if (serverError) {
-        const status: McpServerStatus = {
-          name,
-          connected: false,
-          toolCount: 0,
-          toolNames: [],
-          transport,
-          error: serverError,
-          ...(serverNeedsAuth(name, cfg, serverError) ? { needsAuth: true } : {}),
-        };
-        serverStatuses.set(name, status);
-        return status;
-      } else if (serverTools && Object.keys(serverTools).length > 0) {
-        const toolNames = Object.keys(serverTools).map(t => `${name}_${t}`);
-        for (const [toolName, toolConfig] of Object.entries(serverTools)) {
-          tools[`${name}_${toolName}`] = toolConfig;
-        }
-        const status: McpServerStatus = {
-          name,
-          connected: true,
-          toolCount: toolNames.length,
-          toolNames,
-          transport,
-        };
-        serverStatuses.set(name, status);
-        return status;
-      } else {
-        const status: McpServerStatus = {
-          name,
-          connected: false,
-          toolCount: 0,
-          toolNames: [],
-          transport,
-          error: 'Failed to connect',
-        };
-        serverStatuses.set(name, status);
-        return status;
-      }
-    } catch (error) {
-      const errMsg = error instanceof Error ? error.message : String(error);
-      const status: McpServerStatus = {
+    const record = (outcome: ServerOutcome): McpServerStatus | undefined =>
+      isCurrent(name, attempt, attemptClient) ? applyServerResult(name, cfg, outcome) : undefined;
+    const superseded = (): McpServerStatus => ({
+      ...(serverStatuses.get(name) ?? {
         name,
         connected: false,
         toolCount: 0,
         toolNames: [],
-        transport,
-        error: errMsg,
-        ...(serverNeedsAuth(name, cfg, errMsg) ? { needsAuth: true } : {}),
-      };
-      serverStatuses.set(name, status);
-      return status;
+        transport: getTransport(cfg),
+        error: 'Superseded by a newer connection attempt',
+      }),
+    });
+
+    if (deadlineMs === undefined) {
+      return record(await work) ?? superseded();
     }
+
+    let timer: NodeJS.Timeout | undefined;
+    const deadline = new Promise<'timeout'>(resolve => {
+      timer = setTimeout(() => resolve('timeout'), deadlineMs);
+      timer.unref?.();
+    });
+    const first = await Promise.race([work, deadline]);
+    clearTimeout(timer);
+    if (first !== 'timeout') {
+      return record(first) ?? superseded();
+    }
+    void work.then(record);
+    return record({ error: discoveryTimeoutError() }) ?? superseded();
   }
 
   async function disconnect(): Promise<void> {
+    connectAttempts = new Map();
     if (client) {
+      const closing = client;
+      client = null;
       try {
-        await client.disconnect();
+        await closing.disconnect();
       } catch {
         // Ignore disconnect errors
       }
-      client = null;
     }
+  }
+
+  /** Tear down all connections and reconnect every enabled server. */
+  async function rebuildConnections(): Promise<void> {
+    await disconnect();
+    tools = {};
+    serverStatuses = new Map();
+    stderrLogs = new Map();
+    initialized = false;
+    await connectAndCollectTools();
+    initialized = true;
+  }
+
+  function disabledStatus(name: string): McpServerStatus {
+    const cfg = config.mcpServers?.[name];
+    return {
+      name,
+      connected: false,
+      toolCount: 0,
+      toolNames: [],
+      transport: cfg ? getTransport(cfg) : 'stdio',
+      disabled: true,
+      disabledScope: disabledScopeOf(name),
+    };
+  }
+
+  // Read-merge-write persistence: re-read the persisted state and apply this
+  // operation's delta on top, then adopt the merged result in memory. This
+  // way a concurrent mastracode process's changes (e.g. another window
+  // flipping the global kill switch) are never clobbered by this manager's
+  // construction-time snapshot.
+  function persistProjectDelta(mutate: (overrides: Map<string, McpProjectServerOverride>) => void): void {
+    const fresh = new Map<string, McpProjectServerOverride>(Object.entries(loadProjectServerOverrides(projectDir)));
+    mutate(fresh);
+    projectServerOverrides = fresh;
+    saveProjectServerOverrides(projectDir, Object.fromEntries(fresh));
+  }
+
+  function persistGlobalDelta(mutate: (state: { allDisabled: boolean; disabledServers: Set<string> }) => void): void {
+    const onDisk = loadGlobalDisableState();
+    const fresh = { allDisabled: onDisk.allDisabled, disabledServers: new Set(onDisk.disabledServers) };
+    mutate(fresh);
+    globallyDisabledServers = fresh.disabledServers;
+    globalDisableState = { allDisabled: fresh.allDisabled, disabledServers: Array.from(fresh.disabledServers) };
+    saveGlobalDisableState(globalDisableState);
   }
 
   return {
@@ -513,9 +716,9 @@ export function createMcpManager(
 
     async initInBackground(): Promise<McpInitResult> {
       await this.init();
-      const statuses = Array.from(serverStatuses.values());
+      const statuses = Array.from(serverStatuses.values(), withManagerState);
       const connected = statuses.filter(s => s.connected);
-      const failed = statuses.filter(s => !s.connected);
+      const failed = statuses.filter(s => !s.connected && !s.disabled);
       return {
         connected,
         failed,
@@ -525,17 +728,128 @@ export function createMcpManager(
     },
 
     async reload() {
-      await disconnect();
-      config = applyExtraServers(loadMcpConfig(projectDir, configDirName));
-      tools = {};
-      serverStatuses = new Map();
-      stderrLogs = new Map();
-      initialized = false;
-      await connectAndCollectTools();
-      initialized = true;
+      config = applyExtraServers(loadMcpConfig(projectDir, configDirName, externalDiscovery));
+      projectServerOverrides = new Map(Object.entries(loadProjectServerOverrides(projectDir)));
+      globalDisableState = loadGlobalDisableState();
+      globallyDisabledServers = new Set(globalDisableState.disabledServers);
+      await rebuildConnections();
+    },
+
+    async setServerDisabled(name: string, disabled: boolean, options?: { global?: boolean }): Promise<McpServerStatus> {
+      if (!config.mcpServers?.[name]) {
+        return {
+          name,
+          connected: false,
+          toolCount: 0,
+          toolNames: [],
+          transport: 'stdio',
+          error: `Server "${name}" not found in config`,
+        };
+      }
+
+      const wasEffectivelyDisabled = isDisabled(name);
+
+      if (options?.global) {
+        persistGlobalDelta(state => {
+          if (disabled) {
+            state.disabledServers.add(name);
+          } else {
+            state.disabledServers.delete(name);
+          }
+        });
+      } else {
+        persistProjectDelta(overrides => {
+          overrides.set(name, disabled ? 'disabled' : 'enabled');
+        });
+      }
+
+      // Only rebuild connections when the server's effective state actually
+      // flipped. State changes that only alter an inherited default or an
+      // override beneath the global kill switch leave connections alone.
+      if (isDisabled(name) !== wasEffectivelyDisabled) {
+        await rebuildConnections();
+        return withManagerState(serverStatuses.get(name) ?? disabledStatus(name));
+      }
+      return withManagerState(
+        isDisabled(name) ? disabledStatus(name) : (serverStatuses.get(name) ?? disabledStatus(name)),
+      );
+    },
+
+    async inheritServer(name: string): Promise<McpServerStatus> {
+      if (!config.mcpServers?.[name]) {
+        return {
+          name,
+          connected: false,
+          toolCount: 0,
+          toolNames: [],
+          transport: 'stdio',
+          error: `Server "${name}" not found in config`,
+        };
+      }
+
+      const wasEffectivelyDisabled = isDisabled(name);
+      persistProjectDelta(overrides => {
+        overrides.delete(name);
+      });
+      if (isDisabled(name) !== wasEffectivelyDisabled) {
+        await rebuildConnections();
+      }
+      return withManagerState(
+        isDisabled(name) ? disabledStatus(name) : (serverStatuses.get(name) ?? disabledStatus(name)),
+      );
+    },
+
+    async setAllDisabled(disabled: boolean, options?: { global?: boolean }): Promise<void> {
+      const configuredNames = Object.keys(config.mcpServers ?? {});
+      const effectiveBefore = configuredNames.filter(name => isDisabled(name)).join(',');
+      if (options?.global) {
+        persistGlobalDelta(state => {
+          state.allDisabled = disabled;
+          if (!disabled) {
+            // Enabling globally also clears globally disabled server names so
+            // "/mcp enable all --global" fully restores global defaults.
+            state.disabledServers.clear();
+          }
+        });
+      } else {
+        persistProjectDelta(overrides => {
+          for (const name of configuredNames) {
+            overrides.set(name, disabled ? 'disabled' : 'enabled');
+          }
+        });
+      }
+      const effectiveAfter = configuredNames.filter(name => isDisabled(name)).join(',');
+      if (effectiveAfter !== effectiveBefore) {
+        await rebuildConnections();
+      }
+    },
+
+    async inheritAllServers(): Promise<void> {
+      const configuredNames = Object.keys(config.mcpServers ?? {});
+      const effectiveBefore = configuredNames.filter(name => isDisabled(name)).join(',');
+      persistProjectDelta(overrides => {
+        overrides.clear();
+      });
+      const effectiveAfter = configuredNames.filter(name => isDisabled(name)).join(',');
+      if (effectiveAfter !== effectiveBefore) {
+        await rebuildConnections();
+      }
+    },
+
+    getDisabledServers() {
+      return Object.keys(config.mcpServers ?? {})
+        .filter(name => isDisabled(name))
+        .sort();
+    },
+
+    isAllDisabledGlobally() {
+      return globalDisableState.allDisabled;
     },
 
     async reconnectServer(name: string): Promise<McpServerStatus> {
+      if (isDisabled(name)) {
+        return { ...disabledStatus(name), error: `Server "${name}" is disabled — enable it first` };
+      }
       const cfg = config.mcpServers?.[name];
       if (!cfg) {
         return {
@@ -559,8 +873,8 @@ export function createMcpManager(
         };
       }
 
-      // Use MCPClient's per-server reconnect
-      return connectSingleServer(name, cfg, () => client!.reconnectServer(name));
+      // Use MCPClient's per-server reconnect, bounded by the same discovery timeout as startup
+      return connectSingleServer(name, cfg, c => c.reconnectServer(name), discoveryTimeoutMs);
     },
 
     async authenticateServer(
@@ -577,6 +891,10 @@ export function createMcpManager(
           transport: 'stdio',
           error: `Server "${name}" not found in config`,
         };
+      }
+
+      if (isDisabled(name)) {
+        return { ...disabledStatus(name), error: `Server "${name}" is disabled — enable it first` };
       }
 
       if (!client) {
@@ -602,8 +920,8 @@ export function createMcpManager(
       }
 
       // Zero-config provisioning: a bare `url` entry gets a provider with the
-      // default redirect URL the first time the user authenticates. Dynamic
-      // client registration takes care of the client credentials.
+      // default redirect URL the first time the user authenticates. The Client
+      // ID Metadata Document takes care of the client identity.
       //
       // NOTE: `serverDefs[name]` is the same object reference the MCPClient was
       // constructed with, and connectHttp reads `authProvider` live off it at
@@ -642,9 +960,11 @@ export function createMcpManager(
       authenticatingServers.add(name);
       cancelledAuthServers.delete(name);
       try {
-        const result = await connectSingleServer(name, cfg, () =>
-          client!.authenticate(name, options?.timeoutMs === undefined ? undefined : { timeoutMs: options.timeoutMs }),
+        const result = await connectSingleServer(name, cfg, c =>
+          c.authenticate(name, options?.timeoutMs === undefined ? undefined : { timeoutMs: options.timeoutMs }),
         );
+        // A newer reconnect, reload, or disable replaced this attempt; leave its status alone.
+        if (serverStatuses.get(name) !== result) return result;
         // A cancelled flow resolves with a failed status; mark it so callers can
         // distinguish a deliberate cancel from a genuine authentication failure.
         // Write the marker back to the durable status map (not just the returned
@@ -677,7 +997,14 @@ export function createMcpManager(
     disconnect,
 
     getTools() {
-      return { ...tools };
+      // Servers settle in any order; return tools in config order so the model sees a stable tool list.
+      const ordered: Record<string, any> = {};
+      for (const name of Object.keys(config.mcpServers ?? {})) {
+        for (const key of serverStatuses.get(name)?.toolNames ?? []) {
+          if (key in tools) ordered[key] = tools[key];
+        }
+      }
+      return ordered;
     },
 
     hasServers() {
@@ -687,7 +1014,7 @@ export function createMcpManager(
     },
 
     getServerStatuses() {
-      return Array.from(serverStatuses.values(), withAuthenticating);
+      return Array.from(serverStatuses.values(), withManagerState);
     },
 
     getSkippedServers() {

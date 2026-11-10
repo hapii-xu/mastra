@@ -20,7 +20,7 @@ import {
   ATTR_TELEMETRY_SDK_VERSION,
 } from '@opentelemetry/semantic-conventions';
 
-import { getAttributes, getSpanName } from './gen-ai-semantics.js';
+import { getAttributes, getSpanName, isModelCallSpan } from './gen-ai-semantics.js';
 import type { OtelExporterConfig } from './types.js';
 
 export type SpanFormat = 'GenAI_v1_38_0';
@@ -119,6 +119,14 @@ export class SpanConverter {
       attributes['mastra.tags'] = JSON.stringify(span.tags);
     }
 
+    // Explicit mappings override generated attributes, without changing default exports.
+    for (const [metadataKey, attributeName] of Object.entries(this.params.config?.metadataMapping ?? {})) {
+      if (!attributeName || !span.metadata || !Object.hasOwn(span.metadata, metadataKey)) continue;
+      const value = span.metadata[metadataKey];
+      if (value === null || value === undefined || value === '') continue;
+      attributes[attributeName] = typeof value === 'object' ? JSON.stringify(value) : String(value);
+    }
+
     const startTime = dateToHrTime(span.startTime);
     const endTime = span.endTime ? dateToHrTime(span.endTime) : startTime;
     const duration = computeDuration(span.startTime, span.endTime);
@@ -132,16 +140,23 @@ export class SpanConverter {
       isRemote: false,
     };
 
-    const parentSpanContext = span.parentSpanId
+    // External parents (ambient OTel spans Mastra did not create) are real
+    // spans in the OTel namespace this exporter targets, so keep them as the
+    // OTel-side parent when no Mastra parent exists.
+    const exportedParentSpanId = span.parentSpanId ?? span.externalParentSpanId;
+    const parentSpanContext = exportedParentSpanId
       ? {
           traceId: span.traceId,
-          spanId: span.parentSpanId,
+          spanId: exportedParentSpanId,
           traceFlags: TraceFlags.SAMPLED,
           isRemote: false,
         }
       : undefined;
 
-    const links: Link[] = []; // fill if you add link support later
+    // Spans in other traces, such as the caller of a served MCP request.
+    const links: Link[] = (span.links ?? []).map(link => ({
+      context: { traceId: link.traceId, spanId: link.spanId, traceFlags: TraceFlags.SAMPLED, isRemote: true },
+    }));
 
     const readable: ReadableSpan = {
       name,
@@ -187,11 +202,15 @@ async function getPackageVersion(pkgName: string): Promise<string | undefined> {
  * @returns The appropriate OTEL SpanKind
  */
 export function getSpanKind(type: SpanType): SpanKind {
+  if (isModelCallSpan(type)) {
+    return SpanKind.CLIENT;
+  }
   switch (type) {
-    case SpanType.MODEL_GENERATION:
     case SpanType.RAG_EMBEDDING:
     case SpanType.MCP_TOOL_CALL:
       return SpanKind.CLIENT;
+    case SpanType.MCP_SERVER_REQUEST:
+      return SpanKind.SERVER;
     default:
       return SpanKind.INTERNAL;
   }

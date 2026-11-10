@@ -4,9 +4,6 @@
  * Implements SandboxProcessManager for Blaxel cloud sandboxes.
  * Wraps the Blaxel SDK's process API (exec, list, get, kill, streamLogs)
  * for background process management.
- *
- * Key limitation: Blaxel sandboxes do not support stdin.
- * ProcessHandle.sendStdin() throws and the writer stream will error.
  */
 
 import type { SandboxInstance } from '@blaxel/core';
@@ -35,12 +32,14 @@ class BlaxelProcessHandle extends ProcessHandle {
   private _streamingDone: Promise<void> | null = null;
   private _closeStream: (() => void) | null = null;
   private _killed = false;
+  private readonly _stdinMode: SpawnProcessOptions['stdinMode'];
 
   constructor(pid: string, sandbox: SandboxInstance, startTime: number, options?: SpawnProcessOptions) {
     super(options);
     this.pid = pid;
     this._sandbox = sandbox;
     this._startTime = startTime;
+    this._stdinMode = options?.stdinMode;
   }
 
   get exitCode(): number | undefined {
@@ -119,8 +118,23 @@ class BlaxelProcessHandle extends ProcessHandle {
     return true;
   }
 
-  async sendStdin(_data: string): Promise<void> {
-    throw new Error('Blaxel sandboxes do not support stdin');
+  async sendStdin(data: string): Promise<void> {
+    if (this._exitCode !== undefined) {
+      throw new Error(`Process ${this.pid} has already exited with code ${this._exitCode}`);
+    }
+    if (this._stdinMode === 'ignore') {
+      throw new Error(`Process ${this.pid} was not started with stdin support`);
+    }
+    await this._sandbox.process.writeStdin(this.pid, data);
+  }
+
+  async closeStdin(): Promise<void> {
+    if (this._stdinMode === 'ignore') {
+      throw new Error(`Process ${this.pid} was not started with stdin support`);
+    }
+    // Stdin is already gone once the process exits; ending the writer after exit must not fail.
+    if (this._exitCode !== undefined) return;
+    await this._sandbox.process.closeStdin(this.pid);
   }
 }
 
@@ -128,25 +142,17 @@ class BlaxelProcessHandle extends ProcessHandle {
 // Blaxel Process Manager
 // =============================================================================
 
-export interface BlaxelProcessManagerOptions {
-  env?: Record<string, string | undefined>;
-}
-
 /**
  * Blaxel implementation of SandboxProcessManager.
  * Uses the Blaxel SDK's process API for background process management.
  */
 export class BlaxelProcessManager extends SandboxProcessManager<BlaxelSandbox> {
-  constructor(opts: BlaxelProcessManagerOptions = {}) {
-    super({ env: opts.env });
-  }
-
   async spawn(command: string, options: SpawnProcessOptions = {}): Promise<ProcessHandle> {
     return this.sandbox.retryOnDead(async () => {
       const blaxel = this.sandbox.blaxel;
 
-      // Merge default env with per-spawn env
-      const mergedEnv = { ...this.env, ...options.env };
+      // The base spawn wrapper already merged the sandbox env into options.env
+      const mergedEnv = { ...options.env };
       const envs = Object.fromEntries(
         Object.entries(mergedEnv).filter((entry): entry is [string, string] => entry[1] !== undefined),
       );
@@ -155,7 +161,10 @@ export class BlaxelProcessManager extends SandboxProcessManager<BlaxelSandbox> {
       const result = await blaxel.process.exec({
         command,
         waitForCompletion: false,
-        workingDir: options.cwd,
+        // `stdinMode: 'ignore'` keeps stdin closed so a command that reads it
+        // (a bare `grep`/`cat`) sees EOF instead of hanging until timeout.
+        stdin: options.stdinMode !== 'ignore',
+        workingDir: options.cwd ?? this.sandbox.workingDirectory,
         ...(Object.keys(envs).length > 0 && { env: envs }),
         ...(options.timeout && { timeout: Math.ceil(options.timeout / 1000) }),
       });
@@ -163,10 +172,12 @@ export class BlaxelProcessManager extends SandboxProcessManager<BlaxelSandbox> {
       const pid = result.pid;
       const handle = new BlaxelProcessHandle(pid, blaxel, Date.now(), options);
 
-      // Start streaming logs — route to handle's emitters
+      // Start streaming logs — route to handle's emitters.
+      // streamLogs splits the log stream on newlines and delivers each line
+      // without its terminator, so restore it to keep line-delimited output intact.
       const streamControl = blaxel.process.streamLogs(pid, {
-        onStdout: (data: string) => handle.emitStdout(data),
-        onStderr: (data: string) => handle.emitStderr(data),
+        onStdout: (data: string) => handle.emitStdout(`${data}\n`),
+        onStderr: (data: string) => handle.emitStderr(`${data}\n`),
         onError: (err: Error | string) => {
           const msg = err instanceof Error ? err.message : String(err);
           handle.emitStderr(msg);

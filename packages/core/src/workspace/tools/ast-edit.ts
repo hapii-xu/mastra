@@ -67,6 +67,9 @@ interface AstGrepModule {
 let astGrepModule: AstGrepModule | null | undefined;
 let loadingPromise: Promise<AstGrepModule | null> | undefined;
 
+// Keep the specifier as a parameter so tsdown cannot fold it into a literal dynamic import.
+const importModule = (moduleName: string) => import(/* @vite-ignore */ /* webpackIgnore: true */ moduleName);
+
 /**
  * Try to load @ast-grep/napi. Returns null if not available.
  * Uses dynamic import to avoid compile-time dependency.
@@ -79,9 +82,7 @@ export async function loadAstGrep(): Promise<AstGrepModule | null> {
   if (!loadingPromise) {
     loadingPromise = (async () => {
       try {
-        // Dynamic import with string concatenation to prevent bundlers from resolving at build time
-        const moduleName = '@ast-grep' + '/napi';
-        const mod = await import(/* @vite-ignore */ /* webpackIgnore: true */ moduleName);
+        const mod = await importModule('@ast-grep/napi');
         astGrepModule = { parse: mod.parse, Lang: mod.Lang };
         return astGrepModule;
       } catch {
@@ -197,9 +198,8 @@ function buildImportStatement(defaultName: string | null, namedImports: string[]
     return `import ${defaultName}, { ${namedImports.join(', ')} } from ${moduleStr};`;
   } else if (defaultName) {
     return `import ${defaultName} from ${moduleStr};`;
-  } else {
-    return `import { ${namedImports.join(', ')} } from ${moduleStr};`;
   }
+  return `import { ${namedImports.join(', ')} } from ${moduleStr};`;
 }
 
 /**
@@ -303,9 +303,8 @@ export function addImport(content: string, root: SgNode, importSpec: ImportSpec)
   if (lastImport) {
     const pos = lastImport.range().end.index;
     return content.slice(0, pos) + '\n' + importStatement + content.slice(pos);
-  } else {
-    return importStatement + '\n\n' + content;
   }
+  return importStatement + '\n\n' + content;
 }
 
 /**
@@ -403,6 +402,7 @@ Transforms:
 
 Pattern replace (for everything else):
   { pattern: "console.log($ARG)", replacement: "logger.debug($ARG)" }`,
+  outputSchema: z.string(),
   inputSchema: z.object({
     path: z.string().describe('The path to the file to edit'),
     pattern: z

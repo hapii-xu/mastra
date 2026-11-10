@@ -1,6 +1,7 @@
 export * from './agent';
 export * from './memory-thread';
 export * from './vector';
+export * from './knowledge';
 export * from './tool';
 export * from './processor';
 export * from './base';
@@ -11,6 +12,7 @@ export * from './mcp-tool';
 export * from './agent-builder';
 export * from './observability';
 export * from './stored-agent';
+export * from './dynamic-workflow';
 export * from './stored-prompt-block';
 export * from './stored-mcp-client';
 export * from './stored-scorer';

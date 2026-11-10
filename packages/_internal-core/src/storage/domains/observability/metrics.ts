@@ -13,6 +13,7 @@ import {
   dimensionsField,
   groupBySchema,
   deltaCursorSchema,
+  experimentIdField,
   listModeSchema,
   normalizeObservabilityListArgs,
   paginationArgsSchema,
@@ -156,6 +157,13 @@ export type MetricsAggregation = z.infer<typeof metricsAggregationSchema>;
 export const metricsFilterSchema = z
   .object({
     ...commonFilterFields,
+    traceIds: z.array(traceIdField).nonempty().max(1000).optional().describe('Filter by one or more trace IDs'),
+    experimentIds: z
+      .array(experimentIdField)
+      .nonempty()
+      .max(1000)
+      .optional()
+      .describe('Filter by one or more experiment IDs'),
 
     // Metric identification
     name: z.array(z.string()).nonempty().optional().describe('Filter by metric name(s)'),
@@ -262,7 +270,8 @@ export const distinctColumnSchema = z
 
 // --- getMetricAggregate ---
 
-const requireDistinctColumnRefinement = {
+/** Shared by the metric args schemas and dashboard metric queries, which rebuild those objects. */
+export const requireDistinctColumnRefinement = {
   check: (data: { aggregation: AggregationType; distinctColumn?: string | undefined }) =>
     data.aggregation !== 'count_distinct' || data.distinctColumn !== undefined,
   options: {

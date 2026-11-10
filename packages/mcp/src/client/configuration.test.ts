@@ -1,4 +1,12 @@
-import { afterEach, describe, expect, it, vi } from 'vitest';
+import { createHash } from 'node:crypto';
+import { createServer } from 'node:http';
+import type { AddressInfo } from 'node:net';
+import { createTool } from '@mastra/core/tools';
+import { CLIENT_INFO_META_KEY } from '@modelcontextprotocol/server';
+import { afterAll, afterEach, beforeAll, describe, expect, it, vi } from 'vitest';
+import { z } from 'zod';
+import { serveHTTP } from '../server/__tests__/harness.mock';
+import { MCPServer } from '../server/server';
 import { InternalMastraMCPClient } from './client';
 import { MCPClient } from './configuration';
 
@@ -8,9 +16,50 @@ describe('MCPClient tool discovery retries', () => {
   const clients: MCPClient[] = [];
 
   afterEach(async () => {
+    vi.useRealTimers();
     vi.restoreAllMocks();
     await Promise.all(clients.map(client => client.disconnect().catch(() => {})));
     clients.length = 0;
+  });
+
+  it('replaces a cached same-id instance when the requested typegen output differs', () => {
+    const options = { id: `typegen-cache-${++clientId}`, servers: {}, typegen: { outFile: 'first.ts' } };
+    const original = new MCPClient(options);
+    clients.push(original);
+    // A cached instance must never keep an output file the caller did not ask for, in either
+    // construction order, so the differing `typegen` replaces it exactly like a server change.
+    const replacement = new MCPClient({ ...options, typegen: { outFile: 'second.ts' } });
+    clients.push(replacement);
+    expect(replacement).not.toBe(original);
+    expect(replacement.typegen).toEqual({ outFile: 'second.ts' });
+    options.typegen.outFile = 'mutated.ts';
+    expect(original.typegen?.outFile).toBe('first.ts');
+    expect(replacement.typegen?.outFile).toBe('second.ts');
+    expect(Object.isFrozen(replacement.typegen)).toBe(true);
+    // An untyped construction with the same id must not inherit or hide the requested output.
+    const untypedAfter = new MCPClient({ id: options.id, servers: {} });
+    clients.push(untypedAfter);
+    expect(untypedAfter).not.toBe(replacement);
+    expect(untypedAfter.typegen).toBeUndefined();
+    const typedAfter = new MCPClient({ id: options.id, servers: {}, typegen: { outFile: 'third.ts' } });
+    clients.push(typedAfter);
+    expect(typedAfter.typegen).toEqual({ outFile: 'third.ts' });
+    const independent = new MCPClient({ ...options, id: `typegen-cache-${++clientId}` });
+    clients.push(independent);
+    expect(independent).not.toBe(original);
+  });
+
+  it('keeps returning the cached instance when the requested typegen output matches', () => {
+    const options = { id: `typegen-same-${++clientId}`, servers: {}, typegen: { outFile: 'same.ts' } };
+    const original = new MCPClient(options);
+    clients.push(original);
+    const alias = new MCPClient({ ...options, typegen: { outFile: 'same.ts' } });
+    expect(alias).toBe(original);
+    expect(alias.typegen).toEqual({ outFile: 'same.ts' });
+  });
+
+  it.each(['', '  ', '\0'])('rejects invalid typegen output paths', outFile => {
+    expect(() => new MCPClient({ id: `typegen-invalid-${++clientId}`, servers: {}, typegen: { outFile } })).toThrow('nonempty file path');
   });
 
   function createClient() {
@@ -60,6 +109,7 @@ describe('MCPClient tool discovery retries', () => {
         weather_getWeather: toolset.getWeather,
       },
       errors: {},
+      errorDetails: {},
     });
     expect(internalClient.tools).toHaveBeenCalledTimes(1);
   });
@@ -87,9 +137,171 @@ describe('MCPClient tool discovery retries', () => {
       errors: {
         stock: 'Validation failed',
       },
+      errorDetails: {
+        stock: { message: 'Validation failed' },
+      },
     });
     expect(weatherClient.tools).toHaveBeenCalledTimes(1);
     expect(stockClient.tools).toHaveBeenCalledTimes(1);
+  });
+
+  it('returns structured transport details without removing legacy string errors', async () => {
+    const client = createClient();
+    const transportError = Object.assign(new Error('Error POSTing to endpoint'), {
+      status: 503,
+      code: 'CLIENT_HTTP_NOT_IMPLEMENTED',
+    });
+    const connectError = new Error('Failed to connect to MCP server weather', { cause: transportError });
+
+    vi.spyOn(client as any, 'getConnectedClientForServer').mockRejectedValue(connectError);
+
+    const result = await client.listToolDefinitionsWithErrors();
+
+    expect(result).toEqual({
+      definitions: {},
+      errors: {
+        weather: 'Failed to connect to MCP server weather (HTTP 503)',
+      },
+      errorDetails: {
+        weather: {
+          message: 'Failed to connect to MCP server weather (HTTP 503)',
+          httpStatus: 503,
+          code: 'CLIENT_HTTP_NOT_IMPLEMENTED',
+        },
+      },
+    });
+  });
+
+  it('exposes structured failures for resource, template, and prompt discovery', async () => {
+    const client = createMultiServerClient();
+    const weatherResources = [{ uri: 'weather://current', name: 'Current weather' }] as any;
+    const weatherTemplates = [{ uriTemplate: 'weather://forecast/{city}', name: 'Forecast' }] as any;
+    const weatherPrompts = [{ name: 'forecast', description: 'Create a forecast' }] as any;
+    const weatherClient = {
+      resources: {
+        list: vi.fn().mockResolvedValue(weatherResources),
+        templates: vi.fn().mockResolvedValue(weatherTemplates),
+      },
+      prompts: {
+        list: vi.fn().mockResolvedValue(weatherPrompts),
+      },
+    } as any;
+    const transportError = Object.assign(new Error('service unavailable'), {
+      status: 503,
+      code: 'CLIENT_HTTP_NOT_IMPLEMENTED',
+    });
+    const stockError = new Error('Failed to connect to MCP server stock', { cause: transportError });
+
+    vi.spyOn(client as any, 'getConnectedClientForServer').mockImplementation(async (serverName: string) => {
+      if (serverName === 'stock') throw stockError;
+      return weatherClient;
+    });
+
+    const resources = await client.resources.listWithErrors();
+    const templates = await client.resources.templatesWithErrors();
+    const prompts = await client.prompts.listWithErrors();
+    const expectedDiagnostics = {
+      errors: { stock: 'Failed to connect to MCP server stock (HTTP 503)' },
+      errorDetails: {
+        stock: {
+          message: 'Failed to connect to MCP server stock (HTTP 503)',
+          httpStatus: 503,
+          code: 'CLIENT_HTTP_NOT_IMPLEMENTED',
+        },
+      },
+    };
+
+    expect(resources).toEqual({ resources: { weather: weatherResources }, ...expectedDiagnostics });
+    expect(templates).toEqual({ templates: { weather: weatherTemplates }, ...expectedDiagnostics });
+    expect(prompts).toEqual({ prompts: { weather: weatherPrompts }, ...expectedDiagnostics });
+
+    await expect(client.resources.list()).resolves.toEqual({ weather: weatherResources });
+    await expect(client.resources.templates()).resolves.toEqual({ weather: weatherTemplates });
+    await expect(client.prompts.list()).resolves.toEqual({ weather: weatherPrompts });
+  });
+
+  it('keeps aggregate discovery isolated when an error metadata accessor throws', async () => {
+    const client = createClient();
+    const hostileError = new Proxy(Object.create(null) as object, {
+      get() {
+        throw new Error('metadata accessor failed');
+      },
+    });
+
+    vi.spyOn(client as any, 'getConnectedClientForServer').mockRejectedValue(hostileError);
+
+    await expect(client.listToolsWithErrors()).resolves.toEqual({
+      tools: {},
+      errors: { weather: 'Unknown error' },
+      errorDetails: { weather: { message: 'Unknown error' } },
+    });
+  });
+
+  it('returns healthy tools and timing diagnostics when another server exceeds its discovery budget', async () => {
+    vi.useFakeTimers();
+    const client = createMultiServerClient();
+    const weatherTools = { getWeather: {} as any };
+    const weatherClient = {
+      tools: vi.fn().mockResolvedValue(weatherTools),
+    } as any;
+    const stockClient = {
+      tools: vi.fn().mockImplementation(() => new Promise(() => {})),
+    } as any;
+
+    vi.spyOn(client as any, 'getConnectedClientForServer').mockImplementation(async (serverName: string) => {
+      return serverName === 'weather' ? weatherClient : stockClient;
+    });
+
+    const pending = client.listToolsWithErrors({ perServerTimeoutMs: 50 });
+    await vi.advanceTimersByTimeAsync(50);
+    const result = await pending;
+
+    expect(result).toEqual({
+      tools: {
+        weather_getWeather: weatherTools.getWeather,
+      },
+      errors: {
+        stock: 'Discovery timed out after 50ms',
+      },
+      errorDetails: {
+        stock: { message: 'Discovery timed out after 50ms', code: 'MCP_DISCOVERY_TIMEOUT' },
+      },
+      durations: {
+        weather: 0,
+        stock: 50,
+      },
+    });
+    expect(vi.getTimerCount()).toBe(0);
+  });
+
+  it('returns durations from toolset and tool definition discovery when options are supplied', async () => {
+    vi.useFakeTimers();
+    const client = createClient();
+    const toolset = { getWeather: {} as any };
+    const definitions = { getWeather: { name: 'getWeather' } } as any;
+    const internalClient = {
+      tools: vi.fn().mockResolvedValue(toolset),
+      toolDefinitions: vi.fn().mockResolvedValue(definitions),
+    } as any;
+
+    vi.spyOn(client as any, 'getConnectedClientForServer').mockResolvedValue(internalClient);
+
+    const toolsetsResult = await client.listToolsetsWithErrors({ perServerTimeoutMs: 50 });
+    const definitionsResult = await client.listToolDefinitionsWithErrors({ perServerTimeoutMs: 50 });
+
+    expect(toolsetsResult).toEqual({
+      toolsets: { weather: toolset },
+      errors: {},
+      errorDetails: {},
+      durations: { weather: 0 },
+    });
+    expect(definitionsResult).toEqual({
+      definitions: { weather: definitions },
+      errors: {},
+      errorDetails: {},
+      durations: { weather: 0 },
+    });
+    expect(vi.getTimerCount()).toBe(0);
   });
 
   it('retries listToolsWithErrors once after a reconnectable discovery failure', async () => {
@@ -109,6 +321,7 @@ describe('MCPClient tool discovery retries', () => {
         weather_getWeather: toolset.getWeather,
       },
       errors: {},
+      errorDetails: {},
     });
     expect(internalClient.tools).toHaveBeenCalledTimes(2);
     expect(reconnectSpy).toHaveBeenCalledTimes(1);
@@ -138,6 +351,7 @@ describe('MCPClient tool discovery retries', () => {
         stock_search: stockTools.search,
       },
       errors: {},
+      errorDetails: {},
     });
   });
 
@@ -158,6 +372,7 @@ describe('MCPClient tool discovery retries', () => {
         weather: toolset,
       },
       errors: {},
+      errorDetails: {},
     });
     expect(internalClient.tools).toHaveBeenCalledTimes(2);
     expect(reconnectSpy).toHaveBeenCalledTimes(1);
@@ -179,6 +394,9 @@ describe('MCPClient tool discovery retries', () => {
       toolsets: {},
       errors: {
         weather: 'Validation failed',
+      },
+      errorDetails: {
+        weather: { message: 'Validation failed' },
       },
     });
     expect(internalClient.tools).toHaveBeenCalledTimes(1);
@@ -206,11 +424,7 @@ describe('MCPClient tool discovery retries', () => {
   });
 
   it('forwards per-server capabilities into InternalMastraMCPClient', async () => {
-    const customCapabilities = {
-      elicitation: {
-        supportedContentTypes: ['text/uri-list', 'application/vnd.mastra.form+json'],
-      },
-    } as any;
+    const customCapabilities = { elicitation: { form: {}, url: {} } };
 
     const connectSpy = vi.spyOn(InternalMastraMCPClient.prototype, 'connect').mockResolvedValue(true);
 
@@ -218,8 +432,9 @@ describe('MCPClient tool discovery retries', () => {
       id: `configuration-test-${++clientId}`,
       servers: {
         weather: {
-          url: new URL('http://localhost:1234/sse'),
+          url: new URL('http://localhost:1234/mcp'),
           capabilities: customCapabilities,
+          inputRequests: async () => ({ action: 'decline' }),
         },
       },
     });
@@ -233,27 +448,45 @@ describe('MCPClient tool discovery retries', () => {
     expect(capabilities).toMatchObject(customCapabilities);
   });
 
-  it('registers elicitation handlers before connecting the server', async () => {
+  it('advertises form elicitation when an inputRequests handler is configured', async () => {
     const connectSpy = vi.spyOn(InternalMastraMCPClient.prototype, 'connect').mockResolvedValue(true);
 
     const client = new MCPClient({
       id: `configuration-test-${++clientId}`,
       servers: {
         weather: {
-          url: new URL('http://localhost:1234/sse'),
+          url: new URL('http://localhost:1234/mcp'),
+          inputRequests: async () => ({ action: 'decline' }),
+        },
+        silent: {
+          url: new URL('http://localhost:5678/mcp'),
         },
       },
     });
 
     clients.push(client);
 
-    await client.elicitation.onRequest('weather', async () => ({ action: 'decline' }));
+    const withHandler = (await (client as any).getConnectedClientForServer('weather')).client._capabilities;
+    const withoutHandler = (await (client as any).getConnectedClientForServer('silent')).client._capabilities;
 
-    const internalClient = (client as any).mcpClientsById.get('weather');
-    const capabilities = internalClient.client._capabilities;
+    expect(connectSpy).toHaveBeenCalledTimes(2);
+    expect(withHandler.elicitation).toEqual({ form: {} });
+    expect(withoutHandler.elicitation).toBeUndefined();
+  });
 
-    expect(connectSpy).not.toHaveBeenCalled();
-    expect(capabilities.elicitation).toMatchObject({ form: {} });
+  it('rejects an elicitation capability without an inputRequests handler', async () => {
+    const client = new MCPClient({
+      id: `configuration-test-${++clientId}`,
+      servers: {
+        weather: {
+          url: new URL('http://localhost:1234/mcp'),
+          capabilities: { elicitation: { form: {} } },
+        },
+      },
+    });
+    clients.push(client);
+
+    await expect((client as any).getConnectedClientForServer('weather')).rejects.toThrow(/inputRequests/);
   });
 
   it('returns cached server instructions for configured servers', async () => {
@@ -282,5 +515,449 @@ describe('MCPClient tool discovery retries', () => {
       db: 'Validate schema before migrating.',
       empty: undefined,
     });
+  });
+
+  const makeThreeServerClient = () => {
+    const client = new MCPClient({
+      id: `configuration-test-${++clientId}`,
+      servers: {
+        alpha: { url: new URL('http://localhost:1111/sse') },
+        bravo: { url: new URL('http://localhost:2222/sse') },
+        charlie: { url: new URL('http://localhost:3333/sse') },
+      },
+    });
+    clients.push(client);
+    return client;
+  };
+
+  // Spies getConnectedClientForServer so each server's discovery call awaits
+  // `gate(serverName)` before returning a probe result. `gate` is where each
+  // test injects its timing — a per-server delay, or a concurrency latch.
+  type Gate = (serverName: string) => Promise<void>;
+  const installToolsMock = (client: MCPClient, gate: Gate) =>
+    vi.spyOn(client as any, 'getConnectedClientForServer').mockImplementation(async (serverName: string) => ({
+      tools: vi.fn().mockImplementation(async () => {
+        await gate(serverName);
+        return { probe: {} as any };
+      }),
+    }));
+  const installResourcesMock = (client: MCPClient, gate: Gate) =>
+    vi.spyOn(client as any, 'getConnectedClientForServer').mockImplementation(async (serverName: string) => ({
+      resources: {
+        list: vi.fn().mockImplementation(async () => {
+          await gate(serverName);
+          return [{ uri: `${serverName}://probe` } as any];
+        }),
+      },
+    }));
+
+  // Servers resolve in reverse configuration order; asserts the folded result
+  // still keys in configuration order (a completion-order fold would not).
+  const expectConfigOrder = async (
+    installMock: (client: MCPClient, gate: Gate) => void,
+    invoke: (client: MCPClient) => Promise<Record<string, unknown>>,
+    expectedKeys: string[],
+  ) => {
+    const client = makeThreeServerClient();
+    const delays: Record<string, number> = { alpha: 30, bravo: 15, charlie: 0 };
+    installMock(client, serverName => new Promise(resolve => setTimeout(resolve, delays[serverName])));
+    expect(Object.keys(await invoke(client))).toEqual(expectedKeys);
+  };
+
+  // Asserts every server's discovery is in flight at once; deadlocks against a
+  // serial implementation, where only the first server would ever start.
+  const expectConcurrentDiscovery = async (
+    installMock: (client: MCPClient, gate: Gate) => void,
+    invoke: (client: MCPClient) => Promise<unknown>,
+  ) => {
+    const client = makeThreeServerClient();
+    const serverCount = 3;
+    let inFlight = 0;
+    let maxInFlight = 0;
+    const release: Array<() => void> = [];
+    const allStarted = new Promise<void>(resolveAllStarted => {
+      installMock(client, async () => {
+        inFlight++;
+        maxInFlight = Math.max(maxInFlight, inFlight);
+        if (inFlight === serverCount) resolveAllStarted();
+        await new Promise<void>(resolve => release.push(resolve));
+        inFlight--;
+      });
+    });
+
+    const pending = invoke(client);
+    await allStarted;
+    expect(maxInFlight).toBe(serverCount);
+    release.forEach(fn => fn());
+    await pending;
+  };
+
+  it('preserves configuration order in listToolsWithErrors even when servers resolve out of order', () =>
+    expectConfigOrder(installToolsMock, async client => (await client.listToolsWithErrors()).tools, [
+      'alpha_probe',
+      'bravo_probe',
+      'charlie_probe',
+    ]));
+
+  it('discovers tools from all servers concurrently rather than serially', () =>
+    expectConcurrentDiscovery(installToolsMock, client => client.listToolsWithErrors()));
+
+  // resources.list() shares the concurrent settle/fold path but is an
+  // independent code path from tool discovery, so cover it directly too.
+  it('preserves configuration order in resources.list even when servers resolve out of order', () =>
+    expectConfigOrder(installResourcesMock, client => client.resources.list(), ['alpha', 'bravo', 'charlie']));
+
+  it('lists resources from all servers concurrently rather than serially', () =>
+    expectConcurrentDiscovery(installResourcesMock, client => client.resources.list()));
+});
+
+describe('MCPClient clientInfo', () => {
+  const clients: MCPClient[] = [];
+  let legacy: Awaited<ReturnType<typeof recordingLegacyServer>>;
+
+  beforeAll(async () => {
+    legacy = await recordingLegacyServer();
+  });
+
+  afterAll(async () => {
+    await legacy.close();
+  });
+
+  afterEach(async () => {
+    await Promise.all(clients.map(client => client.disconnect().catch(() => {})));
+    clients.length = 0;
+  });
+
+  /** Connects every server and returns the `clientInfo` each one received in `initialize`, keyed by server name. */
+  async function wireClientInfo(client: MCPClient) {
+    clients.push(client);
+    await client.listTools();
+    return legacy.clientInfo;
+  }
+
+  const at = (server: string) => new URL(`${legacy.url}?server=${server}`);
+
+  it('defaults to the server key and version 1.0.0', async () => {
+    const client = new MCPClient({
+      id: `client-info-test-${++clientId}`,
+      servers: { weather: { url: at('weather') } },
+    });
+
+    expect((await wireClientInfo(client)).get('weather')).toEqual({ name: 'weather', version: '1.0.0' });
+  });
+
+  it('applies top-level clientInfo to every server', async () => {
+    const client = new MCPClient({
+      id: `client-info-test-${++clientId}`,
+      clientInfo: { name: 'my-app', version: '2.3.4' },
+      servers: {
+        weather: { url: at('weather') },
+        stock: { url: at('stock') },
+      },
+    });
+
+    const received = await wireClientInfo(client);
+    expect(received.get('weather')).toEqual({ name: 'my-app', version: '2.3.4' });
+    expect(received.get('stock')).toEqual({ name: 'my-app', version: '2.3.4' });
+  });
+
+  it('merges per-server clientInfo over the top-level default field-wise', async () => {
+    const client = new MCPClient({
+      id: `client-info-test-${++clientId}`,
+      clientInfo: { name: 'my-app', version: '2.3.4' },
+      servers: {
+        weather: { url: at('weather'), clientInfo: { version: '9.9.9' } },
+        stock: { url: at('stock'), clientInfo: { name: undefined, version: '1.2.3' } },
+      },
+    });
+
+    const received = await wireClientInfo(client);
+    expect(received.get('weather')).toEqual({ name: 'my-app', version: '9.9.9' });
+    expect(received.get('stock')).toEqual({ name: 'my-app', version: '1.2.3' });
+  });
+
+  it('sends clientInfo in request _meta on the 2026-07-28 revision', async () => {
+    const served = await serveHTTP(new MCPServer({ name: 'Modern', version: '1.0.0', tools: {} }));
+    const metas: unknown[] = [];
+    const fetchSpy = vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+      if (typeof init?.body === 'string') metas.push(JSON.parse(init.body).params?._meta?.[CLIENT_INFO_META_KEY]);
+      return fetch(input, init);
+    });
+    const client = new MCPClient({
+      id: `client-info-test-${++clientId}`,
+      clientInfo: { name: 'my-app', version: '2.3.4' },
+      servers: { modern: { url: served.url, fetch: fetchSpy } },
+    });
+    clients.push(client);
+
+    try {
+      await client.listTools();
+      expect(metas.length).toBeGreaterThan(0);
+      expect(metas).toEqual(metas.map(() => ({ name: 'my-app', version: '2.3.4' })));
+    } finally {
+      await client.disconnect();
+      await served.close();
+    }
+  });
+
+  it('keeps the server key as the tool namespace when clientInfo.name is set', async () => {
+    const client = new MCPClient({
+      id: `client-info-test-${++clientId}`,
+      clientInfo: { name: 'my-app' },
+      servers: { weather: { url: new URL('http://localhost:1234/mcp') } },
+    });
+    clients.push(client);
+
+    vi.spyOn(InternalMastraMCPClient.prototype, 'connect').mockResolvedValue(undefined as any);
+    vi.spyOn(InternalMastraMCPClient.prototype, 'tools').mockResolvedValue({ forecast: { id: 'forecast' } } as any);
+
+    const tools = await client.listTools();
+    expect(Object.keys(tools)).toEqual(['weather_forecast']);
+    vi.restoreAllMocks();
+  });
+});
+
+describe('MCPClient process hook identity', () => {
+  it('reuses the default explicit-id client when hooks are explicitly enabled', async () => {
+    const options = { id: `hooks-default-${++clientId}`, servers: {} };
+    const original = new MCPClient(options);
+    try {
+      expect(new MCPClient({ ...options, registerProcessHooks: true })).toBe(original);
+    } finally {
+      await original.disconnect();
+    }
+  });
+
+  it('allows independent clients with identical servers and different hook settings', async () => {
+    const servers = { weather: { url: new URL('http://localhost:4324/mcp') } };
+    const original = new MCPClient({ servers });
+    let independent: MCPClient | undefined;
+    try {
+      independent = new MCPClient({ servers, registerProcessHooks: false });
+      expect(independent).not.toBe(original);
+    } finally {
+      await Promise.all([original.disconnect(), independent?.disconnect()]);
+    }
+  });
+
+  it('replaces a cached explicit-id client when process hook ownership changes', async () => {
+    const options = { id: `hooks-changed-${++clientId}`, servers: {} };
+    const original = new MCPClient(options);
+    const replacement = new MCPClient({ ...options, registerProcessHooks: false });
+    try {
+      expect(replacement).not.toBe(original);
+      expect(new MCPClient({ ...options, registerProcessHooks: false })).toBe(replacement);
+    } finally {
+      await Promise.all([original.disconnect(), replacement.disconnect()]);
+    }
+  });
+});
+
+describe('MCPClient clientInfo identity', () => {
+  it('keeps auto-generated ids unchanged when clientInfo is not set', async () => {
+    const servers = { weather: { url: new URL('http://localhost:4320/mcp') } };
+    const client = new MCPClient({ servers });
+    const expected = createHash('sha256')
+      .update('MCPClient')
+      .update(JSON.stringify(servers).normalize('NFKC'))
+      .digest('hex');
+    expect((client as any).id).toBe(expected);
+    await client.disconnect();
+  });
+
+  it('treats clients with different top-level clientInfo as distinct instances', async () => {
+    const servers = { weather: { url: new URL('http://localhost:4321/mcp') } };
+    const a = new MCPClient({ servers, clientInfo: { name: 'app-a' } });
+    const b = new MCPClient({ servers, clientInfo: { name: 'app-b' } });
+    expect((a as any).id).not.toBe((b as any).id);
+    await Promise.all([a.disconnect(), b.disconnect()]);
+  });
+
+  it('replaces a cached explicit-id client when clientInfo changes', async () => {
+    const legacy = await recordingLegacyServer();
+    const servers = { weather: { url: new URL(`${legacy.url}?server=weather`) } };
+    const id = `client-info-identity-${++clientId}`;
+    const a = new MCPClient({ id, servers, clientInfo: { name: 'app-a' } });
+    const b = new MCPClient({ id, servers, clientInfo: { name: 'app-b' } });
+    try {
+      await b.listTools();
+      expect(legacy.clientInfo.get('weather')).toEqual({ name: 'app-b', version: '1.0.0' });
+    } finally {
+      await Promise.all([a.disconnect(), b.disconnect()]);
+      await legacy.close();
+    }
+  });
+
+  it('does not let a replaced client evict its replacement on disconnect', async () => {
+    const servers = { weather: { url: new URL('http://localhost:4322/mcp') } };
+    const id = `client-info-identity-${++clientId}`;
+    const a = new MCPClient({ id, servers, clientInfo: { name: 'app-a' } });
+    const b = new MCPClient({ id, servers, clientInfo: { name: 'app-b' } });
+    await a.disconnect();
+    await a.disconnect();
+    const again = new MCPClient({ id, servers, clientInfo: { name: 'app-b' } });
+    expect(again).toBe(b);
+    await b.disconnect();
+  });
+
+  it('detects a clientInfo change when the caller mutates a shared object', async () => {
+    const servers = { weather: { url: new URL('http://localhost:4322/mcp') } };
+    const id = `client-info-identity-${++clientId}`;
+    const clientInfo = { name: 'app-a' };
+    const a = new MCPClient({ id, servers, clientInfo });
+    clientInfo.name = 'app-b';
+    const b = new MCPClient({ id, servers, clientInfo });
+    expect(b).not.toBe(a);
+    await Promise.all([a.disconnect(), b.disconnect()]);
+  });
+});
+
+/** A pre-2026 server that records the `clientInfo` from each `initialize`, keyed by the `server` query param. */
+async function recordingLegacyServer() {
+  const clientInfo = new Map<string, unknown>();
+  const httpServer = createServer(async (req, res) => {
+    if (req.method !== 'POST') return res.writeHead(405).end();
+    const chunks: Buffer[] = [];
+    for await (const chunk of req) chunks.push(chunk as Buffer);
+    const body = JSON.parse(Buffer.concat(chunks).toString('utf8'));
+    const reply = (payload: object) =>
+      res
+        .writeHead(200, { 'content-type': 'application/json' })
+        .end(JSON.stringify({ jsonrpc: '2.0', id: body.id ?? null, ...payload }));
+    switch (body.method) {
+      case 'initialize':
+        clientInfo.set(
+          new URL(req.url ?? '', 'http://localhost').searchParams.get('server') ?? '',
+          body.params.clientInfo,
+        );
+        return reply({
+          result: {
+            protocolVersion: '2025-11-25',
+            capabilities: { tools: {} },
+            serverInfo: { name: 'legacy', version: '1' },
+          },
+        });
+      case 'notifications/initialized':
+        return res.writeHead(202).end();
+      case 'tools/list':
+        return reply({ result: { tools: [] } });
+      default:
+        return reply({ error: { code: -32601, message: 'Method not found' } });
+    }
+  });
+  const url = await new Promise<URL>(resolve =>
+    httpServer.listen(0, '127.0.0.1', () =>
+      resolve(new URL(`http://127.0.0.1:${(httpServer.address() as AddressInfo).port}/mcp`)),
+    ),
+  );
+  return {
+    url,
+    clientInfo,
+    close: async () => {
+      httpServer.closeAllConnections();
+      await new Promise<void>(resolve => httpServer.close(() => resolve()));
+    },
+  };
+}
+
+describe('MCPClient app-only tools', () => {
+  const echo = (id: string, visibility?: Array<'model' | 'app'>) =>
+    createTool({
+      id,
+      description: id,
+      inputSchema: z.object({}),
+      execute: async () => ({ ok: true }),
+      ...(visibility ? { mcp: { _meta: { ui: { visibility } } } } : {}),
+    });
+
+  async function connectToAppServer() {
+    const served = await serveHTTP(
+      new MCPServer({
+        name: 'Apps',
+        version: '1.0.0',
+        tools: {
+          plain: echo('plain'),
+          shared: echo('shared', ['model', 'app']),
+          appOnly: echo('appOnly', ['app']),
+        },
+      }),
+    );
+    const client = new MCPClient({ id: `app-only-${++clientId}`, servers: { apps: { url: served.url } } });
+    return {
+      client,
+      close: async () => {
+        await client.disconnect();
+        await served.close();
+      },
+    };
+  }
+
+  it('keeps tools meant only for MCP Apps away from agents', async () => {
+    const { client, close } = await connectToAppServer();
+    try {
+      expect(Object.keys(await client.listTools()).sort()).toEqual(['apps_plain', 'apps_shared']);
+      expect(Object.keys((await client.listToolsets()).apps ?? {}).sort()).toEqual(['plain', 'shared']);
+    } finally {
+      await close();
+    }
+  });
+
+  it('keeps them out of cached tool catalogs, so agents rebuilt from a cache never get them', async () => {
+    const { client, close } = await connectToAppServer();
+    try {
+      const definitions = JSON.parse(JSON.stringify(await client.listToolDefinitions()));
+      expect(Object.keys(definitions.apps ?? {}).sort()).toEqual(['plain', 'shared']);
+      expect(Object.keys(await client.toolsFromDefinitions({ definitions })).sort()).toEqual([
+        'apps_plain',
+        'apps_shared',
+      ]);
+    } finally {
+      await close();
+    }
+  });
+
+  it('drops app-only tools from a catalog cached before they were filtered out', async () => {
+    const { client, close } = await connectToAppServer();
+    try {
+      const definitions = JSON.parse(JSON.stringify(await client.listToolDefinitions()));
+      definitions.apps.appOnly = { ...definitions.apps.plain, name: 'appOnly', _meta: { ui: { visibility: ['app'] } } };
+
+      expect(Object.keys(await client.toolsFromDefinitions({ definitions })).sort()).toEqual([
+        'apps_plain',
+        'apps_shared',
+      ]);
+    } finally {
+      await close();
+    }
+  });
+
+  it('never hands app-only tools to the per-server discovery callback', async () => {
+    const { client, close } = await connectToAppServer();
+    try {
+      const seen: Record<string, string[]> = {};
+      await client.listToolsWithErrors({
+        onServerSettled: (serverName, result) => {
+          seen[`tools:${serverName}`] = Object.keys(result.value ?? {}).sort();
+        },
+      });
+      await client.listToolsetsWithErrors({
+        onServerSettled: (serverName, result) => {
+          seen[`toolsets:${serverName}`] = Object.keys(result.value ?? {}).sort();
+        },
+      });
+      await client.listToolDefinitionsWithErrors({
+        onServerSettled: (serverName, result) => {
+          seen[`definitions:${serverName}`] = Object.keys(result.value ?? {}).sort();
+        },
+      });
+
+      expect(seen).toEqual({
+        'tools:apps': ['plain', 'shared'],
+        'toolsets:apps': ['plain', 'shared'],
+        'definitions:apps': ['plain', 'shared'],
+      });
+    } finally {
+      await close();
+    }
   });
 });

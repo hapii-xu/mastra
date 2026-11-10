@@ -16,7 +16,7 @@
       "outputs": ["dist/**", "!dist/docs/**"],
       "inputs": [
         "src/**",
-        "tsup.config.ts",
+        "tsdown.config.ts",
         "tsconfig.json",
         "package.json",
         "!**/*.md",
@@ -27,10 +27,11 @@
       ]
     },
     "test": {
-      "dependsOn": ["test:unit", "test:integration"],
+      "dependsOn": ["^build"],
       "inputs": ["src/**", "tsconfig.json", "package.json", "vitest.config.*", "!**/*.md"]
     },
     "test:unit": {
+      "dependsOn": ["^build"],
       "inputs": ["src/**", "tsconfig.json", "package.json", "vitest.config.*", "!**/*.md"]
     }
   }

@@ -1,13 +1,9 @@
 import { pathToFileURL } from 'node:url';
-
-import { openai } from '@ai-sdk/openai';
 import { Agent } from '@mastra/core/agent';
 import { TaskSignalProvider } from '@mastra/core/signals';
-import { askUserTool } from '@mastra/core/tools';
+import { askUserTool, webFetchTool, webSearchTool } from '@mastra/core/tools';
 import { LocalFilesystem, LocalSandbox, WORKSPACE_TOOLS, Workspace } from '@mastra/core/workspace';
 import { Memory } from '@mastra/memory';
-
-import { webFetchTool } from '../tools/web-fetch-tool';
 import { startScheduleTool, stopScheduleTool } from '../tools/schedule-tools';
 
 const workspacePath = 'workspace';
@@ -39,6 +35,13 @@ export const agent = new Agent({
   name: 'Agent',
   description:
     'A general-purpose assistant that can research, manage tasks, work with local files, run approved commands, and create recurring schedules.',
+  metadata: {
+    suggestedPrompts: [
+      "What's the weather in Austin this weekend?",
+      "What's the SPCX stock price right now?",
+      'Build a Japanese sakura festival landing page.',
+    ],
+  },
   instructions: `You are a friendly starter agent for exploring what Mastra can do. Help the user try useful capabilities, build small projects, answer current questions, and shape this harness into a starting point for future work.
 
 Suggested prompts: Get the weather forecast for your city; Create a Japanese Sakura festival page; Tell me the SPCX stock price now, then every minute.
@@ -49,7 +52,7 @@ Ask concise questions when something is unclear or a good question could surface
 
 For local file changes, end with a plain-text URL using ${pathToFileURL(`${workspacePath}/`).href}; avoid Markdown links, localhost, /workspace, relative paths, and static-file servers.
 `,
-  model: 'openai/gpt-5.6-terra',
+  model: 'openai/gpt-6.1-sol',
   defaultOptions: {
     maxSteps: 100,
     autoResumeSuspendedTools: true,
@@ -58,7 +61,7 @@ For local file changes, end with a plain-text URL using ${pathToFileURL(`${works
     options: {
       generateTitle: true,
       observationalMemory: {
-        model: 'openai/gpt-5-mini',
+        model: 'openai/gpt-6-luna',
       },
     },
   }),
@@ -68,7 +71,7 @@ For local file changes, end with a plain-text URL using ${pathToFileURL(`${works
     start_schedule: startScheduleTool,
     stop_schedule: stopScheduleTool,
     web_fetch: webFetchTool,
-    web_search: openai.tools.webSearch(),
+    web_search: webSearchTool,
   },
   signals: [new TaskSignalProvider()],
 });

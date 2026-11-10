@@ -1,20 +1,64 @@
 export interface PlatformApiClientConfig {
   baseUrl: string;
   accessToken: string;
+  /**
+   * Mastra project this deployment belongs to. Sent as `x-mastra-project-id`
+   * so the platform can attribute proxied provider activity to the project;
+   * the platform strips the header before forwarding anything upstream.
+   */
+  projectId?: string;
   fetchImpl?: typeof fetch;
 }
 
+const DEFAULT_INTEGRATIONS_URL = 'https://integrations.mastra.ai';
+const REGIONAL_INTEGRATIONS_URLS: Record<'us' | 'eu', string> = {
+  us: 'https://integrations.us.mastra.ai',
+  eu: 'https://integrations.eu.mastra.ai',
+};
+
 export function platformApiClientConfigFromEnv(): PlatformApiClientConfig {
-  const sharedApiUrl = process.env.MASTRA_SHARED_API_URL?.trim() || 'https://platform.mastra.ai/v1';
-  const accessToken = process.env.MASTRA_PLATFORM_SECRET_KEY?.trim();
+  // MASTRA_INTEGRATIONS_API_URL is the dedicated override for the
+  // integrations service and takes precedence over MASTRA_PLATFORM_REGION.
+  // MASTRA_SHARED_API_URL is deliberately not consulted: it configures the
+  // shared platform API, and integrations routing is independent of it.
+  const integrationsApiUrl = process.env.MASTRA_INTEGRATIONS_API_URL?.trim() || resolveIntegrationsUrl();
+  // MASTRA_PLATFORM_ACCESS_TOKEN is the credential Mastra Platform injects
+  // into deployed projects; MASTRA_PLATFORM_SECRET_KEY is the org secret key
+  // written by project scaffolding. The platform API accepts both forms.
+  const accessToken =
+    process.env.MASTRA_PLATFORM_ACCESS_TOKEN?.trim() || process.env.MASTRA_PLATFORM_SECRET_KEY?.trim();
   if (!accessToken) {
-    throw new Error('Platform integration: missing required environment variable MASTRA_PLATFORM_SECRET_KEY.');
+    throw new Error(
+      'Platform integration: missing required environment variable MASTRA_PLATFORM_ACCESS_TOKEN (or MASTRA_PLATFORM_SECRET_KEY).',
+    );
   }
-  return { baseUrl: normalizeSharedApiUrl(sharedApiUrl), accessToken };
+  const projectId = process.env.MASTRA_PROJECT_ID?.trim();
+  return {
+    baseUrl: normalizeIntegrationsApiUrl(integrationsApiUrl),
+    accessToken,
+    ...(projectId ? { projectId } : {}),
+  };
 }
 
-function normalizeSharedApiUrl(sharedApiUrl: string): string {
-  return sharedApiUrl.replace(/\/+$/, '').replace(/\/v1$/, '');
+/**
+ * Resolves the integrations API base URL from `MASTRA_PLATFORM_REGION`
+ * (case-insensitive `us` or `eu`), falling back to the global default.
+ * Unknown region values fall through to the global default.
+ */
+function resolveIntegrationsUrl(): string {
+  const region = process.env.MASTRA_PLATFORM_REGION?.trim().toLowerCase();
+  if (region === 'us' || region === 'eu') return REGIONAL_INTEGRATIONS_URLS[region];
+  return DEFAULT_INTEGRATIONS_URL;
+}
+
+/**
+ * Normalizes an integrations API URL to a bare origin. Callers pass fully
+ * versioned paths (`/v1/server/...`, `/v2/...`), so a trailing `/v1` — as in
+ * legacy platform API URLs like `https://platform.mastra.ai/v1` — is stripped
+ * to avoid duplicated version segments.
+ */
+function normalizeIntegrationsApiUrl(integrationsApiUrl: string): string {
+  return integrationsApiUrl.replace(/\/+$/, '').replace(/\/v1$/, '');
 }
 
 export class PlatformApiError extends Error {
@@ -32,6 +76,7 @@ export class PlatformApiError extends Error {
 export class PlatformApiClient {
   readonly #baseUrl: string;
   readonly #accessToken: string;
+  readonly #projectId: string | null;
   readonly #fetch: typeof fetch;
 
   constructor(config: PlatformApiClientConfig) {
@@ -41,6 +86,7 @@ export class PlatformApiClient {
     }
     this.#baseUrl = config.baseUrl.replace(/\/+$/, '');
     this.#accessToken = config.accessToken;
+    this.#projectId = config.projectId?.trim() || null;
     this.#fetch = config.fetchImpl ?? globalThis.fetch;
   }
 
@@ -100,6 +146,12 @@ export class PlatformApiClient {
       accept: 'application/json',
       authorization: `Bearer ${this.#accessToken}`,
     };
+    // Project attribution for proxied provider calls. Org-scoped machine
+    // tokens carry no project claim, so without this header the platform
+    // records proxy activity with no project.
+    if (this.#projectId) {
+      headers['x-mastra-project-id'] = this.#projectId;
+    }
     // Acting end-user for platform GitHub writes: the platform resolves this
     // user's GitHub OAuth connection (org-scoped) so issues/PRs are authored
     // by the human instead of the App bot. Ignored by older platforms.

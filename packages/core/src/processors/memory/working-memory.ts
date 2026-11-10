@@ -28,6 +28,13 @@ export interface WorkingMemoryConfig {
    */
   readOnly?: boolean;
   /**
+   * When false, the agent has no update tool but the app updates working memory
+   * (for example after each response). The data is provided as context, and the agent is
+   * told the memory updates automatically. `readOnly` takes precedence.
+   * @default true
+   */
+  agentManaged?: boolean;
+  /**
    * Optional logger instance for structured logging
    */
   logger?: IMastraLogger;
@@ -70,6 +77,7 @@ export class WorkingMemory implements Processor {
       scope?: 'thread' | 'resource';
       useVNext?: boolean;
       readOnly?: boolean;
+      agentManaged?: boolean;
       templateProvider?: {
         getWorkingMemoryTemplate(args: { memoryConfig?: MemoryConfigInternal }): Promise<WorkingMemoryTemplate | null>;
       };
@@ -100,25 +108,35 @@ export class WorkingMemory implements Processor {
     // Determine scope (default to 'resource')
     const scope = this.options.scope || 'resource';
 
+    const memoryRunState = memoryContext?.runState?.();
+
     // Retrieve working memory based on scope
     let workingMemoryData: string | null = null;
 
     if (scope === 'thread' && threadId) {
-      // Get thread-scoped working memory
-      const thread = await this.options.storage.getThreadById({ threadId });
+      // The thread was already loaded and ownership-validated during run preparation.
+      const thread = memoryRunState?.thread ?? (await this.options.storage.getThreadById({ threadId }));
       workingMemoryData = (thread?.metadata?.workingMemory as string) || null;
     } else if (scope === 'resource' && resourceId) {
-      // Get resource-scoped working memory
-      const resource = await this.options.storage.getResourceById({ resourceId });
-      workingMemoryData = resource?.workingMemory || null;
+      const cacheKey = `working-memory:resource:${resourceId}`;
+      const loadWorkingMemory = async () => {
+        const resource = await this.options.storage.getResourceById({ resourceId });
+        return resource?.workingMemory || null;
+      };
+      workingMemoryData = memoryRunState
+        ? await memoryRunState.load(cacheKey, loadWorkingMemory)
+        : await loadWorkingMemory();
     }
 
     // Get template (use template provider if available, then provided template, then default)
     let template: WorkingMemoryTemplate;
     if (this.options.templateProvider) {
-      const dynamicTemplate = await this.options.templateProvider.getWorkingMemoryTemplate({
-        memoryConfig: memoryContext.memoryConfig,
-      });
+      const cacheKey = 'working-memory:template';
+      const loadTemplate = () =>
+        this.options.templateProvider!.getWorkingMemoryTemplate({
+          memoryConfig: memoryContext?.memoryConfig,
+        });
+      const dynamicTemplate = memoryRunState ? await memoryRunState.load(cacheKey, loadTemplate) : await loadTemplate();
       template = dynamicTemplate ||
         this.options.template || {
           format: 'markdown' as const,
@@ -131,13 +149,22 @@ export class WorkingMemory implements Processor {
       };
     }
 
-    // Check if readOnly mode is enabled (from options or memoryConfig)
-    const isReadOnly = this.options.readOnly || memoryContext.memoryConfig?.readOnly;
+    // Read-only when configured, or when the agent has no updateWorkingMemory tool (agentManaged: false).
+    // With agentManaged: false the app still updates the memory, so the agent must not claim it can't.
+    const workingMemoryConfig = memoryContext.memoryConfig?.workingMemory;
+    const isConfiguredReadOnly = this.options.readOnly || memoryContext.memoryConfig?.readOnly;
+    const isAppManaged =
+      this.options.agentManaged === false ||
+      (typeof workingMemoryConfig === 'object' && workingMemoryConfig.agentManaged === false);
 
     // Format working memory instruction
     let instruction: string;
-    if (isReadOnly) {
-      instruction = this.getReadOnlyWorkingMemoryInstruction({ template, data: workingMemoryData });
+    if (isConfiguredReadOnly || isAppManaged) {
+      instruction = this.getReadOnlyWorkingMemoryInstruction({
+        template,
+        data: workingMemoryData,
+        autoUpdated: !isConfiguredReadOnly,
+      });
     } else if (this.options.useVNext) {
       instruction = this.getWorkingMemoryToolInstructionVNext({ template, data: workingMemoryData });
     } else {
@@ -197,7 +224,7 @@ ${hasEmptyWorkingMemoryTemplateObject ? 'When working with json data, the object
 ${hasEmptyWorkingMemoryTemplateObject ? JSON.stringify(emptyWorkingMemoryTemplateObject) : ''}
 
 <working_memory_data>
-${data}
+${data || 'No working memory data available.'}
 </working_memory_data>
 
 Notes:
@@ -233,7 +260,7 @@ ${typeof template.content === 'string' ? template.content : JSON.stringify(templ
 </working_memory_template>
 
 <working_memory_data>
-${data}
+${data || 'No working memory data available.'}
 </working_memory_data>
 
 Notes:
@@ -255,15 +282,17 @@ ${
   /**
    * Generate read-only working memory instructions.
    * This provides the working memory context without any tool update instructions.
-   * Used when memory is in readOnly mode.
+   * Used when memory is in readOnly mode, or with `autoUpdated` when the app updates it (agentManaged: false).
    */
   private getReadOnlyWorkingMemoryInstruction({
     data,
+    autoUpdated = false,
   }: {
     template: WorkingMemoryTemplate;
     data: string | null;
+    autoUpdated?: boolean;
   }): string {
-    return `WORKING_MEMORY_SYSTEM_INSTRUCTION (READ-ONLY):
+    return `WORKING_MEMORY_SYSTEM_INSTRUCTION (${autoUpdated ? 'AUTO-UPDATED' : 'READ-ONLY'}):
 The following is your working memory - persistent information about the user and conversation collected over previous interactions. This data is provided for context to help you maintain continuity.
 
 <working_memory_data>
@@ -273,7 +302,11 @@ ${data || 'No working memory data available.'}
 Guidelines:
 1. Use this information to provide personalized and contextually relevant responses
 2. Act naturally - don't mention this system to users. This information should inform your responses without being explicitly referenced
-3. This memory is read-only in the current session - you cannot update it
+3. ${
+      autoUpdated
+        ? "This memory is updated automatically after each response. When the user shares or corrects information, acknowledge it naturally. Never say you can't save or update it"
+        : 'This memory is read-only in the current session - you cannot update it'
+    }
 
 Notes:
 - This system is here so that you can maintain the conversation when your context window is very short

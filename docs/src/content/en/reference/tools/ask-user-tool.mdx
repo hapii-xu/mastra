@@ -1,6 +1,6 @@
 ---
 title: "Reference: askUserTool | Tools"
-description: "API reference for askUserTool, a built-in tool that suspends an agent run to ask the user a question and resumes with their answer."
+description: "A built-in, agent-agnostic tool that asks the user a question and waits for their response. The tool supports free-text questions, single-select prompts, and multi-select prompts."
 packages:
   - "@mastra/core"
 ---
@@ -9,7 +9,7 @@ packages:
 
 A built-in, agent-agnostic tool that asks the user a question and waits for their response. The tool supports free-text questions, single-select prompts, and multi-select prompts.
 
-The tool pauses through the native [tool suspension](/docs/agents/agent-approval#runtime-suspension-with-suspend) primitive: it calls `suspend()` with the question payload, which makes the agent emit a `tool-call-suspended` event and persist run state. Resume the run with `agent.resumeStream(answer, { runId })`.
+The tool pauses through the native [tool suspension](/docs/agents/human-in-the-loop#runtime-suspension-with-suspend) primitive: it calls `suspend()` with the question payload, which makes the agent emit a `tool-call-suspended` event and persist run state. Resume the run with `agent.resumeStream(answer, { runId })`.
 
 When executed outside an agent run (no `suspend` available), the tool returns a readable fallback string containing the question and choices.
 
@@ -128,4 +128,8 @@ The `tool-call-suspended` event carries a `suspendPayload` with the same shape a
 Pass the user's answer to `agent.resumeStream()`:
 
 - **Free-text and single-select:** A `string`.
-- **Multi-select:** A `string[]` of selected option labels.
+- **Multi-select:** A `string[]` of selected option labels and any custom answer.
+
+Factory and Studio offer **Other…** alongside the suggested options. Select it to turn that option into a text field and enter a custom answer, then select **Submit answer** or press Enter. Single-select prompts resume with the trimmed text as a string. Multi-select prompts resume with the selected labels followed by the trimmed custom text. You can submit custom text without selecting a suggested option.
+
+If **Other…** is selected, the text field must contain a non-empty answer. Leaving an empty or whitespace-only field unselects **Other…**. Unselecting **Other…** excludes the custom text from the response. The **Other…** label itself is never included in the resume data.

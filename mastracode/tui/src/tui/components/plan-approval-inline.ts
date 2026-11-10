@@ -21,7 +21,15 @@ import type { Component, Focusable, SelectItem, TUI } from '@earendil-works/pi-t
 import type { DiffEntry } from '@mastra/code-sdk/utils/plan-diff';
 import { generatePlanDiff } from '@mastra/code-sdk/utils/plan-diff';
 import chalk from 'chalk';
-import { BOX_INDENT, theme, getSelectListTheme, getMarkdownTheme, mastra } from '../theme.js';
+import {
+  BOX_INDENT,
+  displayModeColor,
+  theme,
+  getSelectListTheme,
+  getMarkdownTheme,
+  getThemeGeneration,
+  mastra,
+} from '../theme.js';
 import type { ChatSpacingKind } from './chat-spacing.js';
 
 export interface PlanApprovalInlineOptions {
@@ -37,34 +45,42 @@ export interface PlanApprovalInlineOptions {
   onReject: () => void;
 }
 
-class PlanContentBox implements Component {
+/** Exported for tests. */
+export class PlanContentBox implements Component {
+  private cachedLines?: string[];
+  private cachedWidth?: number;
+  private cachedThemeGeneration?: number;
+
   constructor(private plan: string) {}
 
-  invalidate(): void {}
+  invalidate(): void {
+    this.cachedLines = undefined;
+    this.cachedWidth = undefined;
+    this.cachedThemeGeneration = undefined;
+  }
 
   render(width: number): string[] {
-    const availableWidth = Math.max(24, width - BOX_INDENT);
-    const innerWidth = Math.max(20, availableWidth - 4);
+    // Rendering a large plan lexes markdown and grapheme-wraps every line —
+    // expensive enough to dominate a frame. Cache by (width, theme) since the
+    // plan text is fixed after construction.
+    if (this.cachedLines && this.cachedWidth === width && this.cachedThemeGeneration === getThemeGeneration()) {
+      return this.cachedLines;
+    }
+    // No border: the plan sits inside the prompt's purple left bar (see PlanCard).
+    const innerWidth = Math.max(20, width - BOX_INDENT);
     const markdown = new Markdown(this.plan, 0, 0, getMarkdownTheme(), {
       color: (text: string) => theme.fg('text', text),
     });
     const rendered = markdown.render(innerWidth).flatMap(line => (line.length > 0 ? [line] : ['']));
-    const border = (text: string) => chalk.hex(mastra.purple)(text);
-    const top = `${border('╭')}${border('─'.repeat(innerWidth + 2))}${border('╮')}`;
-    const bottom = `${border('╰')}${border('─'.repeat(innerWidth + 2))}${border('╯')}`;
     const body: string[] = [];
     for (const line of rendered) {
-      // Always wrap every line to innerWidth using the library's ANSI-aware
-      // wrapper. This handles paragraphs that the Markdown renderer outputs
-      // as single long lines without wrapping.
-      const wrapped = wrapTextWithAnsi(line, innerWidth);
-      for (const chunk of wrapped) {
-        const chunkVis = visibleWidth(chunk);
-        const padding = ' '.repeat(Math.max(0, innerWidth - chunkVis));
-        body.push(`${border('│')} ${chunk}${padding} ${border('│')}`);
-      }
+      // Paragraphs can come back as one long line; wrap everything to the inner width.
+      body.push(...wrapTextWithAnsi(line, innerWidth).map(chunk => chunk.replace(/\s+$/, '')));
     }
-    return [top, ...body, bottom];
+    this.cachedLines = body;
+    this.cachedWidth = width;
+    this.cachedThemeGeneration = getThemeGeneration();
+    return this.cachedLines;
   }
 }
 
@@ -72,21 +88,29 @@ class PlanContentBox implements Component {
  * Renders a unified diff between two plan texts inside a bordered box.
  * Long lines are wrapped (not truncated) so the full plan text is visible.
  */
-class PlanDiffBox implements Component {
+export class PlanDiffBox implements Component {
   private diffEntries: DiffEntry[];
+  private cachedLines?: string[];
+  private cachedWidth?: number;
+  private cachedThemeGeneration?: number;
 
   constructor(oldPlan: string, newPlan: string) {
     this.diffEntries = generatePlanDiff(oldPlan, newPlan);
   }
 
-  invalidate(): void {}
+  invalidate(): void {
+    this.cachedLines = undefined;
+    this.cachedWidth = undefined;
+    this.cachedThemeGeneration = undefined;
+  }
 
   render(width: number): string[] {
-    const availableWidth = Math.max(24, width - BOX_INDENT);
-    const innerWidth = Math.max(20, availableWidth - 4);
-    const border = (text: string) => chalk.hex(mastra.purple)(text);
-    const top = `${border('╭')}${border('─'.repeat(innerWidth + 2))}${border('╮')}`;
-    const bottom = `${border('╰')}${border('─'.repeat(innerWidth + 2))}${border('╯')}`;
+    // Same cache rationale as PlanContentBox: diff entries are fixed after
+    // construction, so output only varies with width and theme.
+    if (this.cachedLines && this.cachedWidth === width && this.cachedThemeGeneration === getThemeGeneration()) {
+      return this.cachedLines;
+    }
+    const innerWidth = Math.max(20, width - BOX_INDENT);
 
     const removedColor = chalk.hex(mastra.red);
     const addedColor = chalk.hex(theme.getTheme().success);
@@ -109,16 +133,27 @@ class PlanDiffBox implements Component {
       for (let ci = 0; ci < wrappedChunks.length; ci++) {
         const linePrefix = ci === 0 ? prefix : '  ';
         const content = colorFn(`${linePrefix}${wrappedChunks[ci]}`);
-        const contentVis = visibleWidth(content);
-        const padding = ' '.repeat(Math.max(0, innerWidth - contentVis));
-        body.push(`${border('│')} ${content}${padding} ${border('│')}`);
+        body.push(content);
       }
     }
-    return [top, ...body, bottom];
+    this.cachedLines = body;
+    this.cachedWidth = width;
+    this.cachedThemeGeneration = getThemeGeneration();
+    return this.cachedLines;
   }
 }
 
+/** Plan prompts sit inside a left bar in the plan-mode color, like the other inline prompts. */
+function withPlanBar(lines: string[]): string[] {
+  const bar = chalk.hex(displayModeColor(mastra.purple))('▎');
+  return lines.map(line => (line.replace(/\x1b\[[0-9;]*m/g, '').trim() === '' ? bar : `${bar} ${line}`));
+}
+
 export class PlanApprovalInlineComponent extends Container implements Focusable {
+  override render(width: number): string[] {
+    return withPlanBar(super.render(Math.max(1, width - 2)));
+  }
+
   private contentBox: Box;
   private selectList?: SelectList;
   private onApprove?: () => void;
@@ -218,15 +253,15 @@ export class PlanApprovalInlineComponent extends Container implements Focusable 
     const items: SelectItem[] = [
       {
         value: 'approve',
-        label: `  ${theme.fg('success', 'Approve')} ${theme.fg('dim', '— switch to Build mode and implement')}`,
+        label: `${theme.fg('text', 'Approve')}          ${theme.fg('dim', 'switch to Build mode and implement')}`,
       },
       {
         value: 'goal',
-        label: `  ${theme.fg('success', 'Use as /goal')} ${theme.fg('dim', '— switch to Build mode and pursue this plan')}`,
+        label: `${theme.fg('text', 'Use as /goal')}     ${theme.fg('dim', 'switch to Build mode and pursue this plan')}`,
       },
       {
         value: 'changes',
-        label: `  ${theme.fg('warning', 'Request changes')} ${theme.fg('dim', '— reject and provide feedback via chat')}`,
+        label: `${theme.fg('text', 'Request changes')}  ${theme.fg('dim', 'reject and give feedback in chat')}`,
       },
     ];
 
@@ -241,7 +276,7 @@ export class PlanApprovalInlineComponent extends Container implements Focusable 
 
     this.contentBox.addChild(this.selectList);
     this.contentBox.addChild(new Spacer(1));
-    this.contentBox.addChild(new Text(theme.fg('dim', 'Up/Down navigate  Enter select  Esc reject'), 0, 0));
+    this.contentBox.addChild(new Text(theme.fg('dim', '↑↓ select · Enter confirm · Esc reject'), 0, 0));
   }
 
   private renderStreaming(): void {
@@ -253,7 +288,10 @@ export class PlanApprovalInlineComponent extends Container implements Focusable 
   }
 
   private renderPlanHeader(prefix = ''): void {
-    this.contentBox.addChild(new Text(`${prefix}${theme.bold(theme.fg('accent', `Plan: ${this.planTitle}`))}`, 0, 0));
+    const plan = chalk.bold.hex(displayModeColor(mastra.purple));
+    this.contentBox.addChild(
+      new Text(`${prefix}${plan('Plan:')} ${theme.bold(theme.fg('text', this.planTitle))}`, 0, 0),
+    );
     if (this.planFilename) {
       this.contentBox.addChild(new Text(theme.fg('dim', this.planFilename), 0, 0));
     }
@@ -339,6 +377,10 @@ export interface PlanResultOptions {
 }
 
 export class PlanResultComponent extends Container {
+  override render(width: number): string[] {
+    return withPlanBar(super.render(Math.max(1, width - 2)));
+  }
+
   getChatSpacingKind(): ChatSpacingKind {
     return 'plan';
   }
@@ -352,7 +394,13 @@ export class PlanResultComponent extends Container {
     const icon = options.isApproved ? theme.fg('success', '✓') : theme.fg('error', '✗');
     const status = options.isApproved ? 'Approved' : options.feedback ? 'Changes requested' : 'Rejected';
 
-    contentBox.addChild(new Text(theme.bold(theme.fg('accent', `Plan: ${options.title}`)), 0, 0));
+    contentBox.addChild(
+      new Text(
+        `${chalk.bold.hex(displayModeColor(mastra.purple))('Plan:')} ${theme.bold(theme.fg('text', options.title))}`,
+        0,
+        0,
+      ),
+    );
     if (options.planFilename) {
       contentBox.addChild(new Text(theme.fg('dim', options.planFilename), 0, 0));
     }

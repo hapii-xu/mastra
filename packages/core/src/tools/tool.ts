@@ -1,19 +1,31 @@
 import type { ToolBackgroundConfig } from '../background-tasks';
 import type { Mastra } from '../mastra';
+import { resolveCurrentSpan } from '../observability/utils';
 import { RequestContext } from '../request-context';
+import { getRequestContextInputSource, REQUEST_CONTEXT_INPUT_SOURCE } from '../request-context/input-source';
 import { toStandardSchema } from '../schema';
 import type { PublicSchema, StandardSchemaWithJSON, InferPublicSchema } from '../schema';
 import type { SuspendOptions } from '../workflows';
+import { consumeBuilderValidatedInput } from './builder-validation-context';
+import { createToolObserve } from './observe';
 import type {
   McpMetadata,
   MCPToolProperties,
   NeedsApprovalFn,
   ToolAction,
+  ToolExecuteCallContext,
   ToolExecuteFunction,
   ToolExecutionContext,
   ToolPayloadTransform,
 } from './types';
-import { validateToolInput, validateToolOutput, validateToolSuspendData, validateRequestContext } from './validation';
+import {
+  getValidationIssuePaths,
+  validateToolInput,
+  validateToolOutput,
+  validateToolSuspendData,
+  validateRequestContext,
+} from './validation';
+import type { ValidationError } from './validation';
 
 /**
  * Marker to identify Mastra tools even when `instanceof` fails.
@@ -23,6 +35,118 @@ import { validateToolInput, validateToolOutput, validateToolSuspendData, validat
  * Follows the naming convention: <org>.<product>.<category>.<className>
  */
 export const MASTRA_TOOL_MARKER = Symbol.for('mastra.core.tool.Tool');
+
+type RequestContextEncoder = (values: Record<string, unknown>) => Record<string, unknown> | undefined;
+type RequestContextInputValidator = (values: Record<string, unknown>) => boolean;
+
+function getRequestContextInputValidator(schema: PublicSchema): RequestContextInputValidator {
+  const standardSchema = toStandardSchema(schema);
+
+  return values => {
+    try {
+      const result = standardSchema['~standard'].validate(values);
+      if (result instanceof Promise) {
+        throw new Error('Your schema is async, which is not supported. Please use a sync schema.');
+      }
+      return !('issues' in result) || !result.issues?.length;
+    } catch {
+      return false;
+    }
+  };
+}
+
+function getRequestContextEncoder(schema: PublicSchema | undefined): RequestContextEncoder | undefined {
+  if (!schema || (typeof schema !== 'object' && typeof schema !== 'function')) {
+    return undefined;
+  }
+
+  const encodableSchema = schema as {
+    safeEncode?: (value: unknown) => { success: boolean; data?: unknown };
+    '~standard'?: { vendor?: string };
+  };
+  if (encodableSchema['~standard']?.vendor !== 'zod' || typeof encodableSchema.safeEncode !== 'function') {
+    return undefined;
+  }
+
+  return values => {
+    try {
+      const result = encodableSchema.safeEncode!(values);
+      if (result.success && result.data && typeof result.data === 'object' && !Array.isArray(result.data)) {
+        return result.data as Record<string, unknown>;
+      }
+    } catch {
+      // Unidirectional transforms cannot encode.
+    }
+
+    return undefined;
+  };
+}
+
+/**
+ * Exposes schema-transformed values for one tool execution while keeping
+ * explicit mutations connected to the shared request context.
+ */
+class TransformedRequestContext extends RequestContext<Record<string, any>> {
+  readonly #source: RequestContext;
+  readonly #acceptsInput: RequestContextInputValidator;
+  readonly #encode?: RequestContextEncoder;
+
+  constructor(
+    source: RequestContext,
+    transformedValues: Record<string, unknown>,
+    acceptsInput: RequestContextInputValidator,
+    encode?: RequestContextEncoder,
+  ) {
+    super(Object.entries({ ...source.all, ...transformedValues }));
+    this.#source = source;
+    this.#acceptsInput = acceptsInput;
+    this.#encode = encode;
+    Object.defineProperty(this, REQUEST_CONTEXT_INPUT_SOURCE, { value: source });
+  }
+
+  #getSourceValue(key: string, value: unknown): unknown {
+    const nextSourceValues = { ...this.#source.all, [key]: value };
+    if (this.#acceptsInput(nextSourceValues)) {
+      return value;
+    }
+
+    const encodedValues = this.#encode?.({ ...this.all, [key]: value });
+    if (encodedValues && Object.prototype.hasOwnProperty.call(encodedValues, key)) {
+      return encodedValues[key];
+    }
+
+    throw new Error(
+      `Unable to persist request context key "${key}": the value is not valid schema input and cannot be encoded from the schema output.`,
+    );
+  }
+
+  public override set(key: string, value: any): void {
+    const sourceValue = this.#getSourceValue(key, value);
+    this.#source.setRaw(key, sourceValue);
+    super.set(key, value);
+  }
+
+  public override setRaw(key: string, value: unknown): void {
+    const sourceValue = this.#getSourceValue(key, value);
+    this.#source.setRaw(key, sourceValue);
+    super.setRaw(key, value);
+  }
+
+  public override delete(key: string): boolean {
+    this.#source.deleteRaw(key);
+    return super.delete(key);
+  }
+
+  public override deleteRaw(key: string): boolean {
+    this.#source.deleteRaw(key);
+    return super.deleteRaw(key);
+  }
+
+  public override clear(): void {
+    super.clear();
+    this.#source.clear();
+  }
+}
 
 /**
  * A type-safe tool that agents and workflows can call to perform specific actions.
@@ -91,6 +215,9 @@ export class Tool<
   /** Unique identifier for the tool */
   id: TId;
 
+  /** Display name for UIs and MCP clients. Never sent to the model. */
+  title?: string;
+
   /** Description of what the tool does */
   description: string;
 
@@ -110,15 +237,28 @@ export class Tool<
    * Schema for validating request context values.
    * When provided, the request context will be validated against this schema before tool execution.
    */
-  requestContextSchema?: PublicSchema<TRequestContext>;
+  requestContextSchema?: PublicSchema<TRequestContext, any>;
 
   /**
    * Tool execution function
    * @param inputData - The raw, validated input data
-   * @param context - Optional execution context with metadata
+   * @param context - Optional execution context with metadata. `observe` may be omitted;
+   * the runtime provides one (a no-op when no tracing span is active). When `context` is
+   * omitted (for example when calling a tool directly from a test or script), the tool
+   * receives an empty `requestContext` and the default `observe`, but no `mastra`, writer,
+   * memory, `threadId`, `resourceId`, or `runId`. Pass a context if the tool relies on any
+   * of those.
    * @returns Promise resolving to tool output or a ValidationError if input validation fails
    */
-  execute?: ToolAction<TSchemaIn, TSchemaOut, TSuspendSchema, TResumeSchema, TContext, TId, TRequestContext>['execute'];
+  execute?: {
+    (inputData: TSchemaIn, context?: ToolExecuteCallContext<TContext>): Promise<TSchemaOut | ValidationError | void>;
+    // Calls always match the signature above. This one is last so that
+    // `Parameters<Tool['execute']>[1]` stays the context type without `undefined`.
+    (inputData: TSchemaIn, context: ToolExecuteCallContext<TContext>): Promise<TSchemaOut | ValidationError | void>;
+  };
+
+  /** Whether this tool only displays its call and receives a server acknowledgement. */
+  renderOnly?: boolean;
 
   /** Parent Mastra instance for accessing shared resources */
   mastra?: Mastra;
@@ -136,15 +276,9 @@ export class Tool<
    * requireApproval: async ({ isDryRun }) => !isDryRun
    * ```
    */
-  requireApproval?: ToolAction<
-    TSchemaIn,
-    TSchemaOut,
-    TSuspendSchema,
-    TResumeSchema,
-    TContext,
-    TId,
-    TRequestContext
-  >['requireApproval'];
+  requireApproval?: NonNullable<
+    ToolAction<TSchemaIn, TSchemaOut, TSuspendSchema, TResumeSchema, TContext, TId, TRequestContext>['requireApproval']
+  >;
 
   /**
    * Runtime-resolved per-tool approval predicate, evaluated per call.
@@ -157,9 +291,32 @@ export class Tool<
   needsApprovalFn?: NeedsApprovalFn;
 
   /**
+   * Runs before the approval gate for calls that require approval and can reject the call
+   * with `{ proceed: false, output }`, returning `output` to the model without suspending
+   * or executing.
+   * @example
+   * ```typescript
+   * beforeApproval: async ({ orderId }) => {
+   *   if (!(await orderExists(orderId))) {
+   *     return { proceed: false, output: { error: `Order ${orderId} not found` } };
+   *   }
+   * }
+   * ```
+   */
+  beforeApproval?: NonNullable<
+    ToolAction<TSchemaIn, TSchemaOut, TSuspendSchema, TResumeSchema, TContext, TId, TRequestContext>['beforeApproval']
+  >;
+
+  /**
    * Enables strict tool input generation for providers that support it.
    */
   strict?: boolean;
+
+  /**
+   * How a result that fails `outputSchema` validation is handled: replaced with a
+   * validation error (`'strict'`, the default) or logged and returned as-is (`'warn'`).
+   */
+  outputValidation?: 'strict' | 'warn';
 
   /**
    * Provider-specific options passed to the model when this tool is used.
@@ -206,42 +363,18 @@ export class Tool<
    */
   mcp?: MCPToolProperties;
 
-  onInputStart?: ToolAction<
-    TSchemaIn,
-    TSchemaOut,
-    TSuspendSchema,
-    TResumeSchema,
-    TContext,
-    TId,
-    TRequestContext
-  >['onInputStart'];
-  onInputDelta?: ToolAction<
-    TSchemaIn,
-    TSchemaOut,
-    TSuspendSchema,
-    TResumeSchema,
-    TContext,
-    TId,
-    TRequestContext
-  >['onInputDelta'];
-  onInputAvailable?: ToolAction<
-    TSchemaIn,
-    TSchemaOut,
-    TSuspendSchema,
-    TResumeSchema,
-    TContext,
-    TId,
-    TRequestContext
-  >['onInputAvailable'];
-  onOutput?: ToolAction<
-    TSchemaIn,
-    TSchemaOut,
-    TSuspendSchema,
-    TResumeSchema,
-    TContext,
-    TId,
-    TRequestContext
-  >['onOutput'];
+  onInputStart?: NonNullable<
+    ToolAction<TSchemaIn, TSchemaOut, TSuspendSchema, TResumeSchema, TContext, TId, TRequestContext>['onInputStart']
+  >;
+  onInputDelta?: NonNullable<
+    ToolAction<TSchemaIn, TSchemaOut, TSuspendSchema, TResumeSchema, TContext, TId, TRequestContext>['onInputDelta']
+  >;
+  onInputAvailable?: NonNullable<
+    ToolAction<TSchemaIn, TSchemaOut, TSuspendSchema, TResumeSchema, TContext, TId, TRequestContext>['onInputAvailable']
+  >;
+  onOutput?: NonNullable<
+    ToolAction<TSchemaIn, TSchemaOut, TSuspendSchema, TResumeSchema, TContext, TId, TRequestContext>['onOutput']
+  >;
 
   /**
    * Examples of valid tool inputs passed through to the AI SDK.
@@ -284,15 +417,19 @@ export class Tool<
   ) {
     (this as any)[MASTRA_TOOL_MARKER] = true;
     this.id = opts.id;
+    this.title = opts.title;
     this.description = opts.description;
     this.inputSchema = opts.inputSchema ? toStandardSchema(opts.inputSchema) : undefined;
     this.outputSchema = opts.outputSchema ? toStandardSchema(opts.outputSchema) : undefined;
     this.suspendSchema = opts.suspendSchema ? toStandardSchema(opts.suspendSchema) : undefined;
     this.resumeSchema = opts.resumeSchema ? toStandardSchema(opts.resumeSchema) : undefined;
     this.requestContextSchema = opts.requestContextSchema;
+    this.renderOnly = opts.renderOnly;
     this.mastra = opts.mastra;
     this.requireApproval = opts.requireApproval || false;
+    this.beforeApproval = opts.beforeApproval;
     this.strict = opts.strict;
+    this.outputValidation = opts.outputValidation;
     this.providerOptions = opts.providerOptions;
     this.toModelOutput = opts.toModelOutput;
     this.transform = opts.transform;
@@ -308,17 +445,22 @@ export class Tool<
     // Tools receive two parameters:
     // 1. input - The raw, validated input data
     // 2. context - Execution metadata (mastra, suspend, etc.)
-    if (opts.execute) {
-      const originalExecute = opts.execute;
+    if (opts.renderOnly && opts.execute) {
+      throw new Error('A render-only tool cannot also define execute');
+    }
+    const originalExecute = opts.renderOnly ? async () => ({ acknowledged: true }) : opts.execute;
+    if (originalExecute) {
       this.execute = async (inputData: TSchemaIn, context?: any) => {
         // When a tool is being resumed (resumeData present in context), skip input
         // validation. The original args were already validated during the initial
         // execution, and during resume the tool's execute function checks resumeData
         // and returns early without using the input args.
-        const isResuming = !!(context?.resumeData || context?.agent?.resumeData);
+        const isResuming = (context?.resumeData ?? context?.agent?.resumeData ?? context?.workflow?.resumeData) != null;
+        const wasBuilderValidated = consumeBuilderValidatedInput(context);
+        const skipInputValidation = isResuming || wasBuilderValidated;
 
         let data: any = inputData;
-        if (!isResuming) {
+        if (!skipInputValidation) {
           // Validate input if schema exists
           const validationResult = validateToolInput(this.inputSchema, inputData, this.id);
           if (validationResult.error) {
@@ -327,15 +469,26 @@ export class Tool<
           data = validationResult.data;
         }
 
+        const sourceRequestContext = getRequestContextInputSource(context?.requestContext);
+
         // Validate request context if schema exists
-        const { error: requestContextError } = validateRequestContext(
+        const { data: validatedRequestContext, error: requestContextError } = validateRequestContext(
           this.requestContextSchema,
-          context?.requestContext,
+          sourceRequestContext,
           this.id,
         );
         if (requestContextError) {
           return requestContextError as any;
         }
+
+        const executionRequestContext = this.requestContextSchema
+          ? new TransformedRequestContext(
+              sourceRequestContext ?? new RequestContext(),
+              validatedRequestContext as Record<string, unknown>,
+              getRequestContextInputValidator(this.requestContextSchema),
+              getRequestContextEncoder(this.requestContextSchema),
+            )
+          : context?.requestContext;
 
         let suspendData = null;
 
@@ -358,7 +511,7 @@ export class Tool<
         if (!context) {
           // No context provided - create a minimal context with requestContext
           organizedContext = {
-            requestContext: new RequestContext(),
+            requestContext: executionRequestContext ?? new RequestContext(),
             mastra: undefined,
           };
         } else {
@@ -377,29 +530,35 @@ export class Tool<
               messages,
               suspend,
               resumeData,
+              suspendPayload,
               threadId,
               resourceId,
               writableStream,
+              isBackgroundTask,
+              background,
               ...rest
             } = baseContext;
             organizedContext = {
               ...rest,
+              background,
               agent: {
                 agentId: agentId || '',
                 toolCallId,
                 messages,
                 suspend,
                 resumeData,
+                suspendPayload,
                 threadId,
                 resourceId,
                 writableStream,
+                ...(isBackgroundTask ? { isBackgroundTask: true } : {}),
               },
               // Ensure requestContext is always present
-              requestContext: rest.requestContext || new RequestContext(),
+              requestContext: executionRequestContext ?? new RequestContext(),
             };
           } else if (isWorkflowExecution && !baseContext.workflow) {
             // Reorganize workflow context - nest workflow-specific properties under 'workflow' key
-            const { workflowId, runId, state, setState, suspend, resumeData, ...rest } = baseContext;
+            const { workflowId, runId, state, setState, suspend, resumeData, suspendPayload, ...rest } = baseContext;
             organizedContext = {
               ...rest,
               workflow: {
@@ -409,9 +568,10 @@ export class Tool<
                 setState,
                 suspend,
                 resumeData,
+                suspendPayload,
               },
               // Ensure requestContext is always present
-              requestContext: rest.requestContext || new RequestContext(),
+              requestContext: executionRequestContext ?? new RequestContext(),
             };
           } else {
             // Ensure requestContext is always present even for direct execution
@@ -436,15 +596,29 @@ export class Tool<
                     },
                   }
                 : baseContext.workflow,
-              requestContext: baseContext.requestContext || new RequestContext(),
+              requestContext: executionRequestContext ?? new RequestContext(),
             };
           }
+        }
+
+        // Agent tool calls inject `observe` in the tool builder. Direct `tool.execute()` calls and
+        // `createStep(tool)` workflow steps do not, so default it here from the caller's span,
+        // falling back to the ambient span (e.g. a direct call from inside a traced workflow step).
+        if (!organizedContext.observe) {
+          organizedContext = {
+            ...organizedContext,
+            observe: createToolObserve(
+              organizedContext.tracingContext?.currentSpan ??
+                organizedContext.tracing?.currentSpan ??
+                resolveCurrentSpan(),
+            ),
+          };
         }
 
         const resumeData =
           organizedContext.agent?.resumeData ?? organizedContext.workflow?.resumeData ?? organizedContext?.resumeData;
 
-        if (resumeData) {
+        if (resumeData != null) {
           const resumeValidation = validateToolInput(this.resumeSchema, resumeData, this.id);
           if (resumeValidation.error) {
             return resumeValidation.error as any;
@@ -467,6 +641,15 @@ export class Tool<
         const outputValidation = validateToolOutput(this.outputSchema, output, this.id, skiptOutputValidation);
 
         if (outputValidation.error) {
+          const logger = organizedContext.mastra?.getLogger?.() ?? this.mastra?.getLogger?.();
+          logger?.warn('Tool output validation failed', {
+            toolId: this.id,
+            issuePaths: getValidationIssuePaths(outputValidation.error, this.outputSchema, 'output'),
+          });
+          if (this.outputValidation === 'warn') {
+            // The tool already ran, so keep its real result and only report the mismatch.
+            return output;
+          }
           return outputValidation.error as any;
         }
 
@@ -581,6 +764,31 @@ type CreateToolOpts<
   resumeSchema?: TResumeSchema;
   execute?: ToolExecuteFunction<InferSchema<TInputSchema>, InferSchema<TOutputSchema>, TContext, TRequestContext>;
 };
+/**
+ * Defines a tool with a description, input/output schemas, and an execution function.
+ *
+ * @example
+ * ```typescript
+ * import { createTool } from '@mastra/core/tools';
+ * import { z } from 'zod';
+ *
+ * const greet = createTool({
+ *   id: 'greet',
+ *   description: 'Greet someone by name.',
+ *   inputSchema: z.object({ name: z.string() }),
+ *   outputSchema: z.string(),
+ *   execute: async ({ name }) => `Hello, ${name}!`,
+ * });
+ * ```
+ *
+ * @see For documentation bundled with your installed package, locate
+ * `@mastra/core/package.json` with your project's resolver or package-manager
+ * tooling, then read `dist/docs/SKILL.md` from that package root and follow its
+ * reference links. Use package-manager tools for virtual or archived packages.
+ *
+ * @see [Tool documentation](https://mastra.ai/reference/tools/create-tool)
+ * if packaged docs are unavailable.
+ */
 export function createTool<
   TId extends string = string,
   TInputSchema extends SchemaLike = undefined,

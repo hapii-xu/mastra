@@ -1,5 +1,6 @@
 import type { Adapter, StreamChunk, Thread } from 'chat';
 import type { IMastraLogger } from '../logger/logger';
+import { describeProviderError, readProviderErrorDetails } from '../loop/shared/provider-error-details';
 import type { AgentChunkType } from '../stream/types';
 import {
   formatArgsSummary,
@@ -25,6 +26,8 @@ export interface PendingApprovalRecord {
   runId?: string;
   toolName?: string;
   args?: Record<string, unknown>;
+  /** Platform user id of the person whose message triggered the tool call. */
+  requesterId?: string;
 }
 
 /**
@@ -159,10 +162,12 @@ export class ToolTracker {
 
   enrichApproval(call: { toolCallId: string; toolName: string; args: unknown }): ToolEnrichment {
     const tracked = this.tools.get(call.toolCallId);
-    const displayName = tracked?.displayName ?? stripToolPrefix(call.toolName);
-    const argsSummary =
-      tracked?.argsSummary ?? formatArgsSummary(typeof call.args === 'object' && call.args != null ? call.args : {});
-    const args = tracked?.args ?? call.args;
+    // A supervisor re-emits a sub-agent's approval under its own delegation
+    // call's toolCallId; only reuse tracked details when they describe the same tool.
+    const same = tracked?.toolName === call.toolName ? tracked : undefined;
+    const displayName = same?.displayName ?? stripToolPrefix(call.toolName);
+    const argsSummary = same?.argsSummary ?? formatArgsSummary(call.args);
+    const args = same ? same.args : call.args;
     const startedAt = tracked?.startedAt ?? Date.now();
     return {
       toolCallId: call.toolCallId,
@@ -230,10 +235,16 @@ export async function postStreamError(args: {
   } else {
     message = String(extracted);
   }
-  const display = message.length > 500 ? message.slice(0, 500) + '…' : message;
-  logger?.error?.(`[${platform}] Stream completed with error`, { error: display });
+  // Provider HTTP failures often carry only the status text ("Bad Request") as
+  // their message; the provider's real explanation is in the response body.
+  // Logs get the parsed explanation (inside `display`) but never the raw body,
+  // which can echo request content to anyone who can read server logs.
+  const { statusCode, requestId } = readProviderErrorDetails(rawError);
+  const display =
+    describeProviderError(message, rawError, 1000) ?? (message.length > 1000 ? message.slice(0, 1000) + '…' : message);
+  logger?.error?.(`[${platform}] Stream completed with error`, { error: display, statusCode, requestId });
   const postable = formatError
-    ? formatError(rawError instanceof Error ? rawError : new Error(display))
+    ? formatError(rawError instanceof Error ? rawError : new Error(display, { cause: rawError }))
     : `❌ Error: ${display}`;
   try {
     await chatThread.post(postable as Parameters<Thread['post']>[0]);
@@ -274,20 +285,26 @@ export async function postFileAttachment(args: {
   logger?: IMastraLogger;
 }): Promise<void> {
   const { chunk, chatThread, logger } = args;
-  const { data, mimeType } = chunk.payload as { data: string | Uint8Array; mimeType: string };
+  const {
+    data,
+    mimeType,
+    filename: payloadFilename,
+  } = chunk.payload as {
+    data: string | Uint8Array;
+    mimeType: string;
+    filename?: string;
+  };
   logger?.debug?.('[CHANNEL] Received file chunk', {
     mimeType,
     dataType: typeof data,
-    size: typeof data === 'string' ? data.length : (data as Uint8Array)?.byteLength,
+    size: typeof data === 'string' ? data.length : data?.byteLength,
   });
   const ext = mimeType.split('/')[1]?.split(';')[0] || 'bin';
-  const filename = `generated.${ext}`;
+  const filename = payloadFilename ?? `generated.${ext}`;
   const binary =
     typeof data === 'string' ? Buffer.from(data, 'base64') : data instanceof Uint8Array ? Buffer.from(data) : data;
   try {
-    await chatThread.post({ markdown: ' ', files: [{ data: binary, filename, mimeType }] } as Parameters<
-      Thread['post']
-    >[0]);
+    await chatThread.post({ markdown: ' ', files: [{ data: binary, filename, mimeType }] });
   } catch (e) {
     logger?.debug?.('[CHANNEL] Failed to post file attachment', { error: e, mimeType, filename });
   }

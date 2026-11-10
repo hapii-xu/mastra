@@ -8,6 +8,7 @@ export { createWorkspaceTools, resolveToolConfig, type ResolvedToolConfig } from
 export { readFileTool } from './read-file';
 export { writeFileTool } from './write-file';
 export { editFileTool } from './edit-file';
+export { applyPatchTool } from './apply-patch';
 export { listFilesTool } from './list-files';
 export { deleteFileTool } from './delete-file';
 export { fileStatTool } from './file-stat';
@@ -22,11 +23,24 @@ export {
 } from './execute-command';
 export { getProcessOutputTool } from './get-process-output';
 export { killProcessTool } from './kill-process';
-export { grepTool } from './grep';
+export { grepTool, createGrepTool, type GrepToolOptions } from './grep';
 export { lspInspectTool } from './lsp-inspect';
+export { computerScreenshotTool } from './computer-screenshot';
+export { computerClickTool } from './computer-click';
+export { computerDoubleClickTool } from './computer-double-click';
+export { computerRightClickTool } from './computer-right-click';
+export { computerMoveMouseTool } from './computer-move-mouse';
+export { computerDragTool } from './computer-drag';
+export { computerTypeTool } from './computer-type';
+export { computerPressKeyTool } from './computer-press-key';
+export { computerScrollTool } from './computer-scroll';
+export { computerGetScreenInfoTool } from './computer-get-screen-info';
+export { computerWaitTool } from './computer-wait';
 
 // Helpers
 export { requireWorkspace, requireFilesystem, requireSandbox, emitWorkspaceMetadata } from './helpers';
+export { requireComputer } from './computer-helpers';
+export { isMediaToolResult, mediaToModelOutput, DEFAULT_MAX_MEDIA_BYTES, type MediaToolResult } from './media';
 export {
   applyTail,
   applyTokenLimit,

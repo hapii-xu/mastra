@@ -1,6 +1,6 @@
 ---
 title: "Reference: WorkingMemory | Processors"
-description: "Documentation for the WorkingMemory processor in Mastra, which injects persistent user/context data as system instructions."
+description: "The WorkingMemory is an input processor that injects working memory data as a system message."
 packages:
   - "@mastra/core"
   - "@mastra/pg"
@@ -65,8 +65,9 @@ const processor = new WorkingMemory({
                   },
                   {
                     name: 'content',
-                    type: 'string',
-                    description: 'Template content defining the structure of working memory data',
+                    type: 'string | Record<string, unknown>',
+                    description:
+                      'Template content defining the structure of working memory data. The object form is only valid when format is json',
                     isOptional: false,
                   },
                 ],
@@ -150,9 +151,10 @@ const processor = new WorkingMemory({
 ```typescript title="src/mastra/agents/personalized-agent.ts"
 import { Agent } from '@mastra/core/agent'
 import { WorkingMemory, MessageHistory } from '@mastra/core/processors'
-import { PostgresStorage } from '@mastra/pg'
+import { PostgresStore } from '@mastra/pg'
 
-const storage = new PostgresStorage({
+const storage = new PostgresStore({
+  id: 'pg-storage',
   connectionString: process.env.DATABASE_URL,
 })
 
@@ -213,7 +215,7 @@ const processor = new WorkingMemory({
    - Resource record (`scope: 'resource'`)
 1. Resolves the template (from provider, options, or default)
 1. Generates system instructions based on mode:
-   - **Normal mode**: Includes guidelines for storing/updating information, template structure, and current data
+   - **Normal mode**: Includes guidelines for storing and updating information, along with the template structure and current data
    - **Read-only mode** (`readOnly: true`): Includes only the current data as context without update instructions
 1. Adds the instruction as a system message with `source: 'memory'` tag
 

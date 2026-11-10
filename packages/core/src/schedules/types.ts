@@ -37,6 +37,12 @@ export type ScheduleIfIdle = {
   behavior?: AgentSignalIdleBehavior;
   attributes?: AgentSignalAttributes;
   streamOptions?: ScheduleStreamOptions;
+  /**
+   * Reject the wake unless an advertised thread owner acknowledges it, so the
+   * process that claimed the thread runs the turn with its claim options. When
+   * no owner answers, the fire fails. Same as `AgentSignalIfIdleOptions.requireClaimedOwner`.
+   */
+  requireClaimedOwner?: boolean;
 };
 
 /** Stable schedule id prefix for agent schedules. */
@@ -68,6 +74,22 @@ export type ScheduleRunStatus =
   | 'agent-missing'
   | 'invalid-input';
 
+/**
+ * Signal categories a schedule fire may use. Single runtime source for the zod
+ * enum below and for schedule-definition validation, so the two can't drift.
+ */
+export const SCHEDULE_SIGNAL_TYPES = [
+  'user',
+  'state',
+  'reactive',
+  'notification',
+  'user-message',
+  'system-reminder',
+] as const satisfies readonly AgentSignalType[];
+
+/** Lifecycle statuses a schedule row may be created with. */
+export const SCHEDULE_STATUSES = ['active', 'paused'] as const;
+
 /** Shared zod for {@link AgentSignalAttributes} (XML tag attribute values). */
 const ScheduleAttributesSchema = z.record(z.string(), z.union([z.string(), z.number(), z.boolean(), z.null()]));
 
@@ -87,6 +109,7 @@ const ScheduleIfIdleSchema = z.object({
   behavior: z.enum(['wake', 'persist', 'discard']).optional(),
   attributes: ScheduleAttributesSchema.optional(),
   streamOptions: ScheduleStreamOptionsSchema.optional(),
+  requireClaimedOwner: z.boolean().optional(),
 });
 
 /**
@@ -99,7 +122,7 @@ export const ScheduleInputSchema = z.object({
   prompt: z.string(),
   threadId: z.string().optional(),
   resourceId: z.string().optional(),
-  signalType: z.enum(['user', 'state', 'reactive', 'notification', 'user-message', 'system-reminder']).optional(),
+  signalType: z.enum(SCHEDULE_SIGNAL_TYPES).optional(),
   /**
    * XML tag name the signal renders as. Defaults to `schedule`, so a fire
    * surfaces to the agent as `<schedule>…</schedule>`. Override to render a
@@ -198,7 +221,10 @@ export type SchedulePrepareContext<TMastra = unknown> = {
  */
 export type SchedulePrepareResult = Partial<ScheduleEffective>;
 
-/** Argument passed to `schedules.onFinish` for any non-error, non-abort outcome. */
+/**
+ * Argument passed to `schedules.onFinish` for any non-error, non-abort outcome.
+ * For a threaded schedule, `succeeded` means the run was started, not that it completed.
+ */
 export type ScheduleFinishContext<TMastra = unknown> = {
   mastra: TMastra;
   /** The agent this schedule fires. Convenience alias for `schedule.agentId`. */
@@ -215,7 +241,11 @@ export type ScheduleFinishContext<TMastra = unknown> = {
   effective: ScheduleEffective;
 };
 
-/** Argument passed to `schedules.onError` whenever `prepare`, `sendSignal`, or the agent run threw. */
+/**
+ * Argument passed to `schedules.onError` whenever `prepare` or `sendSignal` threw
+ * (including the signal failing to route), or a threadless agent run threw a
+ * non-abort error.
+ */
 export type ScheduleErrorContext<TMastra = unknown> = {
   mastra: TMastra;
   /** The agent this schedule fires. Convenience alias for `schedule.agentId`. */
@@ -229,7 +259,7 @@ export type ScheduleErrorContext<TMastra = unknown> = {
   effective?: ScheduleEffective;
 };
 
-/** Argument passed to `schedules.onAbort` when the run was aborted mid-stream. */
+/** Argument passed to `schedules.onAbort` when a threadless run was aborted. */
 export type ScheduleAbortContext<TMastra = unknown> = {
   mastra: TMastra;
   /** The agent this schedule fires. Convenience alias for `schedule.agentId`. */
@@ -245,10 +275,13 @@ export type ScheduleAbortContext<TMastra = unknown> = {
  * each context carries `agentId` so a hook can branch per agent.
  *
  * `onFinish` fires once per schedule trigger when the trigger reached a
- * non-error, non-abort terminal state. `onError` fires when `prepare`,
- * `sendSignal`, or the agent run threw. `onAbort` fires when the run was
- * aborted mid-stream. `prepare` can return overrides, `null` to skip, or
- * `undefined` to use row defaults.
+ * non-error, non-abort outcome. `onError` fires when `prepare` or
+ * `sendSignal` threw, or a threadless agent run threw a non-abort error.
+ * `onAbort` fires when a threadless run was aborted. A threaded schedule hands the prompt
+ * to the thread without waiting for the run, so failures or aborts after the
+ * run starts surface on the thread's run stream, not through these hooks.
+ * `prepare` can return overrides, `null` to skip, or `undefined` to use row
+ * defaults.
  *
  * Hook exceptions are caught and logged; they never re-route the worker or
  * recurse into another hook.

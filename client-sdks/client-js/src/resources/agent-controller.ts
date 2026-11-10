@@ -1,9 +1,42 @@
-import type { MastraDBMessage, MastraMessagePart } from '@mastra/core/agent-controller';
+import type {
+  AgentControllerThinkingLevel,
+  AgentControllerThread,
+  AgentControllerWireEvent,
+  MastraDBMessage,
+  MastraMessagePart,
+} from '@mastra/core/agent-controller';
+/** Acknowledgement for approval/suspension commands; `ok` is true only when a pending target claimed it. */
+export type AgentControllerCommandRejection = 'not_pending' | 'stale_tool_call' | 'aborting' | 'no_pending_suspension';
+
+export interface AgentControllerCommandAck {
+  ok: boolean;
+  /** Set when `ok` is false. */
+  reason?: AgentControllerCommandRejection;
+}
+
 export type { MastraDBMessage, MastraMessageContentV2, MastraMessagePart } from '@mastra/core/agent-controller';
 import type { RequestContext } from '@mastra/core/request-context';
+import type { StorageListMessagesOutput } from '@mastra/core/storage';
 
-import type { ClientOptions } from '../types';
-import { parseClientRequestContext } from '../utils';
+import type { QueryParams, RouteResponse } from '../route-types.generated.js';
+import type {
+  AgentControllerActiveRun,
+  AgentControllerAvailableModel,
+  AgentControllerGoalRecord,
+  AgentControllerModeInfo,
+  AgentControllerSessionState,
+  AgentControllerThreadInfo,
+  AgentControllerWorkspaceStatus,
+  ClientOptions,
+  CreateAgentControllerSessionResponse,
+  CreateAgentControllerThreadResponse,
+  PermissionPolicy,
+  PermissionRules,
+  SendNotificationInput,
+  SendNotificationResult,
+  ToolCategory,
+} from '../types';
+import { isTerminalReconnectError, parseClientRequestContext } from '../utils';
 import { BaseResource } from './base';
 
 /**
@@ -15,70 +48,58 @@ import { BaseResource } from './base';
  *
  *   GET  /agent-controller                                          listAgentControllers
  *   POST /agent-controller/:id/sessions                             session().create()
- *   GET  /agent-controller/:id/sessions/:resourceId/stream          session().subscribe()
- *   POST /agent-controller/:id/sessions/:resourceId/messages        session().sendMessage()
- *   POST /agent-controller/:id/sessions/:resourceId/abort           session().abort()
- *   POST /agent-controller/:id/sessions/:resourceId/tool-approval   session().approveTool()
+ *   GET  /agent-controller/:id/sessions/:sessionId/stream           session().subscribe()
+ *   POST /agent-controller/:id/sessions/:sessionId/messages         session().sendMessage()
+ *   POST /agent-controller/:id/sessions/:sessionId/abort            session().abort()
+ *   POST /agent-controller/:id/sessions/:sessionId/tool-approval    session().approveTool()
  */
 
-export interface AgentControllerInfo {
-  id: string;
-}
+/** One arm of the wire union, selected by its `type`. */
+type WireEventOf<T extends AgentControllerWireEvent['type']> = Extract<AgentControllerWireEvent, { type: T }>;
+
+/** A `MastraDBMessage` before {@link hydrateMessage} turns its `createdAt` back into a `Date`. */
+type SerializedMastraDBMessage = WireEventOf<'message_start'>['message'];
+
+type AgentControllerModernListMessagesOptions = Omit<
+  QueryParams<'GET /agent-controller/:controllerId/sessions/:sessionId/threads/:threadId/messages'>,
+  'limit'
+> & {
+  limit?: never;
+};
+
+type AgentControllerLegacyPagedListMessagesOptions = {
+  /** @deprecated Use `perPage` instead. May only be combined with `page`. */
+  limit: number;
+  page?: number;
+  perPage?: never;
+  orderBy?: never;
+  filter?: never;
+  include?: never;
+};
+
+/** Pagination, ordering, filtering, and include options for an Agent Controller thread's messages. */
+export type AgentControllerListMessagesOptions =
+  | AgentControllerModernListMessagesOptions
+  | AgentControllerLegacyPagedListMessagesOptions;
+
+/** A page of hydrated Agent Controller thread messages. */
+export type AgentControllerListMessagesResult = StorageListMessagesOutput;
+
+type SerializedAgentControllerListMessagesResult = Omit<
+  RouteResponse<'GET /agent-controller/:controllerId/sessions/:sessionId/threads/:threadId/messages'>,
+  'messages'
+> & {
+  messages: SerializedMastraDBMessage[];
+};
+
+/** An `AgentControllerThread` before {@link hydrateThread} turns its timestamps back into `Date`s. */
+type SerializedThread = WireEventOf<'thread_created'>['thread'];
 
 /**
- * Status-line relevant slice of observational-memory progress, mirroring the
- * TUI status line. `msg` reads `pendingTokens/threshold ↓projectedMessageRemoval`
- * (the active message window before an observation fires); `mem` reads
- * `observationTokens/reflectionThreshold ↓projectedReflectionSavings`
- * (accumulated observations before a reflection fires).
+ * Notifications reach a session as agent signals carried on messages, not as
+ * controller events. These two arms predate that and no controller emits them.
  */
-export interface AgentControllerOMProgress {
-  status: string;
-  pendingTokens: number;
-  threshold: number;
-  thresholdPercent: number;
-  observationTokens: number;
-  reflectionThreshold: number;
-  reflectionThresholdPercent: number;
-  projectedMessageRemoval: number;
-  projectedReflectionSavings: number;
-}
-
-/**
- * AgentController events the SDK types explicitly. This is a discriminated union, so
- * narrowing on `event.type` gives you the right payload fields. This mirrors the
- * subset of the agent controller event stream a web client typically renders.
- */
-export type KnownAgentControllerEvent =
-  | { type: 'agent_start' }
-  | { type: 'agent_end'; reason?: 'complete' | 'aborted' | 'error' | 'suspended' }
-  // Assistant message streaming.
-  | { type: 'message_start'; message: MastraDBMessage }
-  | { type: 'message_update'; message: MastraDBMessage }
-  | { type: 'message_end'; message: MastraDBMessage }
-  // Tool lifecycle.
-  | { type: 'tool_input_start'; toolCallId: string; toolName: string }
-  | { type: 'tool_input_delta'; toolCallId: string; argsTextDelta: string; toolName?: string }
-  | { type: 'tool_input_end'; toolCallId: string }
-  | { type: 'tool_start'; toolCallId: string; toolName: string; args: unknown }
-  | { type: 'tool_update'; toolCallId: string; partialResult: unknown }
-  | { type: 'shell_output'; toolCallId: string; output: string; stream: 'stdout' | 'stderr' }
-  | { type: 'tool_end'; toolCallId: string; result?: unknown; isError?: boolean }
-  // Interactive prompts.
-  | { type: 'tool_approval_required'; toolCallId: string; toolName: string; args: unknown }
-  | { type: 'tool_suspended'; toolCallId: string; toolName: string; args: unknown; suspendPayload: unknown }
-  // Session state changes.
-  | { type: 'mode_changed'; modeId: string; previousModeId: string }
-  | { type: 'model_changed'; modelId: string; scope?: 'global' | 'thread' | 'mode'; modeId?: string }
-  | { type: 'thread_changed'; threadId: string; previousThreadId: string | null }
-  | { type: 'thread_created'; thread: { id: string; title?: string } }
-  | { type: 'thread_deleted'; threadId: string }
-  // Subagents.
-  | { type: 'subagent_start'; toolCallId: string; agentType: string; task: string; modelId: string }
-  | { type: 'subagent_end'; toolCallId: string }
-  // Task tools.
-  | { type: 'task_updated'; tasks: AgentControllerTaskSnapshot[] }
-  // Notifications.
+type NotificationEvent =
   | {
       type: 'notification';
       notificationId?: string;
@@ -97,56 +118,21 @@ export type KnownAgentControllerEvent =
       bySource: Record<string, number>;
       byPriority: Record<string, number>;
       notificationIds: string[];
-    }
-  // Usage tracking.
-  | { type: 'usage_update'; usage: unknown }
-  // Canonical display-state snapshot, emitted after every other event. Carries
-  // the status-line figures (OM progress + cumulative token usage). Maps/Dates
-  // in the full display state don't survive JSON, so only plain fields are typed.
-  | {
-      type: 'display_state_changed';
-      displayState: {
-        isRunning?: boolean;
-        omProgress?: AgentControllerOMProgress;
-        tokenUsage?: Record<string, unknown>;
-        [key: string]: unknown;
-      };
-    }
-  // Goals.
-  | {
-      type: 'goal_evaluation';
-      payload: {
-        objective: string;
-        iteration: number;
-        maxRuns: number;
-        passed: boolean;
-        status: 'active' | 'paused' | 'done';
-        reason?: string;
-      };
-    }
-  // Follow-up queue.
-  | { type: 'follow_up_queued'; count: number }
-  // Observational memory lifecycle.
-  | { type: 'om_observation_start' }
-  | { type: 'om_observation_end' }
-  | { type: 'om_observation_failed'; error?: string }
-  | { type: 'om_reflection_start' }
-  | { type: 'om_reflection_end' }
-  | { type: 'om_reflection_failed'; error?: string }
-  | { type: 'om_buffering_start' }
-  | { type: 'om_buffering_end' }
-  | { type: 'om_buffering_failed'; error?: string }
-  | { type: 'om_model_changed'; role: string; modelId: string }
-  | { type: 'om_activation'; enabled: boolean }
-  | { type: 'om_status'; status: string }
-  | { type: 'om_thread_title_updated'; title: string }
-  // Workspace lifecycle.
-  | { type: 'workspace_ready' }
-  | { type: 'workspace_error'; error?: string }
-  | { type: 'workspace_status_changed'; status: string }
-  // Notices.
-  | { type: 'info'; message: string }
-  | { type: 'error'; error: { message?: string } | string; errorType?: string };
+    };
+
+/** The timestamps the SDK gives back as `Date`s. {@link hydrateKnownEvent} is typed against this, so the two cannot drift. */
+type Hydrated<T> = T extends { type: 'thread_created' }
+  ? Omit<T, 'thread'> & { thread: AgentControllerThread }
+  : T extends { type: 'message_start' }
+    ? Omit<T, 'message'> & { message: MastraDBMessage }
+    : T;
+
+/**
+ * AgentController events the SDK types explicitly: the wire union `@mastra/core`
+ * derives from the controller's own events, with timestamps hydrated. This is a
+ * discriminated union, so narrowing on `event.type` gives the right payload.
+ */
+export type KnownAgentControllerEvent = Hydrated<AgentControllerWireEvent> | NotificationEvent;
 
 /** Any other agent controller event the SDK doesn't model explicitly. */
 export interface OtherAgentControllerEvent {
@@ -155,163 +141,128 @@ export interface OtherAgentControllerEvent {
 }
 
 /**
- * An agent controller event. Narrow on `type` to access known payloads; unknown
- * event types fall through to {@link OtherAgentControllerEvent}.
+ * An agent controller event. Comparing `event.type` to a literal does NOT
+ * narrow this union — {@link OtherAgentControllerEvent} types `type` as
+ * `string`, which matches every literal. Narrow with
+ * {@link isKnownAgentControllerEvent} first, then switch on `type`.
  */
 export type AgentControllerEvent = KnownAgentControllerEvent | OtherAgentControllerEvent;
 
-type SerializedMastraDBMessage = Omit<MastraDBMessage, 'createdAt'> & { createdAt: Date | string };
+// Runtime mirror of the union — Record keyed by its `type` makes tsc reject a
+// missing or extra entry.
+const KNOWN_AGENT_CONTROLLER_EVENT_TYPES = new Set<string>(
+  Object.keys({
+    agent_start: true,
+    agent_end: true,
+    message_start: true,
+    message_update: true,
+    message_end: true,
+    state_changed: true,
+    tool_input_start: true,
+    tool_input_delta: true,
+    tool_input_end: true,
+    tool_start: true,
+    tool_update: true,
+    shell_output: true,
+    command_exit: true,
+    tool_end: true,
+    tool_approval_required: true,
+    tool_suspended: true,
+    tool_suspension_cancelled: true,
+    mode_changed: true,
+    model_changed: true,
+    thread_changed: true,
+    thread_created: true,
+    thread_deleted: true,
+    thread_owner_changed: true,
+    thread_title_updated: true,
+    subagent_start: true,
+    subagent_text_delta: true,
+    subagent_tool_start: true,
+    subagent_tool_end: true,
+    subagent_end: true,
+    subagent_model_changed: true,
+    task_updated: true,
+    notification: true,
+    notification_summary: true,
+    usage_update: true,
+    display_state_changed: true,
+    goal_evaluation: true,
+    follow_up_queued: true,
+    om_observation_start: true,
+    om_observation_end: true,
+    om_observation_failed: true,
+    om_reflection_start: true,
+    om_reflection_end: true,
+    om_reflection_failed: true,
+    om_buffering_start: true,
+    om_buffering_end: true,
+    om_buffering_failed: true,
+    om_model_changed: true,
+    om_activation: true,
+    om_status: true,
+    om_thread_title_updated: true,
+    workspace_ready: true,
+    workspace_error: true,
+    workspace_status_changed: true,
+    task_complete_evaluation: true,
+    info: true,
+    error: true,
+  } satisfies Record<KnownAgentControllerEvent['type'], true>),
+);
+
+/** Narrows to the explicitly typed events; see {@link AgentControllerEvent}. */
+export function isKnownAgentControllerEvent(event: AgentControllerEvent): event is KnownAgentControllerEvent {
+  return KNOWN_AGENT_CONTROLLER_EVENT_TYPES.has(event.type);
+}
+
+const toDate = (value: Date | string): Date => (value instanceof Date ? value : new Date(value));
 
 function hydrateMessage(message: SerializedMastraDBMessage): MastraDBMessage {
-  return {
-    ...message,
-    createdAt: message.createdAt instanceof Date ? message.createdAt : new Date(message.createdAt),
-  };
+  return { ...message, createdAt: toDate(message.createdAt) };
 }
 
-function hydrateEventMessage(event: AgentControllerEvent): AgentControllerEvent {
-  if (event.type !== 'message_start' && event.type !== 'message_update' && event.type !== 'message_end') return event;
-
-  return {
-    ...event,
-    message: hydrateMessage(event.message as SerializedMastraDBMessage),
-  } as AgentControllerEvent;
+function hydrateThread(thread: SerializedThread): AgentControllerThread {
+  return { ...thread, createdAt: toDate(thread.createdAt), updatedAt: toDate(thread.updatedAt) };
 }
 
-/** Response from creating or resuming an agent controller session. */
-export interface CreateAgentControllerSessionResponse {
-  controllerId: string;
-  resourceId: string;
-  threadId?: string;
+/** A frame straight off the stream: still wire-shaped, so its timestamps are strings. */
+type ParsedEvent = AgentControllerWireEvent | NotificationEvent | OtherAgentControllerEvent;
+
+function isKnownParsedEvent(event: ParsedEvent): event is AgentControllerWireEvent | NotificationEvent {
+  return KNOWN_AGENT_CONTROLLER_EVENT_TYPES.has(event.type);
 }
 
-/** Agent behavior settings, mirroring the TUI's `/settings` toggles. */
-export interface AgentControllerSessionSettings {
-  /** Auto-approve all tool calls (no per-tool prompt). */
-  yolo: boolean;
-  /** Extended-thinking budget. */
-  thinkingLevel: 'off' | 'low' | 'medium' | 'high' | 'xhigh';
-  /** How completion/notification alerts are delivered. */
-  notifications: 'off' | 'bell' | 'system' | 'both';
-  /** Use AST-aware smart editing when available. */
-  smartEditing: boolean;
+/** The stream carries every timestamp as an ISO string; give consumers back the `Date`s {@link Hydrated} promises. */
+function hydrateKnownEvent(event: AgentControllerWireEvent | NotificationEvent): KnownAgentControllerEvent {
+  switch (event.type) {
+    case 'message_start':
+      return { ...event, message: hydrateMessage(event.message) };
+    case 'thread_created':
+      return { ...event, thread: hydrateThread(event.thread) };
+    default:
+      return event;
+  }
 }
 
-/** State snapshot for an agent controller session. */
-export interface AgentControllerSessionState {
-  controllerId: string;
-  resourceId: string;
-  threadId?: string;
-  modeId: string;
-  modelId: string;
-  /** Whether the agent is currently executing a run (for initial UI hydration). */
-  running?: boolean;
-  /** OM progress snapshot for the status line (initial hydration). */
-  omProgress?: AgentControllerOMProgress;
-  /** Cumulative token usage for the current thread. */
-  tokenUsage?: Record<string, unknown>;
-  /** Agent behavior settings (yolo, thinking, notifications, smart editing). */
-  settings?: AgentControllerSessionSettings;
+function hydrateEventTimestamps(event: ParsedEvent): AgentControllerEvent {
+  return isKnownParsedEvent(event) ? hydrateKnownEvent(event) : event;
 }
 
-export interface AgentControllerModeInfo {
-  id: string;
-  name?: string;
-}
-
-export interface AgentControllerThreadInfo {
-  id: string;
-  title?: string;
-  resourceId?: string;
-  createdAt?: string;
-  updatedAt?: string;
-  /**
-   * The session scoping tags this thread was stamped with at creation (e.g.
-   * `{ projectPath }`). Present on `listThreads()` results; used to tell which
-   * worktree/scope a thread belongs to when a resourceId is shared.
-   */
-  tags?: Record<string, string>;
-  /**
-   * Whether a run is currently executing on this thread (`'active'`) or not
-   * (`'idle'`). Present on `listThreads()` results; lets one listing report
-   * activity across every worktree/scope sharing the resourceId.
-   */
-  state?: 'active' | 'idle';
-}
-
-export interface AgentControllerAvailableModel {
-  id: string;
-  provider: string;
-  modelName: string;
-  hasApiKey: boolean;
-  apiKeyEnvVar?: string;
-  useCount: number;
-}
-
-export interface AgentControllerWorkspaceStatus {
-  hasWorkspace: boolean;
-  isReady: boolean;
-}
-
-export interface AgentControllerGoalRecord {
-  id?: string;
-  objective: string;
-  status: 'active' | 'paused' | 'done';
-  runsUsed: number;
-  maxRuns?: number;
-  judgeModelId?: string;
-  startedAt: number;
-  updatedAt: number;
-  pausedReason?: string;
-}
-
-/** Permission policy for a tool or category. */
-export type PermissionPolicy = 'allow' | 'ask' | 'deny';
-
-/** Tool category for permission grouping. */
-export type ToolCategory = 'read' | 'edit' | 'execute' | 'mcp' | 'other';
-
-/** Permission rules for controlling tool approval behavior. */
-export interface PermissionRules {
-  categories?: Partial<Record<ToolCategory, PermissionPolicy>>;
-  tools?: Partial<Record<string, PermissionPolicy>>;
-}
-
-/** Snapshot of a single task item from the task tools. */
-export interface AgentControllerTaskSnapshot {
-  id: string;
-  content: string;
-  status: 'pending' | 'in_progress' | 'completed';
-  activeForm: string;
-}
-
-/** Input for sending a notification signal to a session. */
-export interface SendNotificationInput {
-  source: string;
-  kind: string;
-  summary: string;
-  priority?: 'low' | 'medium' | 'high' | 'urgent';
-  payload?: unknown;
-  sourceId?: string;
-  dedupeKey?: string;
-  coalesceKey?: string;
-  attributes?: Record<string, string | number | boolean | null | undefined>;
-  metadata?: Record<string, unknown>;
-}
-
-/** Result of sending a notification signal. */
-export interface SendNotificationResult {
-  accepted: boolean;
-  notificationId?: string;
-  /** Delivery decision: deliver, queue, defer, summarize, persist, or discard. */
-  decision?: string;
-  runId?: string;
-}
-
-/** Resume payload for the built-in `submit_plan` suspension. */
+/**
+ * Resume payload for the built-in `submit_plan` suspension.
+ *
+ * The tool suspends with only the plan file `path`; hosts read that file to render
+ * the approval. `path`/`title`/`plan` let the host back-fill what it rendered so the
+ * persisted tool result (`submittedPlan`) replays the plan durably in history even
+ * after the plan file changes or disappears.
+ */
 export interface PlanResume {
   action: 'approved' | 'rejected';
   feedback?: string;
+  path?: string;
+  title?: string;
+  plan?: string;
 }
 
 /**
@@ -326,6 +277,8 @@ export interface AgentControllerRequestOptions {
 
 /** Options for subscribing to an agent controller session's event stream. */
 export interface SubscribeAgentControllerSessionOptions {
+  /** Set to false to omit full display_state_changed snapshots, including the initial snapshot. Defaults to true. */
+  displayState?: boolean;
   /** Called for each event received over the stream. */
   onEvent: (event: AgentControllerEvent) => void;
   /**
@@ -356,6 +309,17 @@ export interface SubscribeAgentControllerSessionOptions {
         delayMs?: number;
         maxDelayMs?: number;
       };
+  /**
+   * Treat the stream as dropped after this many milliseconds without
+   * receiving any bytes. Server heartbeats (every 25s) count, so a healthy
+   * idle stream never trips it; a half-open connection (laptop sleep, proxy
+   * or NAT timeout) does. Also bounds opening the stream: the initial
+   * `subscribe()` rejects, and a reconnect attempt counts as failed, when no
+   * response arrives in time. A timeout is handled like any other drop —
+   * `reconnect` / `onReconnect` if enabled, otherwise `onError`.
+   * Default 60000; `0` disables.
+   */
+  idleTimeoutMs?: number;
 }
 
 export interface AgentControllerSubscription {
@@ -364,54 +328,46 @@ export interface AgentControllerSubscription {
 }
 
 /**
- * A session bound to a `resourceId` within one agent controller. Sessions are
- * get-or-create on the server, so re-creating the same resourceId (and scope)
- * resumes the existing conversation rather than forking it.
- *
- * Pass a `scope` to address an independent session over the same resourceId:
- * two sessions with the same resourceId but different scopes have their own
- * run loop, thread binding, and mode/model/state (e.g. one session per git
- * worktree, with the worktree path as the scope). The scope travels on every
- * request as a `sessionScope` query param.
+ * A session addressed by its `sessionId` within one agent controller. Sessions
+ * are get-or-create on the server, so re-creating the same sessionId resumes
+ * the existing conversation rather than forking it. Many sessions can work on
+ * one `resourceId` (whose threads and memory they use); each has its own run
+ * loop, thread binding, and mode/model/state.
  */
 export class AgentControllerSession extends BaseResource {
   constructor(
     options: ClientOptions,
     private readonly controllerId: string,
-    private readonly resourceId: string,
-    private readonly scope?: string,
+    private readonly sessionId: string,
   ) {
     super(options);
   }
 
   private base() {
-    return `/agent-controller/${encodeURIComponent(this.controllerId)}/sessions/${encodeURIComponent(this.resourceId)}`;
-  }
-
-  /** Append this session's scope (if any) as a `sessionScope` query param. */
-  private url(path: string): string {
-    if (this.scope === undefined) return path;
-    const sep = path.includes('?') ? '&' : '?';
-    return `${path}${sep}sessionScope=${encodeURIComponent(this.scope)}`;
+    return `/agent-controller/${encodeURIComponent(this.controllerId)}/sessions/${encodeURIComponent(this.sessionId)}`;
   }
 
   /**
-   * Create or resume this session. Pass `tags` to scope initial thread
-   * selection — a thread is a resume candidate only when its metadata matches
-   * every tag. Pass `threadId` to bind the session to one exact thread,
-   * creating it with that id when it does not exist.
+   * Create or resume this session. `resourceId` names whose threads and memory
+   * the session works on. Without it the server resumes the session on the
+   * resource it already has (the live session's, or the resource of the thread
+   * with the session's id), falling back to the sessionId. Pass `tags` to scope
+   * initial thread selection — a thread is a resume candidate only when its
+   * metadata matches every tag. Pass `threadId` to bind the session to one
+   * exact thread, creating it with that id when it does not exist.
    */
   create(options?: {
+    resourceId?: string;
     tags?: Record<string, string>;
     threadId?: string;
   }): Promise<CreateAgentControllerSessionResponse> {
     return this.request(`/agent-controller/${encodeURIComponent(this.controllerId)}/sessions`, {
       method: 'POST',
       body: {
-        resourceId: this.resourceId,
+        resourceId: options?.resourceId,
+        sessionId: this.sessionId,
         tags: options?.tags,
         threadId: options?.threadId,
-        sessionScope: this.scope,
       },
     });
   }
@@ -444,6 +400,7 @@ export class AgentControllerSession extends BaseResource {
               maxDelayMs: finiteOr(options.reconnect.maxDelayMs, 30_000),
             }
           : null;
+    const idleTimeoutMs = finiteOr(options.idleTimeoutMs, 60_000);
 
     /** Exponential backoff for the Nth (1-based) retry of an outage streak. */
     const backoffDelay = (attempt: number) =>
@@ -451,6 +408,8 @@ export class AgentControllerSession extends BaseResource {
 
     let cancelled = false;
     let currentReader: ReadableStreamDefaultReader<Uint8Array> | null = null;
+    // Aborts the fetch behind the stream currently being opened or read.
+    let currentAbort: AbortController | null = null;
     let reconnectTimer: ReturnType<typeof setTimeout> | undefined;
     let delayResolve: (() => void) | undefined;
 
@@ -470,8 +429,57 @@ export class AgentControllerSession extends BaseResource {
         reconnectTimer = setTimeout(settleDelay, ms);
       });
 
+    const idleTimeoutError = () => {
+      const error = new Error(`Agent controller session stream received no data for ${idleTimeoutMs}ms`);
+      error.name = 'AgentControllerStreamIdleError';
+      return error;
+    };
+
     const requestStream = async (): Promise<Response> => {
-      const response = (await this.request(this.url(`${this.base()}/stream`), { stream: true })) as Response;
+      const abort = new AbortController();
+      currentAbort = abort;
+      let openTimer: ReturnType<typeof setTimeout> | undefined;
+      const request = this.request(
+        `${this.base()}/stream${options.displayState === false ? '?displayState=false' : ''}`,
+        {
+          stream: true,
+          signal: abort.signal,
+        },
+      ) as Promise<Response>;
+      // If the timeout wins the race, a late response must be cancelled and a late
+      // rejection must not surface as unhandled.
+      request
+        .then(response => {
+          if (abort.signal.aborted) {
+            void response.body?.cancel().catch(() => {});
+          }
+        })
+        .catch(() => {});
+      let response: Response;
+      try {
+        if (idleTimeoutMs > 0) {
+          // Race rather than rely on abort alone: a custom fetch may ignore the signal.
+          response = await Promise.race([
+            request,
+            new Promise<never>((_resolve, reject) => {
+              openTimer = setTimeout(() => {
+                const error = idleTimeoutError();
+                abort.abort(error);
+                reject(error);
+              }, idleTimeoutMs);
+            }),
+          ]);
+        } else {
+          response = await request;
+        }
+      } finally {
+        clearTimeout(openTimer);
+      }
+      if (abort.signal.aborted) {
+        // Lost the race (timeout or unsubscribe) after the response arrived.
+        void response.body?.cancel().catch(() => {});
+        throw abort.signal.reason;
+      }
       if (!response.body) {
         throw new Error('No response body for agent controller session stream');
       }
@@ -499,13 +507,42 @@ export class AgentControllerSession extends BaseResource {
     const pump = async (response: Response): Promise<PumpResult> => {
       const reader = response.body!.getReader();
       currentReader = reader;
+      const abort = currentAbort;
       const decoder = new TextDecoder();
       let buffer = '';
+      // A half-open connection never errors or closes, so read() would await
+      // forever. Any bytes (including `: heartbeat` comments) re-arm the timer;
+      // on expiry we cancel the reader and report a transport drop.
+      let idleTimer: ReturnType<typeof setTimeout> | undefined;
+      let timedOut = false;
+      const armIdleTimer = () => {
+        if (idleTimeoutMs <= 0) return;
+        clearTimeout(idleTimer);
+        idleTimer = setTimeout(() => {
+          timedOut = true;
+          void reader.cancel(idleTimeoutError()).catch(() => {});
+          abort?.abort(idleTimeoutError());
+        }, idleTimeoutMs);
+      };
 
       try {
+        armIdleTimer();
         while (!cancelled) {
-          const { done, value } = await reader.read();
+          let chunk: Awaited<ReturnType<typeof reader.read>>;
+          try {
+            chunk = await reader.read();
+          } catch (error) {
+            if (timedOut && !cancelled) return { kind: 'transport_error', error: idleTimeoutError() };
+            throw error;
+          }
+          // A cancel-induced `done` must not be mistaken for a clean close.
+          if (timedOut && !cancelled) return { kind: 'transport_error', error: idleTimeoutError() };
+          const { done, value } = chunk;
           if (done) return cancelled ? { kind: 'cancelled' } : { kind: 'done' };
+          armIdleTimer();
+          // A read() that resolved just before unsubscribe() must not deliver its
+          // frame: cancellation happened while we were awaiting.
+          if (cancelled) return { kind: 'cancelled' };
           buffer += decoder.decode(value, { stream: true });
 
           let separator: { index: number; length: number } | null;
@@ -518,10 +555,13 @@ export class AgentControllerSession extends BaseResource {
               if (!data) continue;
               let event: AgentControllerEvent;
               try {
-                event = hydrateEventMessage(JSON.parse(data) as AgentControllerEvent);
+                event = hydrateEventTimestamps(JSON.parse(data));
               } catch {
                 continue;
               }
+              // An earlier onEvent in this same buffered chunk may have called
+              // unsubscribe(); stop before delivering any further frames.
+              if (cancelled) return { kind: 'cancelled' };
               try {
                 options.onEvent(event);
               } catch (cause) {
@@ -535,7 +575,9 @@ export class AgentControllerSession extends BaseResource {
       } catch (error) {
         return cancelled ? { kind: 'cancelled' } : { kind: 'transport_error', error };
       } finally {
+        clearTimeout(idleTimer);
         if (currentReader === reader) currentReader = null;
+        if (currentAbort === abort) currentAbort = null;
         void reader.cancel().catch(() => {});
       }
     };
@@ -593,6 +635,9 @@ export class AgentControllerSession extends BaseResource {
         let attempts = 0;
         let reconnectedResponse: Response | undefined;
         while (!reconnectedResponse) {
+          // A requestStream() that rejected after unsubscribe() must not surface
+          // as a terminal onError: honor cancellation before exhausting the budget.
+          if (cancelled) return;
           if (attempts >= reconnectOptions.maxRetries) {
             reportTerminalError(result);
             return;
@@ -603,6 +648,13 @@ export class AgentControllerSession extends BaseResource {
           try {
             reconnectedResponse = await requestStream();
           } catch (error) {
+            if (cancelled) return;
+            // Auth denials and other client errors won't resolve by resubscribing;
+            // 408/429 stay retryable.
+            if (isTerminalReconnectError(error)) {
+              safeOnError(error);
+              return;
+            }
             result = { kind: 'transport_error', error };
           }
         }
@@ -618,6 +670,13 @@ export class AgentControllerSession extends BaseResource {
         } catch {
           // Consumer callback failures must not kill the stream loop.
         }
+        // onReconnect may have called unsubscribe(). The new response has not yet
+        // acquired a reader (pump() runs on the next iteration), so unsubscribe()
+        // had nothing to cancel — cancel its body here before the loop exits.
+        if (cancelled) {
+          void response.body?.cancel().catch(() => {});
+          return;
+        }
       }
     };
 
@@ -628,6 +687,7 @@ export class AgentControllerSession extends BaseResource {
         cancelled = true;
         settleDelay();
         void currentReader?.cancel().catch(() => {});
+        currentAbort?.abort();
       },
     };
   }
@@ -644,7 +704,7 @@ export class AgentControllerSession extends BaseResource {
   ): Promise<void> {
     const { content, files } = typeof message === 'string' ? { content: message, files: undefined } : message;
     const requestContext = parseClientRequestContext(options?.requestContext);
-    await this.request(this.url(`${this.base()}/messages`), {
+    await this.request(`${this.base()}/messages`, {
       method: 'POST',
       body: {
         message: content,
@@ -656,15 +716,33 @@ export class AgentControllerSession extends BaseResource {
 
   /** Abort the in-flight run for this session. */
   async abort(): Promise<void> {
-    await this.request(this.url(`${this.base()}/abort`), { method: 'POST' });
+    await this.request(`${this.base()}/abort`, { method: 'POST' });
   }
 
-  /** Approve or decline a pending tool call (`tool_approval_required`). */
-  async approveTool(toolCallId: string, approved: boolean, options?: AgentControllerRequestOptions): Promise<void> {
+  /**
+   * Approve or decline a pending tool call (`tool_approval_required`). Resolves
+   * `{ ok: false, reason }` when no pending approval claimed the decision.
+   */
+  async approveTool(
+    toolCallId: string,
+    approved: boolean,
+    options?: AgentControllerRequestOptions & {
+      /** Also grant the tool's category to the call's thread ("always allow"). */
+      alwaysAllowCategory?: boolean;
+    },
+  ): Promise<AgentControllerCommandAck> {
     const requestContext = parseClientRequestContext(options?.requestContext);
-    await this.request(this.url(`${this.base()}/tool-approval`), {
+    return this.request<AgentControllerCommandAck>(`${this.base()}/tool-approval`, {
       method: 'POST',
-      body: { toolCallId, approved, ...(requestContext ? { requestContext } : {}) },
+      // Not idempotent: a replay after a lost response would be rejected as not_pending
+      // and misreport an applied decision as ignored.
+      retries: 0,
+      body: {
+        toolCallId,
+        approved,
+        ...(options?.alwaysAllowCategory ? { alwaysAllowCategory: true } : {}),
+        ...(requestContext ? { requestContext } : {}),
+      },
     });
   }
 
@@ -677,43 +755,64 @@ export class AgentControllerSession extends BaseResource {
     toolCallId: string,
     resumeData: string | string[] | PlanResume,
     options?: AgentControllerRequestOptions,
-  ): Promise<void> {
+  ): Promise<AgentControllerCommandAck> {
     const requestContext = parseClientRequestContext(options?.requestContext);
-    await this.request(this.url(`${this.base()}/tool-suspension`), {
+    return this.request<AgentControllerCommandAck>(`${this.base()}/tool-suspension`, {
       method: 'POST',
+      // Not idempotent: a replay after a lost response would be rejected as not_pending
+      // and misreport an applied decision as ignored.
+      retries: 0,
       body: { toolCallId, resumeData, ...(requestContext ? { requestContext } : {}) },
     });
   }
 
-  /** Inject a message into the in-flight run without starting a new turn. */
-  async steer(message: string, options?: AgentControllerRequestOptions): Promise<void> {
+  /**
+   * Aborts the in-flight run, then sends the message as a new turn.
+   * Pass a structured message to attach files, as with `sendMessage`.
+   */
+  async steer(
+    message: string | { content: string; files?: Array<{ data: string; mediaType: string; filename?: string }> },
+    options?: AgentControllerRequestOptions,
+  ): Promise<void> {
+    const { content, files } = typeof message === 'string' ? { content: message, files: undefined } : message;
     const requestContext = parseClientRequestContext(options?.requestContext);
-    await this.request(this.url(`${this.base()}/steer`), {
+    await this.request(`${this.base()}/steer`, {
       method: 'POST',
-      body: { message, ...(requestContext ? { requestContext } : {}) },
+      body: {
+        message: content,
+        ...(files?.length ? { files } : {}),
+        ...(requestContext ? { requestContext } : {}),
+      },
     });
   }
 
   /** Get the current mode, model, and thread (for initial UI hydration). */
-  state(): Promise<AgentControllerSessionState> {
-    return this.request(this.url(this.base()));
+  state(options?: { threadId?: string }): Promise<AgentControllerSessionState> {
+    const path = options?.threadId ? `${this.base()}?threadId=${encodeURIComponent(options.threadId)}` : this.base();
+    return this.request(path);
   }
 
   /** Merge key-value pairs into the session state. Existing keys not in the payload are preserved. */
   async setState(updates: Record<string, unknown>): Promise<void> {
-    await this.request(this.url(`${this.base()}/state`), { method: 'PUT', body: { state: updates } });
+    await this.request(`${this.base()}/state`, { method: 'PUT', body: { state: updates } });
   }
 
   /** Switch the active mode (e.g. `build`, `plan`). */
   async switchMode(modeId: string): Promise<void> {
-    await this.request(this.url(`${this.base()}/mode`), { method: 'POST', body: { modeId } });
+    await this.request(`${this.base()}/mode`, { method: 'POST', body: { modeId } });
   }
 
-  /** Switch the model. Defaults to thread scope. */
-  async switchModel(modelId: string, options?: { scope?: 'global' | 'thread'; modeId?: string }): Promise<void> {
-    await this.request(this.url(`${this.base()}/model`), {
+  /**
+   * Switch the session model and persist it to the active thread. When
+   * `thinkingLevel` is provided it is applied and persisted with the model.
+   */
+  async switchModel(
+    modelId: string,
+    { thinkingLevel }: { thinkingLevel?: AgentControllerThinkingLevel } = {},
+  ): Promise<void> {
+    await this.request(`${this.base()}/model`, {
       method: 'POST',
-      body: { modelId, scope: options?.scope, modeId: options?.modeId },
+      body: thinkingLevel !== undefined ? { modelId, thinkingLevel } : { modelId },
     });
   }
 
@@ -732,20 +831,20 @@ export class AgentControllerSession extends BaseResource {
     if (opts.limit != null) params.set('limit', String(opts.limit));
     if (opts.tags && Object.keys(opts.tags).length > 0) params.set('tags', JSON.stringify(opts.tags));
     const query = params.toString() ? `?${params.toString()}` : '';
-    const body = await this.request<{ threads: AgentControllerThreadInfo[] }>(
-      this.url(`${this.base()}/threads${query}`),
+    const body = await this.request<RouteResponse<'GET /agent-controller/:controllerId/sessions/:sessionId/threads'>>(
+      `${this.base()}/threads${query}`,
     );
     return body.threads;
   }
 
   /** Switch the session to an existing thread (rebinds stream + state). */
   async switchThread(threadId: string): Promise<void> {
-    await this.request(this.url(`${this.base()}/thread`), { method: 'POST', body: { threadId } });
+    await this.request(`${this.base()}/thread`, { method: 'POST', body: { threadId } });
   }
 
   /** Create a new thread (unbinds previous, binds the new one). */
-  async createThread(title?: string): Promise<AgentControllerThreadInfo> {
-    return this.request(this.url(`${this.base()}/threads`), {
+  async createThread(title?: string): Promise<CreateAgentControllerThreadResponse> {
+    return this.request(`${this.base()}/threads`, {
       method: 'POST',
       body: { title },
     });
@@ -753,71 +852,125 @@ export class AgentControllerSession extends BaseResource {
 
   /** Delete a thread. If it's the active thread the session unbinds. */
   async deleteThread(threadId: string): Promise<void> {
-    await this.request(this.url(`${this.base()}/threads/${encodeURIComponent(threadId)}`), {
+    await this.request(`${this.base()}/threads/${encodeURIComponent(threadId)}`, {
       method: 'DELETE',
     });
   }
 
   /** Rename a thread. */
   async renameThread(threadId: string, title: string): Promise<void> {
-    await this.request(this.url(`${this.base()}/threads/${encodeURIComponent(threadId)}`), {
+    await this.request(`${this.base()}/threads/${encodeURIComponent(threadId)}`, {
       method: 'PUT',
       body: { title },
     });
   }
 
   /** Clone a thread (and its messages). The session binds to the clone. */
-  async cloneThread(options?: { sourceThreadId?: string; title?: string }): Promise<AgentControllerThreadInfo> {
-    return this.request(this.url(`${this.base()}/threads/clone`), {
+  async cloneThread(options?: {
+    sourceThreadId?: string;
+    title?: string;
+  }): Promise<CreateAgentControllerThreadResponse> {
+    return this.request(`${this.base()}/threads/clone`, {
       method: 'POST',
       body: options ?? {},
     });
   }
 
-  /** List messages for a specific thread. */
-  async listMessages(threadId: string, limit?: number): Promise<MastraDBMessage[]> {
-    const params = limit != null ? `?limit=${limit}` : '';
-    const body = await this.request<{ messages: SerializedMastraDBMessage[] }>(
-      this.url(`${this.base()}/threads/${encodeURIComponent(threadId)}/messages${params}`),
+  /** List messages for a specific thread, preserving the legacy array-returning limit overload. */
+  async listMessages(threadId: string, limit?: number): Promise<MastraDBMessage[]>;
+  async listMessages(
+    threadId: string,
+    options: AgentControllerListMessagesOptions,
+  ): Promise<AgentControllerListMessagesResult>;
+  async listMessages(
+    threadId: string,
+    options?: number | AgentControllerListMessagesOptions,
+  ): Promise<MastraDBMessage[] | AgentControllerListMessagesResult> {
+    const queryParams = new URLSearchParams();
+    const legacy = typeof options === 'number' || options === undefined;
+
+    if (typeof options === 'number') {
+      queryParams.set('limit', String(options));
+    } else if (options === undefined) {
+      queryParams.set('perPage', 'false');
+    } else {
+      const { limit, page, perPage, orderBy, filter, include } = options;
+      if (
+        limit !== undefined &&
+        (perPage !== undefined || orderBy !== undefined || filter !== undefined || include !== undefined)
+      ) {
+        throw new Error('limit can only be combined with page; use perPage with orderBy, filter, or include');
+      }
+      if (limit !== undefined) queryParams.set('limit', String(limit));
+      if (page !== undefined) queryParams.set('page', String(page));
+      if (perPage !== undefined) queryParams.set('perPage', String(perPage));
+      if (orderBy) queryParams.set('orderBy', JSON.stringify(orderBy));
+      if (filter) queryParams.set('filter', JSON.stringify(filter));
+      if (include) queryParams.set('include', JSON.stringify(include));
+    }
+
+    const query = queryParams.toString();
+    const body = await this.request<SerializedAgentControllerListMessagesResult>(
+      `${this.base()}/threads/${encodeURIComponent(threadId)}/messages${query ? `?${query}` : ''}`,
     );
-    return body.messages.map(hydrateMessage);
+    const messages = body.messages.map(hydrateMessage);
+
+    if (legacy) return messages;
+    return { ...body, messages };
   }
 
   /**
    * Queue a follow-up message. If the session is idle it sends immediately;
    * if a run is active it queues for after completion.
+   * Pass a structured message to attach files, as with `sendMessage`.
    */
-  async followUp(message: string, options?: AgentControllerRequestOptions): Promise<void> {
+  async followUp(
+    message: string | { content: string; files?: Array<{ data: string; mediaType: string; filename?: string }> },
+    options?: AgentControllerRequestOptions,
+  ): Promise<void> {
+    const { content, files } = typeof message === 'string' ? { content: message, files: undefined } : message;
     const requestContext = parseClientRequestContext(options?.requestContext);
-    await this.request(this.url(`${this.base()}/follow-up`), {
+    await this.request(`${this.base()}/follow-up`, {
       method: 'POST',
-      body: { message, ...(requestContext ? { requestContext } : {}) },
+      body: {
+        message: content,
+        ...(files?.length ? { files } : {}),
+        ...(requestContext ? { requestContext } : {}),
+      },
     });
   }
 
   /** Get the observational memory record for this session's thread. */
-  async getOMRecord(): Promise<unknown> {
-    const body = await this.request<{ record: unknown }>(this.url(`${this.base()}/om`));
+  async getOMRecord(): Promise<RouteResponse<'GET /agent-controller/:controllerId/sessions/:sessionId/om'>['record']> {
+    const body = await this.request<RouteResponse<'GET /agent-controller/:controllerId/sessions/:sessionId/om'>>(
+      `${this.base()}/om`,
+    );
     return body.record;
   }
 
   /** Change the session's resource identity. */
   async setResourceId(newResourceId: string): Promise<void> {
-    await this.request(this.url(`${this.base()}/resource`), {
+    await this.request(`${this.base()}/resource`, {
       method: 'POST',
       body: { newResourceId },
     });
   }
 
   /** Get known resource IDs for this session. */
-  async getResourceIds(): Promise<string[]> {
-    const body = await this.request<{ resourceIds: string[] }>(this.url(`${this.base()}/resources`));
+  async getResourceIds(): Promise<
+    RouteResponse<'GET /agent-controller/:controllerId/sessions/:sessionId/resources'>['resourceIds']
+  > {
+    const body = await this.request<RouteResponse<'GET /agent-controller/:controllerId/sessions/:sessionId/resources'>>(
+      `${this.base()}/resources`,
+    );
     return body.resourceIds;
   }
 
   /** Get the current goal for this session's thread. */
   async getGoal(): Promise<AgentControllerGoalRecord | undefined> {
-    const body = await this.request<{ goal?: AgentControllerGoalRecord }>(this.url(`${this.base()}/goal`));
+    const body = await this.request<RouteResponse<'GET /agent-controller/:controllerId/sessions/:sessionId/goal'>>(
+      `${this.base()}/goal`,
+    );
     return body.goal;
   }
 
@@ -826,10 +979,13 @@ export class AgentControllerSession extends BaseResource {
     objective: string,
     options?: { judgeModelId?: string; maxRuns?: number },
   ): Promise<AgentControllerGoalRecord | undefined> {
-    const body = await this.request<{ goal?: AgentControllerGoalRecord }>(this.url(`${this.base()}/goal`), {
-      method: 'POST',
-      body: { objective, ...options },
-    });
+    const body = await this.request<RouteResponse<'POST /agent-controller/:controllerId/sessions/:sessionId/goal'>>(
+      `${this.base()}/goal`,
+      {
+        method: 'POST',
+        body: { objective, ...options },
+      },
+    );
     return body.goal;
   }
 
@@ -839,16 +995,19 @@ export class AgentControllerSession extends BaseResource {
     maxRuns?: number;
     status?: 'active' | 'paused' | 'done';
   }): Promise<AgentControllerGoalRecord | undefined> {
-    const body = await this.request<{ goal?: AgentControllerGoalRecord }>(this.url(`${this.base()}/goal`), {
-      method: 'PUT',
-      body: options,
-    });
+    const body = await this.request<RouteResponse<'PUT /agent-controller/:controllerId/sessions/:sessionId/goal'>>(
+      `${this.base()}/goal`,
+      {
+        method: 'PUT',
+        body: options,
+      },
+    );
     return body.goal;
   }
 
   /** Clear the current goal. */
   async clearGoal(): Promise<void> {
-    await this.request(this.url(`${this.base()}/goal`), { method: 'DELETE' });
+    await this.request(`${this.base()}/goal`, { method: 'DELETE' });
   }
 
   // ---------------------------------------------------------------------------
@@ -857,12 +1016,12 @@ export class AgentControllerSession extends BaseResource {
 
   /** Get the current permission rules (per-category and per-tool policies). */
   async getPermissions(): Promise<PermissionRules> {
-    return this.request(this.url(`${this.base()}/permissions`));
+    return this.request(`${this.base()}/permissions`);
   }
 
   /** Set the approval policy for a tool category. */
   async setPermissionForCategory(category: ToolCategory, policy: PermissionPolicy): Promise<void> {
-    await this.request(this.url(`${this.base()}/permissions/category`), {
+    await this.request(`${this.base()}/permissions/category`, {
       method: 'PUT',
       body: { category, policy },
     });
@@ -870,7 +1029,7 @@ export class AgentControllerSession extends BaseResource {
 
   /** Set the approval policy for a specific tool. */
   async setPermissionForTool(toolName: string, policy: PermissionPolicy): Promise<void> {
-    await this.request(this.url(`${this.base()}/permissions/tool`), {
+    await this.request(`${this.base()}/permissions/tool`, {
       method: 'PUT',
       body: { toolName, policy },
     });
@@ -882,7 +1041,7 @@ export class AgentControllerSession extends BaseResource {
    * or is persisted for later.
    */
   async sendNotification(input: SendNotificationInput): Promise<SendNotificationResult> {
-    return this.request(this.url(`${this.base()}/notifications`), {
+    return this.request(`${this.base()}/notifications`, {
       method: 'POST',
       body: input,
     });
@@ -904,14 +1063,26 @@ export class AgentController extends BaseResource {
 
   /** List the modes configured on this agent controller (e.g. build, plan). */
   async listModes(): Promise<AgentControllerModeInfo[]> {
-    const body = await this.request<{ modes: AgentControllerModeInfo[] }>(`${this.basePath()}/modes`);
+    const body = await this.request<RouteResponse<'GET /agent-controller/:controllerId/modes'>>(
+      `${this.basePath()}/modes`,
+    );
     return body.modes;
   }
 
   /** List available models on this agent controller (with auth status and use counts). */
   async listModels(): Promise<AgentControllerAvailableModel[]> {
-    const body = await this.request<{ models: AgentControllerAvailableModel[] }>(`${this.basePath()}/models`);
+    const body = await this.request<RouteResponse<'GET /agent-controller/:controllerId/models'>>(
+      `${this.basePath()}/models`,
+    );
     return body.models;
+  }
+
+  /** List the runs in flight on this controller, across all resources. */
+  async listActiveRuns(): Promise<AgentControllerActiveRun[]> {
+    const body = await this.request<RouteResponse<'GET /agent-controller/:controllerId/active-runs'>>(
+      `${this.basePath()}/active-runs`,
+    );
+    return body.runs;
   }
 
   /** Get workspace status for this agent controller. */
@@ -920,12 +1091,11 @@ export class AgentController extends BaseResource {
   }
 
   /**
-   * Scope to a session bound to `resourceId` (e.g. a user or conversation id).
-   * Pass `scope` to address an independent session over the same resourceId
-   * (e.g. one session per git worktree, with the worktree path as the scope).
+   * Address the session with this `sessionId`. Sessions created without an
+   * explicit id are addressed by their `resourceId`.
    */
-  session(resourceId: string, scope?: string): AgentControllerSession {
-    return new AgentControllerSession(this.options, this.controllerId, resourceId, scope);
+  session(sessionId: string): AgentControllerSession {
+    return new AgentControllerSession(this.options, this.controllerId, sessionId);
   }
 }
 

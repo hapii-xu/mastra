@@ -19,7 +19,7 @@
 import * as p from '@clack/prompts';
 import { defaultDatabaseName } from '../db/db.js';
 import type { DatabaseKind, ProjectDatabase } from '../db/platform-api.js';
-import { attachDatabase, DB_ENV_VAR_NAMES, pollDatabaseUntilReady } from '../db/platform-api.js';
+import { attachDatabase, DB_ENV_VAR_NAMES, fetchDatabaseCatalog, pollDatabaseUntilReady } from '../db/platform-api.js';
 import type { PreflightAutofix, PreflightIssue } from '../deploy-preflight.js';
 import type { Environment } from '../env/platform-api.js';
 
@@ -68,6 +68,85 @@ function collectAutofixes(issues: PreflightIssue[]): Map<DatabaseKind, Preflight
 }
 
 /**
+ * Expand a preflight autofix's primary provider into the ordered list of
+ * candidate providers whose managed databases inject at least one of the same
+ * env vars, filtered to the ones this org actually has in its catalog.
+ *
+ * The primary (whatever `dbAutofixFor` picked first — currently `neon` for
+ * DATABASE_URL) stays first so its label is the default option in the
+ * `p.select` prompt. Other candidates come in DB_ENV_VAR_NAMES insertion
+ * order for stable UX.
+ */
+function candidateProviders(
+  primary: DatabaseKind,
+  envVarNames: string[],
+  availableKinds: Set<DatabaseKind>,
+): DatabaseKind[] {
+  const seen = new Set<DatabaseKind>([primary]);
+  const list: DatabaseKind[] = [primary];
+  for (const envVarName of envVarNames) {
+    for (const [kind, names] of Object.entries(DB_ENV_VAR_NAMES) as [DatabaseKind, string[]][]) {
+      if (seen.has(kind)) continue;
+      if (!availableKinds.has(kind)) continue;
+      if (!names.includes(envVarName)) continue;
+      seen.add(kind);
+      list.push(kind);
+    }
+  }
+  return list;
+}
+
+/** Human-friendly label for the multi-provider select prompt. */
+const PROVIDER_LABEL: Record<DatabaseKind, string> = {
+  turso: 'Turso',
+  neon: 'Neon (serverless, public)',
+  postgres: 'Postgres (VPC-isolated)',
+  redis: 'Redis',
+  mongodb: 'MongoDB',
+};
+
+async function confirmProvision(
+  provider: DatabaseKind,
+  envVarNames: string[],
+  environmentName: string,
+): Promise<DatabaseKind | null> {
+  const confirm = await p.confirm({
+    message:
+      `Preflight needs ${envVarNames.join(', ')} for the ${environmentName} environment. ` +
+      `Create a managed ${provider} database now and attach it?`,
+    initialValue: true,
+  });
+  if (p.isCancel(confirm)) {
+    p.cancel('Deploy cancelled.');
+    process.exit(0);
+  }
+  return confirm ? provider : null;
+}
+
+async function selectProvision(
+  candidates: DatabaseKind[],
+  envVarNames: string[],
+  environmentName: string,
+): Promise<DatabaseKind | null> {
+  const options = [
+    ...candidates.map(kind => ({ value: kind as DatabaseKind | 'skip', label: PROVIDER_LABEL[kind] ?? kind })),
+    { value: 'skip' as const, label: 'Skip — set it manually later' },
+  ];
+  const selection = await p.select({
+    message:
+      `Preflight needs ${envVarNames.join(', ')} for the ${environmentName} environment. ` +
+      `Which managed database should be provisioned?`,
+    options,
+    initialValue: candidates[0],
+  });
+  if (p.isCancel(selection)) {
+    p.cancel('Deploy cancelled.');
+    process.exit(0);
+  }
+  return selection === 'skip' ? null : (selection as DatabaseKind);
+}
+
+/**
  * If preflight surfaced blocking issues we know how to auto-fix (missing
  * managed database env vars), offer to fix them inline. Non-interactive
  * callers get the original issues back untouched — the caller is expected to
@@ -91,34 +170,53 @@ export async function maybeAutoProvisionDatabases(
   // an explicit yes to a specific provider.
   if (!isInteractive() || ctx.autoAccept) return untouched;
 
+  // The platform filters the provider catalog per-organization (feature
+  // flags, e.g. `managed-redis`). Only offer kinds the platform would let
+  // this org attach — the same gate the dashboard UI uses. Fail closed on
+  // errors, matching the platform: a flag-service hiccup must not lead to
+  // prompts whose attach would then be rejected anyway.
+  let availableKinds: Set<DatabaseKind>;
+  try {
+    const catalog = await fetchDatabaseCatalog(ctx.token, ctx.orgId, ctx.projectId);
+    availableKinds = new Set(catalog.filter(entry => entry.status === 'available').map(entry => entry.kind));
+  } catch (error) {
+    const message = error instanceof Error ? error.message : String(error);
+    p.log.warn(`Could not check managed database availability (${message}); skipping auto-provisioning.`);
+    return untouched;
+  }
+
   const resolved = new Set<PreflightAutofix>();
   const newlyManaged: string[] = [];
   const provisioned: ProjectDatabase[] = [];
 
   for (const [provider, fixes] of grouped) {
-    const uniqueVars = [...new Set(fixes.map(f => f.envVarName))].join(', ');
-    const confirm = await p.confirm({
-      message:
-        `Preflight needs ${uniqueVars} for the ${ctx.environment.slug} environment. ` +
-        `Create a managed ${provider} database now and attach it?`,
-      initialValue: true,
-    });
+    // Silently skip kinds the platform doesn't offer this org — mirrors the
+    // dashboard, where a gated provider simply doesn't appear.
+    if (!availableKinds.has(provider)) continue;
 
-    if (p.isCancel(confirm)) {
-      p.cancel('Deploy cancelled.');
-      process.exit(0);
-    }
-    if (!confirm) continue;
+    const uniqueVars = [...new Set(fixes.map(f => f.envVarName))];
+    // Some env vars (e.g. DATABASE_URL) can be satisfied by more than one
+    // provider — Neon (public serverless) or the VPC-only Railway Postgres.
+    // When multiple candidates are actually offered by this org, we present a
+    // choice instead of hard-coding the primary that dbAutofixFor happened to
+    // pick.
+    const candidates = candidateProviders(provider, uniqueVars, availableKinds);
+
+    const chosen =
+      candidates.length === 1
+        ? await confirmProvision(provider, uniqueVars, ctx.environment.name)
+        : await selectProvision(candidates, uniqueVars, ctx.environment.name);
+    if (!chosen) continue;
 
     try {
-      const created = await provisionOne(ctx, provider);
+      const created = await provisionOne(ctx, chosen);
       provisioned.push(created);
-      const injected = DB_ENV_VAR_NAMES[provider] ?? [];
+      const injected = DB_ENV_VAR_NAMES[chosen] ?? [];
       newlyManaged.push(...injected);
       for (const fix of fixes) resolved.add(fix);
     } catch (error) {
       const message = error instanceof Error ? error.message : String(error);
-      p.log.error(`Failed to attach a ${provider} database: ${message}`);
+      p.log.error(`Failed to attach a ${chosen} database: ${message}`);
       // Leave the fixes in the issue list — the normal error printer will
       // show the exact `mastra env db create` command as remediation.
     }
@@ -136,6 +234,7 @@ export async function maybeAutoProvisionDatabases(
 
 async function provisionOne(ctx: AutoProvisionContext, provider: DatabaseKind): Promise<ProjectDatabase> {
   const name = defaultDatabaseName(
+    provider,
     { name: ctx.projectName, slug: ctx.projectSlug },
     { name: ctx.environment.name, slug: ctx.environment.slug, type: ctx.environment.type },
   );
@@ -151,7 +250,7 @@ async function provisionOne(ctx: AutoProvisionContext, provider: DatabaseKind): 
     const ready = await pollDatabaseUntilReady(ctx.token, ctx.orgId, ctx.projectId, created.id, {
       onStatus: status => spinner.message(`Provisioning ${provider} database "${created.name}" — ${status}`),
     });
-    spinner.stop(`Database "${ready.name}" is ready and attached to ${ctx.environment.slug}.`);
+    spinner.stop(`Database "${ready.name}" is ready and attached to the ${ctx.environment.name} environment.`);
     return ready;
   } catch (error) {
     spinner.stop('Provisioning failed.');

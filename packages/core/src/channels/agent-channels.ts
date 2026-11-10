@@ -1,11 +1,18 @@
-import type { Chat, Adapter, ChatConfig, Message, StateAdapter, Thread } from 'chat';
+import { createHash } from 'node:crypto';
+import type { Chat, Adapter, Attachment, ChatConfig, Message, StateAdapter, Thread } from 'chat';
 import { z } from 'zod';
 
 import type { Agent } from '../agent/agent';
 import type { MastraProviderMetadata } from '../agent/message-list/state/types';
-import type { AgentSignalContents } from '../agent/signals';
+import { createSignal } from '../agent/signals';
+import type { AgentSignalContents, AgentSignalInput } from '../agent/signals';
+import { MastraError } from '../error';
+import { getErrorFromUnknown } from '../error/utils';
+import { RegisteredLogger } from '../logger/constants';
 import type { IMastraLogger } from '../logger/logger';
 import type { Mastra } from '../mastra';
+import type { MastraMemory } from '../memory/memory';
+import { parseMemoryRequestContext } from '../memory/types';
 import type { StorageThreadType } from '../memory/types';
 import type {
   InputProcessor,
@@ -18,9 +25,15 @@ import { RequestContext } from '../request-context';
 import type { ApiRoute } from '../server/types';
 import type { AgentChunkType } from '../stream/types';
 import { createTool } from '../tools/tool';
+import { WORKSPACE_TOOLS } from '../workspace/constants';
+import { CompositeFilesystem } from '../workspace/filesystem/composite-filesystem';
+import type { WorkspaceFilesystem } from '../workspace/filesystem/filesystem';
+import { resolveToolConfig } from '../workspace/tools/tools';
 
-import { chatModule, getChatModule } from './chat-lazy';
+import { getChatModule } from './chat-lazy';
+import { createChatLogger } from './chat-logger';
 import { resolveSlackTopLevelThreadId } from './compat/slack';
+import { ChannelSessionRejectedError } from './errors';
 
 import { formatArgsSummary, formatToolApproved, formatToolDenied, stripToolPrefix } from './formatting';
 import {
@@ -28,6 +41,7 @@ import {
   extractUrls,
   findInlineLinkRule,
   headContentType,
+  isTextMimeType,
   normalizeInlineLinks,
 } from './inline-media';
 import type { InlineLinkRule } from './inline-media';
@@ -35,23 +49,60 @@ import { ChatChannelOutputProcessor, CHAT_CHANNEL_RENDER_CONTEXT_KEY } from './o
 import type { ChatChannelRenderContext } from './output-processor';
 import { ChatChannelProcessor } from './processor';
 import { MastraStateAdapter } from './state-adapter';
+import { extractErrorMessage } from './stream-helpers';
 import type { PendingApprovalRecord } from './stream-helpers';
+import {
+  collectThreadHistory,
+  formatLegacyHistoryBlock,
+  formatOmittedCount,
+  formatOmittedMarker,
+  messageText,
+} from './thread-history';
+import type { ThreadHistoryLogContext, ThreadHistoryWindow } from './thread-history';
 import type {
   ChannelAdapterConfig,
   ChannelConfig,
   ChannelContext,
+  ChannelHandlerConfig,
+  ChannelHandlerContext,
   ChannelHandlers,
   PostableMessage,
   ResolveResourceId,
   ResolveThreadId,
   StreamingConfig,
-  ThreadHistoryMessage,
   ToolDisplay,
   ToolDisplayFn,
 } from './types';
 import { defaultTypingStatus } from './typing-status';
 import type { TypingStatusContext, TypingStatusFn } from './typing-status';
 import { resolveWaitUntil } from './wait-until';
+
+/** Structured fields for {@link AgentChannels.log}. */
+export interface ChannelLogContext {
+  /** Prefixes the message as `[platform]`. */
+  platform?: string;
+  /** `Error` instances are normalized with `getErrorFromUnknown` so they serialize. */
+  error?: unknown;
+  [key: string]: unknown;
+}
+
+type ChannelAgent = Pick<
+  Agent<any, any, any, any>,
+  'id' | 'getMastraInstance' | 'sendMessage' | 'approveToolCall' | 'declineToolCall' | 'getMemory' | 'getWorkspace'
+>;
+
+/** Platforms whose chat-SDK adapters render interactive approval buttons. */
+const APPROVAL_BUTTON_PLATFORMS = new Set(['slack', 'discord', 'teams', 'gchat', 'google-chat', 'telegram']);
+
+/** Size cap for text attachments decoded into the agent's prompt. */
+const MAX_TEXT_ATTACHMENT_BYTES = 128 * 1024;
+
+/** Text and binary attachments larger than this are not downloaded or saved. */
+const MAX_ATTACHMENT_DOWNLOAD_BYTES = 10 * 1024 * 1024;
+
+/** Default total for attachments stored under `channel-attachments/` in a workspace. */
+const DEFAULT_MAX_ATTACHMENT_STORAGE_BYTES = 100 * 1024 * 1024;
+const ATTACHMENT_DIR = 'channel-attachments';
 
 /**
  * Manages a single Chat SDK instance for an agent, wiring all adapters
@@ -66,7 +117,8 @@ export class AgentChannels {
   private chat: Chat | null = null;
   /** Stored initialization promise so webhook handlers can await readiness on serverless cold starts. */
   private initPromise: Promise<void> | null = null;
-  private agent!: Agent<any, any, any, any>;
+  private agent!: ChannelAgent;
+  private dispatchAgent?: ChannelAgent;
   private logger?: IMastraLogger;
   private customState: StateAdapter | undefined;
   private stateAdapter!: StateAdapter;
@@ -83,10 +135,14 @@ export class AgentChannels {
   private shouldInline: (mimeType: string) => boolean;
   /** Inline-link rules for promoting URLs in message text to file parts. */
   private inlineLinkRules: InlineLinkRule[] | undefined;
+  /** Total bytes of attachments that may be stored under `channel-attachments/`. */
+  private maxAttachmentStorageBytes: number;
   /** Whether channel tools (reactions, etc.) are enabled. */
   private toolsEnabled: boolean;
   /** Optional hook to resolve the memory resourceId (owner) for newly-created channel threads. */
   private resolveResourceId: ResolveResourceId | undefined;
+  /** Memoized bot display name lookups, keyed by platform. */
+  private botDisplayNames = new Map<string, Promise<string | undefined>>();
   /** Optional hook to resolve the internal thread id for newly-created channel threads. */
   private resolveThreadId: ResolveThreadId | undefined;
   /**
@@ -151,6 +207,7 @@ export class AgentChannels {
     this.threadContext = config.threadContext ?? {};
     this.shouldInline = buildInlineMediaCheck(config.inlineMedia);
     this.inlineLinkRules = normalizeInlineLinks(config.inlineLinks);
+    this.maxAttachmentStorageBytes = config.maxAttachmentStorageBytes ?? DEFAULT_MAX_ATTACHMENT_STORAGE_BYTES;
     this.toolsEnabled = config.tools !== false;
     this.resolveResourceId = config.resolveResourceId;
     this.resolveThreadId = config.resolveThreadId;
@@ -159,11 +216,23 @@ export class AgentChannels {
   }
 
   /**
-   * Bind this AgentChannels to its owning agent. Called by Agent constructor.
+   * Bind the owning agent used for webhook paths and stored-thread ownership.
+   * Called by Agent construction and setChannels; changing the owner resets dispatch.
+   * Durable wrappers set a separate dispatch target without changing ownership.
    * @internal
    */
-  __setAgent(agent: Agent<any, any, any, any>): void {
+  __setAgent(agent: ChannelAgent): void {
+    if (this.agent !== agent) this.dispatchAgent = undefined;
     this.agent = agent;
+  }
+
+  /** Set the execution target without changing channel ownership. @internal */
+  __setDispatchAgent(agent: ChannelAgent): void {
+    this.dispatchAgent = agent;
+  }
+
+  private getDispatchAgent(): ChannelAgent {
+    return this.dispatchAgent ?? this.agent;
   }
 
   /**
@@ -172,7 +241,9 @@ export class AgentChannels {
    */
   __setLogger(logger: IMastraLogger): void {
     this.logger =
-      'child' in logger && typeof (logger as any).child === 'function' ? (logger as any).child('CHANNEL') : logger;
+      'child' in logger && typeof (logger as any).child === 'function'
+        ? (logger as any).child({ component: RegisteredLogger.CHANNEL })
+        : logger;
   }
 
   /**
@@ -200,6 +271,181 @@ export class AgentChannels {
     }
   }
 
+  // -------------------------------------------------------------------------
+  // Protected dispatch seams
+  //
+  // These are the exact points where inbound platform events are routed into
+  // the owning agent. A subclass can override them to route events into a
+  // different execution surface while reusing all of the shared machinery
+  // (thread mapping, event/render context, approval cards, drivers).
+  // -------------------------------------------------------------------------
+
+  /**
+   * Id of the entity that owns this channels instance, used in webhook route
+   * paths. Returns `null` when no owner is bound yet, in which case
+   * `getWebhookRoutes()` returns no routes.
+   */
+  protected getOwnerId(): string | null {
+    return this.agent?.id ?? null;
+  }
+
+  /** Base path for webhook routes, e.g. `/api/agents/{agentId}`. */
+  protected getWebhookBasePath(): string {
+    return `/api/agents/${this.getOwnerId()}`;
+  }
+
+  /** Resolve the Mastra instance from the bound owner. */
+  protected getMastra(): Mastra | undefined {
+    return this.agent?.getMastraInstance();
+  }
+
+  /**
+   * The memory resourceId (owner) used when `processChatMessage` creates a new
+   * channel-backed thread. Returns a thunk when a `resolveResourceId` hook is
+   * configured so the hook only runs when a new thread is actually created,
+   * never when reusing an existing one (which keeps its stored owner).
+   */
+  protected resolveChannelResourceId(args: {
+    platform: string;
+    chatThread: Thread;
+    message: Message;
+    defaultResourceId: string;
+    requestContext: RequestContext;
+  }): string | (() => string | Promise<string>) {
+    const { platform, chatThread, message, defaultResourceId, requestContext } = args;
+    return this.resolveResourceId
+      ? () => this.resolveResourceId!({ platform, thread: chatThread, message, defaultResourceId, requestContext })
+      : defaultResourceId;
+  }
+
+  /**
+   * Route an inbound chat message into the owning agent's signal pipeline.
+   * The message either gets delivered into an already-running agent loop or
+   * wakes the thread with an idle stream.
+   */
+  protected async dispatchInboundMessage(args: {
+    signalContents: AgentSignalContents;
+    attributes: Record<string, string | undefined>;
+    signalMetadata: Record<string, unknown>;
+    providerOptions: MastraProviderMetadata;
+    requestContext: RequestContext;
+    /** The mapped Mastra thread for the chat thread this message arrived on. */
+    thread: StorageThreadType;
+    memory: { thread: string; resource: string };
+    /** Set when the adapter can't render approval buttons, to avoid runs parking forever. */
+    autoResumeSuspendedTools: true | undefined;
+  }): Promise<void> {
+    const {
+      signalContents,
+      attributes,
+      signalMetadata,
+      providerOptions,
+      requestContext,
+      memory,
+      autoResumeSuspendedTools,
+    } = args;
+
+    const result = this.getDispatchAgent().sendMessage(
+      {
+        contents: signalContents,
+        attributes,
+        ...(Object.keys(signalMetadata).length > 0 ? { metadata: signalMetadata } : {}),
+        providerOptions,
+      },
+      {
+        resourceId: memory.resource,
+        threadId: memory.thread,
+        ifIdle: {
+          behavior: 'wake',
+          streamOptions: {
+            requestContext,
+            memory,
+            // Background results are posted to the chat by this run, which carries the
+            // channel's render context, so keep it open until they finish.
+            untilIdle: true,
+            // Without approval-button rendering, auto-approve tools to
+            // avoid getting stuck waiting for input we can't ask for.
+            ...(autoResumeSuspendedTools ? { autoResumeSuspendedTools } : {}),
+          },
+        },
+      },
+    );
+
+    // `accepted` rejects when the agent throws before a run exists (workspace,
+    // instructions, tools, or model resolution). Nothing was persisted and no
+    // run will render the failure, so let it propagate to the channel error
+    // boundary rather than silently dropping the message.
+    const accepted = await result.accepted;
+
+    // When this call wakes a new run, drive it to completion before returning.
+    // Without this, serverless runtimes (Vercel, Lambda, etc.) terminate the
+    // invocation as soon as the webhook handler returns and kill the run
+    // mid-flight. `consumeStream()` is idempotent and safe to call alongside
+    // the existing per-thread subscription consumer.
+    //
+    // Only the `wake` action means this process started and owns the run.
+    // Any other action (deliver/persist/discard) handed the signal off, so
+    // there is nothing to drive to completion here.
+    if (accepted.action === 'wake') {
+      try {
+        await accepted.output.consumeStream();
+      } catch (err) {
+        // The run already started; the output processor reports its failure.
+        this.log('debug', 'accepted consume failed', { threadId: memory.thread, error: err });
+      }
+    } else {
+      this.log(
+        accepted.action === 'deliver' ? 'debug' : 'warn',
+        `[dispatchInboundMessage] inbound message did not start a run (action: ${accepted.action}); the thread may be suspended awaiting tool approval`,
+        { threadId: memory.thread, resourceId: memory.resource },
+      );
+    }
+  }
+
+  /**
+   * Resume a suspended run with an approval and drive the resumed stream to
+   * completion (serverless safety).
+   */
+  protected async dispatchApproval(args: {
+    runId: string;
+    toolCallId: string;
+    requestContext: RequestContext;
+    memory: { thread: string; resource: string };
+  }): Promise<void> {
+    const resumed = await this.getDispatchAgent().approveToolCall({
+      runId: args.runId,
+      toolCallId: args.toolCallId,
+      requestContext: args.requestContext,
+      memory: args.memory,
+    });
+    // Drive the run to completion so serverless runtimes don't kill it.
+    void resumed.consumeStream().catch(err => {
+      this.log('error', 'Error consuming resumed approval stream', { error: err });
+    });
+  }
+
+  /**
+   * Resume a suspended run with a denial and drive the resumed stream to
+   * completion (serverless safety).
+   */
+  protected async dispatchDecline(args: {
+    runId: string;
+    toolCallId: string;
+    requestContext: RequestContext;
+    memory: { thread: string; resource: string };
+  }): Promise<void> {
+    const resumed = await this.getDispatchAgent().declineToolCall({
+      runId: args.runId,
+      toolCallId: args.toolCallId,
+      requestContext: args.requestContext,
+      memory: args.memory,
+    });
+    // Drive the run to completion so serverless runtimes don't kill it.
+    void resumed.consumeStream().catch(err => {
+      this.log('error', 'Error consuming resumed decline stream', { error: err });
+    });
+  }
+
   /**
    * Check if an adapter is registered for the given platform.
    */
@@ -214,7 +460,7 @@ export class AgentChannels {
    *
    * @example
    * ```ts
-   * agent.channels.sdk.onReaction((thread, reaction) => {
+   * agent.getChannels()?.sdk?.onReaction((thread, reaction) => {
    *   console.log('Reaction received:', reaction);
    * });
    * ```
@@ -245,11 +491,11 @@ export class AgentChannels {
             'Channels require storage to be configured on the Mastra instance. Configure a storage provider like LibSQLStore.',
           );
         }
-        this.stateAdapter = new MastraStateAdapter(memoryStore);
+        this.stateAdapter = new MastraStateAdapter(memoryStore, () => this.getOwnerId());
         this.log('info', 'Using MastraStateAdapter (subscriptions persist across restarts)');
       }
 
-      const { Chat } = await getChatModule();
+      const { Chat, Message: ChatMessage, ThreadImpl } = await getChatModule();
       const chat = new Chat({
         adapters: this.adapters,
         state: this.stateAdapter,
@@ -261,181 +507,468 @@ export class AgentChannels {
         // Lambda can cause subsequent messages to be queued forever.
         concurrency: { strategy: 'concurrent' },
         ...this.chatOptions,
+        // Not `this.logger`: that child already binds `component`, and pino would emit the key twice.
+        logger: this.chatOptions.logger ?? createChatLogger(() => mastra.getLogger()),
       });
 
-      // Default handler that routes messages to the agent
-      const defaultHandler = (chatThread: Thread, message: Message) =>
-        this.handleChatMessage(chatThread, message, mastra);
-
       // Register handlers with optional overrides
-      const { onDirectMessage, onMention, onSubscribedMessage } = this.handlerOverrides;
+      const { onDirectMessage, onMention, onMessage, onSubscribedMessage, onSlashCommand, onAction } =
+        this.handlerOverrides;
 
-      if (onDirectMessage !== false) {
-        chat.onDirectMessage((thread, message) => {
-          if (typeof onDirectMessage === 'function') {
-            return onDirectMessage(thread, message, defaultHandler);
-          }
-          return defaultHandler(thread, message);
-        });
-      }
-
-      if (onMention !== false) {
-        chat.onNewMention((thread, message) => {
-          if (typeof onMention === 'function') {
-            return onMention(thread, message, defaultHandler);
-          }
-          return defaultHandler(thread, message);
-        });
-      }
-
-      if (onSubscribedMessage !== false) {
-        chat.onSubscribedMessage((thread, message) => {
-          if (typeof onSubscribedMessage === 'function') {
-            return onSubscribedMessage(thread, message, defaultHandler);
-          }
-          return defaultHandler(thread, message);
-        });
-      }
-
-      // Tool approval buttons — id is "tool_approve:<toolCallId>" or "tool_deny:<toolCallId>"
-      chat.onAction(async event => {
-        const { actionId } = event;
-        if (!actionId.startsWith('tool_approve:') && !actionId.startsWith('tool_deny:')) return;
-        try {
-          const approved = actionId.startsWith('tool_approve:');
-          const toolCallId = actionId.split(':')[1];
-          if (!toolCallId) {
-            this.log('info', `Missing toolCallId in action event actionId=${actionId}`);
-            return;
-          }
-
-          const chatThread = event.thread as Thread | null;
-          if (!chatThread) {
-            this.log('info', `No thread in action event for toolCallId=${toolCallId}`);
-            return;
-          }
-          const platform = event.adapter.name;
-          const messageId = event.messageId;
-          const adapter = this.adapters[platform];
-          const adapterConfig = this.adapterConfigs[platform];
-          if (!adapter) throw new Error(`No adapter for platform "${platform}"`);
-
-          const externalThreadId = this.resolveExternalThreadId({ platform, chatThread, messageId });
-          const mastraThread = await this.getOrCreateThread({
-            externalThreadId,
-            channelId: chatThread.channelId,
-            platform,
-            resourceId: `${platform}:${event.user.userId}`,
+      // Per-message dispatch scope. The request context and the handler context
+      // MUST be built per message, never once at initialize() time: a custom
+      // handler may write the sender's tenant onto the request context, and a
+      // shared instance would leak that tenant into the next message's run.
+      // `skipped` holds the earlier messages of this sender's run (oldest first)
+      // when the Chat SDK batched the dispatch under a `burst`/`debounce`/`queue`
+      // concurrency strategy; `batchIds` covers the whole batch so a first
+      // mention never re-fetches batched messages as thread history.
+      const beginMessage = (
+        skipped: readonly Message[] = [],
+        batchIds?: ReadonlySet<string>,
+        eventType?: ChannelContext['eventType'],
+      ) => {
+        const requestContext = new RequestContext();
+        const signalMetadata: Record<string, unknown> = {};
+        const defaultHandler = (chatThread: Thread, message: Message) =>
+          this.handleChatMessage(
+            chatThread,
+            message,
             mastra,
-          });
+            requestContext,
+            signalMetadata,
+            skipped,
+            batchIds,
+            eventType,
+          );
+        // Context handed to custom handlers so they can reach the resolved Mastra
+        // instance without being injected with an external accessor, and
+        // contribute to the request context the run will dispatch with.
+        const handlerContext: ChannelHandlerContext = { mastra, requestContext, signalMetadata, skipped };
+        return { defaultHandler, handlerContext };
+      };
 
-          // Look up the runId for this toolCallId. Prefer the in-memory
-          // `pendingApprovalCards` map (set when the approval card was posted)
-          // because it's keyed by toolCallId and survives parallel same-tool
-          // approvals. Fall back to the persisted `pendingToolApprovals`
-          // metadata for cases where the bot restarted between card post and
-          // click (the metadata path is lossy for parallel same-tool calls
-          // since core keys those by toolName — only the latest survives).
-          let runId: string | undefined;
-          let toolName: string | undefined;
-          let toolArgs: Record<string, unknown> | undefined;
-
-          const stashed = this.pendingApprovalCards.get(toolCallId);
-          if (stashed?.runId) {
-            runId = stashed.runId;
-            toolName = stashed.toolName;
-            toolArgs = stashed.args;
-          } else {
-            const storage = mastra.getStorage();
-            const memoryStore = storage ? await storage.getStore('memory') : undefined;
-            if (!memoryStore) {
-              throw new Error('Storage is required for tool approval lookups');
+      // The SDK batches by conversation, not sender. Split the batch into runs of
+      // consecutive messages from one sender and give each run its own handler
+      // call and context, so a custom handler can authorize or stamp context for
+      // every sender, not just the one who sent the latest message. A message
+      // without a userId is never grouped with another.
+      const dispatchBatch = async (
+        thread: Thread,
+        message: Message,
+        skipped: readonly Message[] | undefined,
+        handler: ChannelHandlerConfig,
+        route: 'direct' | 'mention' | 'subscribed' | 'message',
+      ) => {
+        const all = [...(skipped ?? []), message];
+        const batchIds = new Set(all.map(m => m.id));
+        const runs: Message[][] = [];
+        for (const m of all) {
+          const last = runs[runs.length - 1];
+          const userId = m.author?.userId;
+          if (last && userId !== undefined && last[0]!.author?.userId === userId) last.push(m);
+          else runs.push([m]);
+        }
+        let failure: { err: unknown } | undefined;
+        for (const run of runs) {
+          const runMessage = run[run.length - 1]!;
+          let runHandler = handler;
+          let runEventType: ChannelContext['eventType'] = thread.isDM || route === 'message' ? 'message' : 'mention';
+          // The SDK selects one handler for the whole batch if any message is
+          // a mention. Preserve DM/subscription precedence, but when onMessage
+          // is opted in, route each new sender run independently so unmentioned
+          // messages go through its filter. Without onMessage, unmentioned runs
+          // keep reaching the batch's handler as before.
+          if (!thread.isDM && (route === 'mention' || route === 'message')) {
+            if (run.some(m => m.isMention)) {
+              if (onMention === false) continue;
+              runHandler = onMention;
+              runEventType = 'mention';
+            } else if (typeof onMessage === 'function') {
+              runHandler = onMessage;
+              runEventType = 'message';
             }
-
-            const { messages } = await memoryStore.listMessages({
-              threadId: mastraThread.id,
-              perPage: 50,
-              orderBy: { field: 'createdAt', direction: 'DESC' },
-            });
-
-            for (const msg of messages) {
-              const pending = msg.content?.metadata?.pendingToolApprovals as
-                | Record<
-                    string,
-                    {
-                      toolCallId: string;
-                      runId: string;
-                      parentRunId?: string;
-                      toolName: string;
-                      args: Record<string, unknown>;
-                    }
-                  >
-                | undefined;
-              if (pending) {
-                for (const toolData of Object.values(pending)) {
-                  if (toolData.toolCallId === toolCallId) {
-                    runId = toolData.parentRunId ?? toolData.runId;
-                    toolName = toolData.toolName;
-                    toolArgs = toolData.args;
-                    break;
-                  }
-                }
-                if (runId) break;
+          }
+          if (runHandler === false) continue;
+          const { defaultHandler, handlerContext } = beginMessage(run.slice(0, -1), batchIds, runEventType);
+          try {
+            if (typeof runHandler === 'function') await runHandler(thread, runMessage, defaultHandler, handlerContext);
+            else await defaultHandler(thread, runMessage);
+          } catch (err) {
+            // A host handler that throws for one sender must not silence later
+            // senders. The first error is re-thrown after the last run so the Chat
+            // SDK still sees the rejection exactly as it does for a single message.
+            const fields = {
+              platform: thread.adapter.name,
+              threadId: thread.id,
+              messageId: runMessage.id,
+              authorId: runMessage.author?.userId,
+              error: err,
+            };
+            if (failure) {
+              // Only the first error is re-thrown; every later one would vanish.
+              this.log('error', 'Custom channel handler failed for another sender in the batch', fields);
+            } else {
+              failure = { err };
+              if (runs.length > 1) {
+                this.log('error', 'Custom channel handler failed; continuing with later senders', fields);
               }
             }
           }
+        }
+        if (failure) throw failure.err;
+      };
 
-          if (!runId) {
-            this.log('info', `No pending approval found for toolCallId=${toolCallId}`);
-            return;
-          }
+      if (onDirectMessage !== false) {
+        chat.onDirectMessage((thread, message, _channel, context) =>
+          dispatchBatch(thread, message, context?.skipped, onDirectMessage, 'direct'),
+        );
+      }
 
-          // Build the card header with tool name and args
-          const displayName = toolName ? stripToolPrefix(toolName) : 'tool';
-          const argsSummary = toolArgs ? formatArgsSummary(toolArgs) : '';
-          // Resolve the tool display mode so the approve/deny edit matches
-          // the original card's rendering (cards → Block Kit, text → plain).
-          // Streaming is irrelevant here — we're outside the agent loop.
-          const { resolved: toolDisplay } = this.resolveToolDisplay(
-            platform,
-            adapterConfig?.toolDisplay,
-            false,
-            adapterConfig?.cards,
-            adapterConfig?.formatToolCall,
-          );
-          const useCards = toolDisplay === 'cards';
+      // With onMention disabled, still register the mention route when onMessage
+      // is opted in: the SDK sends a batch ending in a mention there and skips
+      // the catch-all, so its unmentioned sender runs would otherwise be lost.
+      // Per-run routing above drops the disabled runs.
+      if (onMention !== false || typeof onMessage === 'function') {
+        chat.onNewMention((thread, message, context) =>
+          dispatchBatch(thread, message, context?.skipped, onMention, 'mention'),
+        );
+      }
 
-          if (!approved) {
-            const byUser = chatThread.isDM ? undefined : event.user.fullName || event.user.userName || 'User';
-            try {
-              await adapter.editMessage(
-                chatThread.id,
-                messageId,
-                formatToolDenied(displayName, argsSummary, byUser, useCards),
-              );
-            } catch (err) {
-              this.log('debug', 'Failed to edit denied card', err);
-            }
+      if (onSubscribedMessage !== false) {
+        chat.onSubscribedMessage((thread, message, context) =>
+          dispatchBatch(thread, message, context?.skipped, onSubscribedMessage, 'subscribed'),
+        );
+      }
 
-            // Resume the suspended run with a denial so the agent can produce a
-            // follow-up message (e.g. acknowledging the rejection). Stash the
-            // render context so `ChatChannelOutputProcessor` renders the output
-            // inline — same path as processChatMessage and the approve branch.
-            const { channelContext } = this.buildEventContext({
-              chatThread,
-              platform,
-              eventType: 'action',
-              messageId,
-              actor: event.user,
+      if (typeof onMessage === 'function') {
+        chat.onNewMessage(/[\s\S]*/, (thread, message, context) =>
+          dispatchBatch(thread, message, context?.skipped, onMessage, 'message'),
+        );
+      }
+
+      if (onSlashCommand !== false) {
+        chat.onSlashCommand(event => {
+          const { defaultHandler: handleMessage, handlerContext } = beginMessage();
+          const defaultHandler = async () => {
+            const text = `${event.command} ${event.text}`.trim();
+            const threadId = event.channel.id;
+            const message = new ChatMessage({
+              attachments: [],
+              author: event.user,
+              formatted: {
+                type: 'root',
+                children: [{ type: 'paragraph', children: [{ type: 'text', value: text }] }],
+              },
+              id: event.triggerId ?? crypto.randomUUID(),
+              metadata: { dateSent: new Date(), edited: false },
+              raw: event.raw,
+              text,
+              threadId,
             });
-            const requestContext = new RequestContext();
-            requestContext.set('channel', channelContext);
+            const thread = new ThreadImpl({
+              adapter: event.adapter,
+              channelId: event.channel.id,
+              channelVisibility: event.channel.channelVisibility,
+              currentMessage: message,
+              id: threadId,
+              isDM: event.channel.isDM,
+              stateAdapter: this.stateAdapter,
+            });
+            return handleMessage(thread, message);
+          };
 
-            const renderContext = this._buildRenderContext(chatThread, platform);
-            requestContext.set(CHAT_CHANNEL_RENDER_CONTEXT_KEY, renderContext);
+          if (typeof onSlashCommand === 'function') {
+            return onSlashCommand(event, defaultHandler, handlerContext);
+          }
+          return defaultHandler();
+        });
+      }
 
+      if (onAction !== false) {
+        chat.onAction(event => {
+          const { handlerContext } = beginMessage();
+          // Tool approval buttons — id is "tool_approve:<toolCallId>" or "tool_deny:<toolCallId>"
+          const defaultHandler = async () => {
+            const { actionId } = event;
+            if (!actionId.startsWith('tool_approve:') && !actionId.startsWith('tool_deny:')) return;
+            const platform = event.adapter.name;
+            const messageId = event.messageId;
+            const actionEventContext = {
+              platform,
+              threadId: (event.thread as Thread | null)?.id,
+              messageId,
+              actionId,
+              toolCallId: actionId.slice(actionId.indexOf(':') + 1),
+              actorId: event.user?.userId,
+            };
             try {
-              const resumed = await this.agent.declineToolCall({
+              const approved = actionId.startsWith('tool_approve:');
+              const toolCallId = actionEventContext.toolCallId;
+              if (!toolCallId) {
+                this.log('info', 'Missing toolCallId in action event', actionEventContext);
+                return;
+              }
+
+              const chatThread = event.thread as Thread | null;
+              if (!chatThread) {
+                this.log('info', 'No thread in action event', actionEventContext);
+                return;
+              }
+              const adapter = this.adapters[platform];
+              const adapterConfig = this.adapterConfigs[platform];
+              if (!adapter) throw new Error(`No adapter for platform "${platform}"`);
+
+              const externalThreadId = this.resolveExternalThreadId({ platform, chatThread, messageId });
+              const { thread: mastraThread } = await this.findThreadMapping({
+                externalThreadId,
+                channelId: chatThread.channelId,
+                platform,
+                mastra,
+              });
+              if (!mastraThread) {
+                // Approval cards can only continue runs on threads created by an
+                // earlier message. Do not mint a replacement from the clicker's
+                // identity when that durable mapping is missing.
+                this.log('warn', 'No mapped channel thread found for tool approval action', actionEventContext);
+                return;
+              }
+
+              // Look up the runId for this toolCallId. Prefer the in-memory
+              // `pendingApprovalCards` map (set when the approval card was posted)
+              // because it's keyed by toolCallId and survives parallel same-tool
+              // approvals. Fall back to the persisted `pendingToolApprovals`
+              // metadata for cases where the bot restarted between card post and
+              // click (the metadata path is lossy for parallel same-tool calls
+              // since core keys those by toolName — only the latest survives).
+              let runId: string | undefined;
+              let toolName: string | undefined;
+              let toolArgs: Record<string, unknown> | undefined;
+
+              const stashed = this.pendingApprovalCards.get(toolCallId);
+              let requesterId = stashed?.requesterId;
+              if (stashed?.runId) {
+                runId = stashed.runId;
+                toolName = stashed.toolName;
+                toolArgs = stashed.args;
+              } else {
+                const storage = mastra.getStorage();
+                const memoryStore = storage ? await storage.getStore('memory') : undefined;
+                if (!memoryStore) {
+                  throw new Error('Storage is required for tool approval lookups');
+                }
+
+                const { messages } = await memoryStore.listMessages({
+                  threadId: mastraThread.id,
+                  perPage: 50,
+                  orderBy: { field: 'createdAt', direction: 'DESC' },
+                });
+
+                for (const [index, msg] of messages.entries()) {
+                  const pending = msg.content?.metadata?.pendingToolApprovals as
+                    | Record<
+                        string,
+                        {
+                          toolCallId: string;
+                          runId: string;
+                          parentRunId?: string;
+                          toolName: string;
+                          args: Record<string, unknown>;
+                        }
+                      >
+                    | undefined;
+                  if (pending) {
+                    for (const toolData of Object.values(pending)) {
+                      if (toolData.toolCallId === toolCallId) {
+                        runId = toolData.parentRunId ?? toolData.runId;
+                        toolName = toolData.toolName;
+                        toolArgs = toolData.args;
+                        // Recover the card's owner from the user turn that led to it
+                        // (messages are newest-first). If that turn has messages from
+                        // more than one author we can't tell who triggered the tool,
+                        // so no one may answer the card.
+                        const earlier = messages.slice(index + 1);
+                        const turnStart = earlier.findIndex(m => m.role === 'user');
+                        const turnEnd = earlier.findIndex((m, i) => i > turnStart && m.role !== 'user');
+                        const authors = new Set(
+                          (turnStart === -1 ? [] : earlier.slice(turnStart, turnEnd === -1 ? undefined : turnEnd))
+                            .map(
+                              m =>
+                                (
+                                  m.content?.providerMetadata?.mastra as
+                                    | { channels?: Record<string, { author?: { userId?: string } }> }
+                                    | undefined
+                                )?.channels?.[platform]?.author?.userId,
+                            )
+                            .filter((id): id is string => !!id),
+                        );
+                        if (adapterConfig?.toolApprovers !== 'anyone' && !requesterId && authors.size > 1) {
+                          this.log('info', 'Ignoring tool approval action: requester is ambiguous', actionEventContext);
+                          return;
+                        }
+                        requesterId ??= [...authors][0];
+                        break;
+                      }
+                    }
+                    if (runId) break;
+                  }
+                }
+              }
+
+              if (!runId) {
+                this.log('info', 'No pending approval found', actionEventContext);
+                return;
+              }
+
+              // Only the user whose message triggered the tool call may answer
+              // its approval card. Skip the check when either identity is unknown.
+              const actorId = event.user?.userId;
+              if (adapterConfig?.toolApprovers !== 'anyone' && requesterId && actorId && requesterId !== actorId) {
+                this.log('info', `Ignoring tool approval action from ${actorId}: only ${requesterId} may answer`, {
+                  ...actionEventContext,
+                  requesterId,
+                });
+                return;
+              }
+
+              // Build the card header with tool name and args
+              const displayName = toolName ? stripToolPrefix(toolName) : 'tool';
+              const argsSummary = toolArgs ? formatArgsSummary(toolArgs) : '';
+              // Resolve the tool display mode so the approve/deny edit matches
+              // the original card's rendering (cards → Block Kit, text → plain).
+              // Streaming is irrelevant here — we're outside the agent loop.
+              const { resolved: toolDisplay, fn: toolDisplayFn } = this.resolveToolDisplay(
+                platform,
+                adapterConfig?.toolDisplay,
+                false,
+                adapterConfig?.cards,
+                adapterConfig?.formatToolCall,
+              );
+              const useCards = toolDisplay === 'cards';
+              // Name of the user who clicked, shown on the resolved card. Omitted in
+              // DMs, where the only possible clicker is obvious.
+              const byUser = chatThread.isDM ? undefined : event.user.fullName || event.user.userName || 'User';
+              // Let a function-form `toolDisplay` own the resolved card. Only
+              // non-blank `post` results are honored; anything else (or a
+              // throwing renderer) falls back to the default formatter.
+              const renderResolved = (
+                decision: { kind: 'approved'; byUser?: string } | { kind: 'denied'; byUser?: string },
+              ): PostableMessage | undefined => {
+                if (!toolDisplayFn) return undefined;
+                try {
+                  const result = toolDisplayFn(
+                    {
+                      ...decision,
+                      toolCallId,
+                      toolName: toolName ?? displayName,
+                      displayName,
+                      argsSummary,
+                      args: toolArgs,
+                    },
+                    { mode: 'static', platform },
+                  );
+                  if (result?.kind !== 'post' || result.message == null) return undefined;
+                  const message = result.message;
+                  const blank =
+                    typeof message === 'string'
+                      ? message.trim().length === 0
+                      : 'markdown' in message && message.markdown.trim().length === 0;
+                  return blank ? undefined : message;
+                } catch (err) {
+                  this.log('debug', `toolDisplay threw for ${decision.kind} event`, {
+                    ...actionEventContext,
+                    error: err,
+                  });
+                  return undefined;
+                }
+              };
+
+              if (!approved) {
+                try {
+                  await adapter.editMessage(
+                    chatThread.id,
+                    messageId,
+                    renderResolved({ kind: 'denied', byUser }) ??
+                      formatToolDenied(displayName, argsSummary, byUser, useCards),
+                  );
+                } catch (err) {
+                  this.log('debug', 'Failed to edit denied card', { ...actionEventContext, error: err });
+                }
+
+                // Resume the suspended run with a denial so the agent can produce a
+                // follow-up message (e.g. acknowledging the rejection). Stash the
+                // render context so `ChatChannelOutputProcessor` renders the output
+                // inline — same path as processChatMessage and the approve branch.
+                const { channelContext } = await this.buildEventContext({
+                  chatThread,
+                  platform,
+                  eventType: 'action',
+                  messageId,
+                  actor: event.user,
+                });
+                const { requestContext } = handlerContext;
+                requestContext.set('channel', channelContext);
+
+                const renderContext = this._buildRenderContext(chatThread, platform, { requesterId });
+                requestContext.set(CHAT_CHANNEL_RENDER_CONTEXT_KEY, renderContext);
+
+                try {
+                  await this.dispatchDecline({
+                    runId,
+                    toolCallId,
+                    requestContext,
+                    memory: {
+                      thread: mastraThread.id,
+                      resource: mastraThread.resourceId,
+                    },
+                  });
+                } catch (err) {
+                  const isStaleApproval = err instanceof Error && err.message.includes('No snapshot found');
+                  if (isStaleApproval) {
+                    this.log('info', 'Ignoring stale tool denial action (runId already consumed)', actionEventContext);
+                  } else {
+                    throw err;
+                  }
+                } finally {
+                  // Stash entry is no longer needed; the resumed decline stream
+                  // won't emit a tool-result for this call.
+                  this.pendingApprovalCards.delete(toolCallId);
+                }
+                return;
+              }
+
+              // Immediately edit the card to show "Approved" and remove the buttons
+              try {
+                await adapter.editMessage(
+                  chatThread.id,
+                  messageId,
+                  renderResolved({ kind: 'approved', byUser }) ??
+                    formatToolApproved(displayName, argsSummary, useCards, byUser),
+                );
+              } catch (err) {
+                this.log('debug', 'Failed to edit approved card', { ...actionEventContext, error: err });
+              }
+
+              // Build request context for the resumed stream. Stash the render
+              // context so `ChatChannelOutputProcessor` renders the tool-result
+              // and any follow-up output inline — same path as processChatMessage.
+              const { channelContext } = await this.buildEventContext({
+                chatThread,
+                platform,
+                eventType: 'action',
+                messageId,
+                actor: event.user,
+              });
+              const { requestContext } = handlerContext;
+              requestContext.set('channel', channelContext);
+
+              const renderContext = this._buildRenderContext(chatThread, platform, {
+                approvalContext: { toolCallId, messageId },
+                requesterId,
+              });
+              requestContext.set(CHAT_CHANNEL_RENDER_CONTEXT_KEY, renderContext);
+
+              await this.dispatchApproval({
                 runId,
                 toolCallId,
                 requestContext,
@@ -444,83 +977,45 @@ export class AgentChannels {
                   resource: mastraThread.resourceId,
                 },
               });
-              // Drive the run to completion so serverless runtimes don't kill it.
-              void resumed.consumeStream().catch(err => {
-                this.log('error', 'Error consuming resumed decline stream', err);
-              });
             } catch (err) {
               const isStaleApproval = err instanceof Error && err.message.includes('No snapshot found');
               if (isStaleApproval) {
-                this.log('info', `Ignoring stale tool denial action (runId already consumed)`);
-              } else {
-                throw err;
+                this.log('info', 'Ignoring stale tool approval action (runId already consumed)', actionEventContext);
+                return;
               }
-            } finally {
-              // Stash entry is no longer needed; the resumed decline stream
-              // won't emit a tool-result for this call.
-              this.pendingApprovalCards.delete(toolCallId);
+              // The resolver also runs on approval continuations, so a refusal
+              // here means this clicker isn't allowed to act — same silence as the
+              // inbound path (see handleChatMessage).
+              if (err instanceof ChannelSessionRejectedError) {
+                this.log('info', 'Session resolver refused the tool approval action', {
+                  ...actionEventContext,
+                  reason: err.message,
+                });
+                return;
+              }
+              this.log('error', 'Error handling tool approval action', { ...actionEventContext, error: err });
+              try {
+                const thread = event.thread;
+                if (thread) {
+                  const error = err instanceof Error ? err : new Error(String(err));
+                  const adapterConfig = this.adapterConfigs[event.adapter.name];
+                  const errorMessage = adapterConfig?.formatError
+                    ? adapterConfig.formatError(error, { requestContext: handlerContext.requestContext })
+                    : `❌ Error: ${error.message}`;
+                  await thread.post(errorMessage);
+                }
+              } catch (err) {
+                this.log('warn', 'Failed to post error message for action', { ...actionEventContext, error: err });
+              }
             }
-            return;
-          }
+          };
 
-          // Immediately edit the card to show "Approved" and remove the buttons
-          try {
-            await adapter.editMessage(chatThread.id, messageId, formatToolApproved(displayName, argsSummary, useCards));
-          } catch (err) {
-            this.log('debug', 'Failed to edit approved card', err);
+          if (typeof onAction === 'function') {
+            return onAction(event, defaultHandler, handlerContext);
           }
-
-          // Build request context for the resumed stream. Stash the render
-          // context so `ChatChannelOutputProcessor` renders the tool-result
-          // and any follow-up output inline — same path as processChatMessage.
-          const { channelContext } = this.buildEventContext({
-            chatThread,
-            platform,
-            eventType: 'action',
-            messageId,
-            actor: event.user,
-          });
-          const requestContext = new RequestContext();
-          requestContext.set('channel', channelContext);
-
-          const renderContext = this._buildRenderContext(chatThread, platform, { toolCallId, messageId });
-          requestContext.set(CHAT_CHANNEL_RENDER_CONTEXT_KEY, renderContext);
-
-          const resumed = await this.agent.approveToolCall({
-            runId,
-            toolCallId,
-            requestContext,
-            memory: {
-              thread: mastraThread.id,
-              resource: mastraThread.resourceId,
-            },
-          });
-          // Drive the run to completion so serverless runtimes don't kill it.
-          void resumed.consumeStream().catch(err => {
-            this.log('error', 'Error consuming resumed approval stream', err);
-          });
-        } catch (err) {
-          const isStaleApproval = err instanceof Error && err.message.includes('No snapshot found');
-          if (isStaleApproval) {
-            this.log('info', `Ignoring stale tool approval action (runId already consumed)`);
-            return;
-          }
-          this.log('error', 'Error handling tool approval action', err);
-          try {
-            const thread = event.thread;
-            if (thread) {
-              const error = err instanceof Error ? err : new Error(String(err));
-              const adapterConfig = this.adapterConfigs[event.adapter.name];
-              const errorMessage = adapterConfig?.formatError
-                ? adapterConfig.formatError(error)
-                : `❌ Error: ${error.message}`;
-              await thread.post(errorMessage);
-            }
-          } catch (err) {
-            this.log('debug', 'Failed to post error message for action', err);
-          }
-        }
-      });
+          return defaultHandler();
+        });
+      }
       await chat.initialize();
       this.chat = chat;
 
@@ -554,9 +1049,9 @@ export class AgentChannels {
    * Skips platforms that are externally managed (e.g., by SlackProvider).
    */
   getWebhookRoutes(): ApiRoute[] {
-    if (!this.agent) return [];
+    if (!this.getOwnerId()) return [];
 
-    const agentId = this.agent.id;
+    const basePath = this.getWebhookBasePath();
     const routes: ApiRoute[] = [];
 
     for (const platform of Object.keys(this.adapters)) {
@@ -566,7 +1061,7 @@ export class AgentChannels {
       }
       const self = this;
       routes.push({
-        path: `/api/agents/${agentId}/channels/${platform}/webhook`,
+        path: `${basePath}/channels/${platform}/webhook`,
         method: 'POST',
         requiresAuth: false,
         _mastraInternal: true,
@@ -664,7 +1159,7 @@ export class AgentChannels {
     if (this.channelConfig.threadContext?.addSystemMessage === false) return [];
     const hasProcessor = configuredProcessors.some(p => !isProcessorWorkflow(p) && p.id === 'chat-channel-context');
     if (hasProcessor) return [];
-    return [new ChatChannelProcessor()];
+    return [new ChatChannelProcessor(this)];
   }
 
   /**
@@ -718,18 +1213,31 @@ export class AgentChannels {
   // ---------------------------------------------------------------------------
 
   /**
-   * Resolve the adapter for the current conversation from request context.
+   * Resolve the adapter and chat thread for the current conversation. A run
+   * started by an inbound message carries them on request context. Any other
+   * run (a schedule, Studio, a woken run) finds them through its memory
+   * thread's persisted channel coordinates, the same way
+   * `ChatChannelOutputProcessor` posts its reply.
    */
-  private getAdapterFromContext(context: { requestContext?: RequestContext }): { adapter: Adapter; threadId: string } {
+  private async getAdapterFromContext(context: {
+    requestContext?: RequestContext;
+    agent?: { threadId?: string };
+  }): Promise<{ adapter: Adapter; threadId: string }> {
     const channel = context.requestContext?.get('channel') as ChannelContext | undefined;
-    if (!channel?.platform || !channel?.threadId) {
+    if (channel?.platform && channel.threadId) {
+      const adapter = this.adapters[channel.platform];
+      if (!adapter) {
+        throw new Error(`No adapter registered for platform "${channel.platform}"`);
+      }
+      return { adapter, threadId: channel.threadId };
+    }
+    const memoryThreadId =
+      context.agent?.threadId ?? parseMemoryRequestContext(context.requestContext)?.thread?.id ?? undefined;
+    const render = memoryThreadId ? await this.buildRenderContextForThread(memoryThreadId) : null;
+    if (!render) {
       throw new Error('No channel context — cannot determine platform or thread');
     }
-    const adapter = this.adapters[channel.platform];
-    if (!adapter) {
-      throw new Error(`No adapter registered for platform "${channel.platform}"`);
-    }
-    return { adapter, threadId: channel.threadId };
+    return { adapter: render.adapter, threadId: render.chatThread.id };
   }
 
   /**
@@ -768,23 +1276,56 @@ export class AgentChannels {
     }
   }
 
-  private buildEventContext(params: {
+  /**
+   * Resolve the bot's current profile display name through the adapter, once per platform and bot user.
+   * Keyed by `botUserId` because one adapter can serve several installations, each with its own bot.
+   * Adapters may report a stale handle as `userName` (e.g. Slack `auth.test` keeps the original
+   * username after an app rename) while inbound mentions render the current display name.
+   */
+  private resolveBotDisplayName(platform: string): Promise<string | undefined> {
+    const adapter = this.adapters[platform]!;
+    const botUserId = adapter.botUserId;
+    if (!botUserId || !adapter.getUser) return Promise.resolve(undefined);
+
+    const key = `${platform}:${botUserId}`;
+    const cached = this.botDisplayNames.get(key);
+    if (cached) return cached;
+
+    const pending = adapter.getUser(botUserId).then(
+      user => {
+        const name = user?.userName || user?.fullName || undefined;
+        if (!name) this.botDisplayNames.delete(key);
+        return name;
+      },
+      err => {
+        this.botDisplayNames.delete(key);
+        this.log('debug', 'Failed to resolve bot display name', { platform, error: err });
+        return undefined;
+      },
+    );
+    this.botDisplayNames.set(key, pending);
+    return pending;
+  }
+
+  private async buildEventContext(params: {
     chatThread: Thread;
     platform: string;
     eventType: string;
     messageId: string | undefined;
     actor: { userId: string; userName?: string; fullName?: string; isBot?: boolean | 'unknown' };
-  }): {
+  }): Promise<{
     channelContext: ChannelContext;
     attributes: Record<string, string | undefined>;
     providerOptions: MastraProviderMetadata;
-  } {
+  }> {
     const { chatThread, platform, eventType, messageId, actor } = params;
     const adapter = this.adapters[platform]!;
     const botUserId = adapter.botUserId;
     const botMention = botUserId ? chatThread.mentionUser(botUserId) : undefined;
     const actorName = actor.fullName || actor.userName;
     const actorMention = actor.userId ? chatThread.mentionUser(actor.userId) : undefined;
+    const displayName = await this.resolveBotDisplayName(platform);
+    const botDisplayName = displayName && displayName !== adapter.userName ? displayName : undefined;
 
     const channelContext: ChannelContext = {
       platform,
@@ -797,13 +1338,15 @@ export class AgentChannels {
       userName: actorName,
       botUserId,
       botUserName: adapter.userName,
+      ...(botDisplayName ? { botDisplayName } : {}),
       botMention,
     };
 
     // Attributes: short, flat, strings only — they're rendered as XML attrs on the signal.
-    // In DMs the author is stable for the whole conversation (already in the system message),
-    // so we keep this minimal to avoid noise on every turn.
-    const attributes: Record<string, string | undefined> = { messageId };
+    // `platform` tells the model this message came in over the channel, not from another
+    // client on the same thread. In DMs the author is stable for the whole conversation
+    // (already in the system message), so we keep the rest minimal to avoid noise on every turn.
+    const attributes: Record<string, string | undefined> = { platform, messageId };
     if (!chatThread.isDM) {
       attributes.authorName = actorName;
       attributes.authorId = actor.userId;
@@ -832,34 +1375,143 @@ export class AgentChannels {
   }
 
   /**
-   * Core handler wired to Chat SDK's onDirectMessage, onNewMention,
-   * and onSubscribedMessage. Streams the Mastra agent response and
-   * updates the channel message in real-time via edits.
+   * Default handler behind Chat SDK's onDirectMessage, onNewMention, and
+   * onSubscribedMessage. Dispatches one sender's run (the message plus that
+   * sender's earlier batched messages in `skipped`), streaming the Mastra agent
+   * response and updating the channel message in real-time via edits. Never
+   * throws to the host: run failures are logged or posted by `handleRunError`.
    */
-  private async handleChatMessage(chatThread: Thread, message: Message, mastra: Mastra): Promise<void> {
+  private async handleChatMessage(
+    chatThread: Thread,
+    message: Message,
+    mastra: Mastra,
+    requestContext: RequestContext,
+    signalMetadata: Record<string, unknown>,
+    skipped: readonly Message[] = [],
+    batchIds?: ReadonlySet<string>,
+    eventType?: ChannelContext['eventType'],
+  ): Promise<void> {
     try {
-      await this.processChatMessage(chatThread, message, mastra);
+      await this.processChatMessage(
+        chatThread,
+        message,
+        mastra,
+        requestContext,
+        signalMetadata,
+        skipped,
+        batchIds,
+        eventType,
+      );
     } catch (err) {
-      const error = err instanceof Error ? err : new Error(String(err));
-      this.log('error', `[${chatThread.adapter.name}] Error handling message`, {
-        messageId: message.id,
-        authorId: message.author?.userId,
-        error: String(err),
-      });
-      try {
-        const adapterConfig = this.adapterConfigs[chatThread.adapter.name];
-        const errorMessage = adapterConfig?.formatError
-          ? adapterConfig.formatError(error)
-          : `❌ Error: ${error.message}`;
-        await chatThread.post(errorMessage);
-      } catch (postErr) {
-        this.log('debug', 'Failed to post error message to thread', postErr);
-      }
+      await this.handleRunError(chatThread, message, err, requestContext);
     }
   }
 
-  private async processChatMessage(chatThread: Thread, message: Message, mastra: Mastra): Promise<void> {
+  private async handleRunError(
+    chatThread: Thread,
+    message: Message,
+    err: unknown,
+    requestContext: RequestContext,
+  ): Promise<void> {
+    const error = err instanceof Error ? err : new Error(String(err));
+    // A refused request is not a malfunction: the host decided this sender
+    // gets nothing. Log it and stop — posting would echo the host's
+    // authorization message into the chat thread and confirm the bot is
+    // present to a sender who was just turned away.
+    if (err instanceof ChannelSessionRejectedError) {
+      this.log('info', 'Session resolver refused the message', {
+        platform: chatThread.adapter.name,
+        threadId: chatThread.id,
+        messageId: message.id,
+        authorId: message.author?.userId,
+        reason: error.message,
+      });
+      return;
+    }
+    let loggedError;
+    try {
+      const message = extractErrorMessage(err);
+      const cause =
+        typeof err === 'object' && err !== null && 'cause' in err ? extractErrorMessage(err.cause) : undefined;
+      const { id, domain, category } = err instanceof MastraError ? err : {};
+      loggedError = {
+        message: typeof message === 'string' && message.length > 0 ? message : 'Unknown error',
+        ...(typeof id === 'string' ? { code: id } : {}),
+        ...(typeof domain === 'string' ? { domain } : {}),
+        ...(typeof category === 'string' ? { category } : {}),
+        ...(typeof cause === 'string' && cause.length > 0 ? { cause: { message: cause } } : {}),
+      };
+    } catch {
+      loggedError = { message: 'Error details unavailable' };
+    }
+    const diagnostic = {
+      platform: chatThread.adapter.name,
+      threadId: chatThread.id,
+      messageId: message.id,
+      authorId: message.author?.userId,
+      error: loggedError,
+    };
+    this.log('error', `Error handling message ${JSON.stringify(diagnostic)}`, diagnostic);
+    try {
+      const adapterConfig = this.adapterConfigs[chatThread.adapter.name];
+      const errorMessage = adapterConfig?.formatError
+        ? adapterConfig.formatError(error, { requestContext })
+        : `❌ Error: ${error.message}`;
+      await chatThread.post(errorMessage);
+    } catch (postErr) {
+      this.log('warn', 'Failed to post error message to thread', {
+        platform: chatThread.adapter.name,
+        threadId: chatThread.id,
+        error: postErr,
+      });
+    }
+  }
+
+  private async processChatMessage(
+    chatThread: Thread,
+    message: Message,
+    mastra: Mastra,
+    requestContext: RequestContext,
+    signalMetadata: Record<string, unknown> = {},
+    skipped: readonly Message[] = [],
+    historyExcludeIds: ReadonlySet<string> = new Set([...skipped, message].map(m => m.id)),
+    eventType: ChannelContext['eventType'] = chatThread.isDM ? 'message' : 'mention',
+  ): Promise<void> {
     const platform = chatThread.adapter.name;
+    // Messages batched by a concurrency strategy, oldest first, then the current one.
+    const batch = [...skipped, message].filter(m => !this.isContentlessMessage(m));
+
+    // Some adapters lift platform side-channel events (read receipts, delivery
+    // acks) into inbound messages carrying no text and no attachments. Running
+    // the agent on nothing still produces a reply, which produces another
+    // receipt, which wakes the agent again — a self-sustaining loop. There is
+    // nothing to answer here, so drop it before any thread, memory, or run
+    // work happens. Custom handlers run ahead of this and still see the
+    // message if they want it.
+    if (batch.length === 0) {
+      this.log('debug', 'Skipping message with no text and no attachments', {
+        platform,
+        messageId: message.id,
+      });
+      return;
+    }
+
+    const { channelContext, attributes, providerOptions } = await this.buildEventContext({
+      chatThread,
+      platform,
+      eventType,
+      messageId: message.id,
+      actor: message.author,
+    });
+
+    // NOTE: `requestContext` is constructed per message at the handler boundary
+    // (see `beginMessage` in initialize) so a custom handler can contribute to
+    // it — e.g. stamping the tenant — before the run dispatches. Core only
+    // enriches it here. Set it before thread mapping and attachments: the
+    // workspace caches the filesystem it resolves per request context, so a
+    // channel-aware resolver must see the channel on its first call, even
+    // from a resolveResourceId/resolveThreadId hook.
+    requestContext.set('channel', channelContext);
 
     // Map to a Mastra thread for memory/history.
     // chatThread.id encodes channel + threadTs, so it's stable per conversation:
@@ -873,14 +1525,19 @@ export class AgentChannels {
       platform,
       // Lazily resolved: the hook only runs when we're actually creating a new
       // thread, never when reusing an existing one (which keeps its stored owner).
-      resourceId: this.resolveResourceId
-        ? () => this.resolveResourceId!({ platform, thread: chatThread, message, defaultResourceId })
-        : defaultResourceId,
+      resourceId: this.resolveChannelResourceId({ platform, chatThread, message, defaultResourceId, requestContext }),
       // Same laziness for the thread id hook; it runs after the resourceId
       // resolves so hosts can align the two (e.g. thread id = session id).
       threadId: this.resolveThreadId
         ? (resourceId: string, defaultThreadId: string) =>
-            this.resolveThreadId!({ platform, thread: chatThread, message, resourceId, defaultThreadId })
+            this.resolveThreadId!({
+              platform,
+              thread: chatThread,
+              message,
+              resourceId,
+              defaultThreadId,
+              requestContext,
+            })
         : undefined,
       mastra,
     });
@@ -890,45 +1547,64 @@ export class AgentChannels {
     // started it. Other participants' messages are still part of that thread's history.
     const threadResourceId = mastraThread.resourceId;
 
-    // Fetch recent thread history when configured, this is a non-DM mention,
-    // AND the agent isn't already subscribed to this thread. If subscribed,
-    // the agent already has history via Mastra's memory system.
-    // History is prepended to the user message text (not as a separate message)
-    // to avoid consecutive user messages which some providers reject (e.g. DeepSeek).
-    let historyBlock: string | undefined; // TODO: convert platform thread chat history into Mastra messages instead of one big text block
+    if (!message.author.isMe) {
+      await this.rememberThreadFacts(mastraThread, chatThread, message, mastra).catch(error =>
+        this.log('warn', `Could not record channel facts on thread ${mastraThread.id}: ${String(error)}`),
+      );
+    }
+
+    // On a non-DM first mention (not yet subscribed), persist the platform
+    // thread's prior messages into the Mastra thread as individual attributed
+    // user signals so the agent sees them as separate turns with their own
+    // author, message id, timestamp and attachments. Once subscribed, memory
+    // carries the history. Agents without memory can't persist rows, so they
+    // keep receiving the history as one text block ahead of the trigger.
+    let legacyHistoryBlock: string | undefined;
     const maxMessages = this.threadContext.maxMessages ?? 10;
     if (maxMessages > 0 && !chatThread.isDM) {
       const alreadySubscribed = await chatThread.isSubscribed();
       if (!alreadySubscribed) {
-        this.logger?.debug?.(`Fetching thread history (max ${maxMessages}) for first mention in ${chatThread.id}`);
-        const history = await this.fetchThreadHistory(chatThread, message.id, maxMessages);
-        this.logger?.debug?.(`Fetched ${history.length} messages from thread history`);
-        if (history.length > 0) {
-          const lines = ['[Thread context — messages in this thread before you joined]'];
-          for (const msg of history) {
-            const mention = msg.userId ? chatThread.mentionUser(msg.userId) : undefined;
-            let prefix = mention ? (msg.author ? `${msg.author} (${mention})` : mention) : msg.author;
-            if (msg.isBot) prefix += ' (bot)';
-            lines.push(`[${prefix}] (msg:${msg.id}): ${msg.text}`);
-          }
-          historyBlock = lines.join('\n');
+        const logContext = {
+          platform,
+          threadId: chatThread.id,
+          mastraThreadId: mastraThread.id,
+          messageId: message.id,
+        };
+        this.log('debug', 'Fetching thread history for first mention', { ...logContext, maxMessages });
+        const history = await collectThreadHistory(chatThread, historyExcludeIds, maxMessages, this.log.bind(this));
+        this.log('debug', 'Fetched thread history', {
+          ...logContext,
+          fetched: history.recent.length + (history.root ? 1 : 0),
+          omitted: formatOmittedCount(history),
+        });
+        const hasHistory = history.root !== undefined || history.recent.length > 0;
+        if (hasHistory) {
+          const persisted = await this.persistThreadHistorySignals({
+            buildSignals: () =>
+              this.buildThreadHistorySignals({ history, chatThread, platform, mastraThread, requestContext }),
+            requestContext,
+            thread: mastraThread,
+            memory: { thread: mastraThread.id, resource: threadResourceId },
+            logContext,
+          });
+          if (!persisted) legacyHistoryBlock = formatLegacyHistoryBlock(history, chatThread, platform);
         }
       } else {
-        this.logger?.debug?.(`Skipping thread history fetch — already subscribed to ${chatThread.id}`);
+        this.log('debug', 'Skipping thread history fetch, thread already subscribed', {
+          platform,
+          threadId: chatThread.id,
+          mastraThreadId: mastraThread.id,
+          messageId: message.id,
+        });
       }
     }
 
-    const richText = message.formatted ? chatModule().stringifyMarkdown(message.formatted).trim() : undefined;
-    const text = [historyBlock, richText || message.text].filter(Boolean).join('\n\n');
-    const parts: Exclude<AgentSignalContents, string> = [{ type: 'text', text }];
-    const attachments = message.attachments.filter(a => a.url || a.fetchData);
-
-    // Route attachments based on `inlineMedia` config (see DEFAULT_INLINE_MEDIA_TYPES).
-    // Inline types are sent as file parts (the LLM adapter converts image/* to
-    // image content automatically). Non-inline types are described as text
-    // metadata so the agent is aware of them without crashing models that
-    // reject unsupported media (e.g. OpenAI rejects video/mp4).
-    this.logger?.debug('[CHANNEL] Attachments', {
+    const messageTexts = batch.map(m => messageText(m));
+    const text = [legacyHistoryBlock, ...messageTexts].filter(Boolean).join('\n\n');
+    const attachments = batch.flatMap(m => m.attachments ?? []).filter(a => a.url || a.fetchData);
+    this.log('debug', 'Attachments', {
+      platform,
+      threadId: chatThread.id,
       count: attachments.length,
       attachments: attachments.map(a => ({
         type: a.type,
@@ -937,54 +1613,10 @@ export class AgentChannels {
         hasData: !!a.fetchData,
       })),
     });
-    for (const att of attachments) {
-      if (!att.url && !att.fetchData) continue;
-      const mimeType = att.mimeType || (att.type === 'image' ? 'image/png' : undefined);
-      if (!mimeType) continue;
-
-      const inline = this.shouldInline(mimeType);
-      const filename = att.name || att.url?.split('/').pop() || 'file';
-      if (inline) {
-        let data: string | undefined;
-        let fetchFailed = false;
-        if (att.fetchData) {
-          // Prefer authenticated fetch (e.g. Slack CDN requires auth)
-          try {
-            const buf = await att.fetchData();
-            const base64 = Buffer.from(buf).toString('base64');
-            data = `data:${mimeType};base64,${base64}`;
-          } catch (err) {
-            this.logger?.warn('[CHANNEL] fetchData failed', { mimeType, error: String(err) });
-            fetchFailed = true;
-          }
-        } else {
-          // Public URL (e.g. Discord CDN) — let the provider fetch directly
-          data = att.url;
-        }
-        if (data) {
-          parts.push({
-            type: 'text',
-            text: `[Attached ${mimeType} file${att.name ? `: ${att.name}` : ''}]`,
-          });
-          parts.push({
-            type: 'file',
-            data,
-            mediaType: mimeType,
-            ...(att.name ? { filename: att.name } : {}),
-          });
-        } else if (fetchFailed) {
-          parts.push({
-            type: 'text',
-            text: `[Attachment unavailable: ${filename} (${mimeType}) — the file could not be loaded, it may have been deleted before processing]`,
-          });
-        }
-      } else {
-        parts.push({
-          type: 'text',
-          text: `[Attached file: ${filename} (${mimeType})${att.url ? ` — ${att.url}` : ''}]`,
-        });
-      }
-    }
+    const parts: Exclude<AgentSignalContents, string> = [
+      { type: 'text', text },
+      ...(await this.attachmentsToParts(attachments, requestContext)),
+    ];
 
     // Promote URLs in message text to file parts based on `inlineLinks` config.
     if (this.inlineLinkRules && text) {
@@ -1028,26 +1660,18 @@ export class AgentChannels {
       toolDisplay === 'cards' ||
       toolDisplay === 'timeline' ||
       toolDisplay === 'grouped' ||
-      toolDisplay === 'hidden';
+      // `'hidden'` still posts approval cards, but only adapters with
+      // interactive buttons can act on them. Button-less surfaces (SMS,
+      // iMessage, custom gateways) must auto-resume or the thread gets stuck.
+      (toolDisplay === 'hidden' && (adapterConfig?.approvalButtons ?? APPROVAL_BUTTON_PLATFORMS.has(platform)));
 
-    this.log('info', '[processChatMessage] tool approval config', {
+    this.log('info', 'Tool approval config', {
       platform,
       toolDisplay,
       toolDisplayFn: !!toolDisplayFn,
       canRenderApprovalButtons,
       autoResumeSuspendedTools: canRenderApprovalButtons ? undefined : true,
     });
-
-    const { channelContext, attributes, providerOptions } = this.buildEventContext({
-      chatThread,
-      platform,
-      eventType: chatThread.isDM ? 'message' : 'mention',
-      messageId: message.id,
-      actor: message.author,
-    });
-
-    const requestContext = new RequestContext();
-    requestContext.set('channel', channelContext);
 
     // Stash the per-event render deps so `ChatChannelOutputProcessor` can
     // route the agent's stream to the chat platform. The processor opens an
@@ -1056,96 +1680,375 @@ export class AgentChannels {
     // subscription consumer: rendering now happens inline with the run that
     // produces the chunks, so only the Lambda that won the wake race
     // (signals reservation) renders the reply.
-    const renderContext = this._buildRenderContext(chatThread, platform);
+    const renderContext = this._buildRenderContext(chatThread, platform, { requesterId: message.author?.userId });
     requestContext.set(CHAT_CHANNEL_RENDER_CONTEXT_KEY, renderContext);
 
     void chatThread.subscribe().catch(err => {
-      this.log('debug', 'chatThread.subscribe failed', err);
+      this.log('debug', 'chatThread.subscribe failed', { platform, threadId: chatThread.id, error: err });
     });
 
     // When the message is text-only, pass the bare string to the signal pipeline.
     // Otherwise pass the parts array directly — both shapes match AgentSignalContents.
     const signalContents: AgentSignalContents = parts.length === 1 && parts[0]?.type === 'text' ? parts[0].text : parts;
 
-    const result = this.agent.sendMessage(
-      {
-        contents: signalContents,
-        attributes,
-        providerOptions,
+    await this.dispatchInboundMessage({
+      signalContents,
+      attributes,
+      signalMetadata,
+      providerOptions,
+      requestContext,
+      thread: mastraThread,
+      memory: {
+        thread: mastraThread.id,
+        resource: threadResourceId,
       },
-      {
-        resourceId: threadResourceId,
-        threadId: mastraThread.id,
-        ifIdle: {
-          behavior: 'wake',
-          streamOptions: {
-            requestContext,
-            memory: {
-              thread: mastraThread.id,
-              resource: threadResourceId,
-            },
-            // Without approval-button rendering, auto-approve tools to
-            // avoid getting stuck waiting for input we can't ask for.
-            autoResumeSuspendedTools: canRenderApprovalButtons ? undefined : true,
-          },
-        },
-      },
-    );
+      autoResumeSuspendedTools: canRenderApprovalButtons ? undefined : true,
+    });
+  }
 
-    // When this call wakes a new run, drive it to completion before returning.
-    // Without this, serverless runtimes (Vercel, Lambda, etc.) terminate the
-    // invocation as soon as the webhook handler returns and kill the run
-    // mid-flight. `consumeStream()` is idempotent and safe to call alongside
-    // the existing per-thread subscription consumer.
-    try {
-      const accepted = await result.accepted;
-      // Only the `wake` action means this process started and owns the run.
-      // Any other action (deliver/persist/discard) handed the signal off, so
-      // there is nothing to drive to completion here.
-      if (accepted.action === 'wake') {
-        await accepted.output.consumeStream();
+  /** A message with neither text nor attachments gives the agent nothing to run on. */
+  private isContentlessMessage(message: Message): boolean {
+    if (message.attachments?.length) return false;
+    if (message.text?.trim()) return false;
+    return !messageText(message)?.trim();
+  }
+
+  /**
+   * Route attachments based on `inlineMedia` config (see DEFAULT_INLINE_MEDIA_TYPES).
+   * Inline types are sent as file parts (the LLM adapter converts image/* to
+   * image content automatically). Non-inline text-like types (text/*, JSON,
+   * YAML, XML, …) that come with an authenticated `fetchData` are decoded and
+   * sent as text. Other non-inline types are described as text
+   * metadata so the agent is aware of them without crashing models that
+   * reject unsupported media (e.g. OpenAI rejects video/mp4). When the agent
+   * has a writable workspace, those with `fetchData` are saved there and the
+   * description carries the workspace path instead of the URL.
+   */
+  private async attachmentsToParts(
+    attachments: Attachment[],
+    requestContext: RequestContext,
+  ): Promise<Exclude<AgentSignalContents, string>> {
+    const parts: Exclude<AgentSignalContents, string> = [];
+    let filesystem: Promise<WorkspaceFilesystem | undefined> | undefined;
+    for (const att of attachments) {
+      if (!att.url && !att.fetchData) continue;
+      const mimeType = att.mimeType || (att.type === 'image' ? 'image/png' : undefined);
+      if (!mimeType) continue;
+
+      const inline = this.shouldInline(mimeType);
+      const filename = att.name || att.url?.split('/').pop() || 'file';
+      if (inline) {
+        let data: string | undefined;
+        let fetchFailed = false;
+        if (att.fetchData) {
+          // Prefer authenticated fetch (e.g. Slack CDN requires auth)
+          try {
+            const buf = await att.fetchData();
+            const bytes = buf instanceof ArrayBuffer ? new Uint8Array(buf) : buf;
+            const base64 = Buffer.from(bytes).toString('base64');
+            data = `data:${mimeType};base64,${base64}`;
+          } catch (err) {
+            this.log('warn', 'Attachment fetchData failed', { mimeType, error: err });
+            fetchFailed = true;
+          }
+        } else {
+          // Public URL (e.g. Discord CDN) — let the provider fetch directly
+          data = att.url;
+        }
+        if (data) {
+          parts.push({
+            type: 'text',
+            text: `[Attached ${mimeType} file${att.name ? `: ${att.name}` : ''}]`,
+          });
+          parts.push({
+            type: 'file',
+            data,
+            mediaType: mimeType,
+            ...(att.name ? { filename: att.name } : {}),
+          });
+        } else if (fetchFailed) {
+          parts.push({
+            type: 'text',
+            text: `[Attachment unavailable: ${filename} (${mimeType}) — the file could not be loaded, it may have been deleted before processing]`,
+          });
+        }
+      } else if (
+        att.fetchData &&
+        isTextMimeType(mimeType) &&
+        !(att.size !== undefined && att.size > MAX_ATTACHMENT_DOWNLOAD_BYTES)
+      ) {
+        // Text-like files behind an authenticated fetch (e.g. Slack's
+        // url_private) are decoded and handed to the agent as text, since the
+        // URL alone is unreadable without the adapter's credentials.
+        try {
+          const buf = await att.fetchData();
+          const bytes = buf instanceof ArrayBuffer ? new Uint8Array(buf) : buf;
+          const truncated = bytes.byteLength > MAX_TEXT_ATTACHMENT_BYTES;
+          const content = new TextDecoder().decode(truncated ? bytes.subarray(0, MAX_TEXT_ATTACHMENT_BYTES) : bytes);
+          parts.push({
+            type: 'text',
+            text:
+              `[Attached file: ${filename} (${mimeType})]\n${content}` +
+              (truncated
+                ? `\n[Truncated: showing the first ${MAX_TEXT_ATTACHMENT_BYTES} of ${bytes.byteLength} bytes]`
+                : ''),
+          });
+        } catch (err) {
+          this.log('warn', 'Attachment fetchData failed', { mimeType, error: err });
+          parts.push({
+            type: 'text',
+            text: `[Attachment unavailable: ${filename} (${mimeType}) — the file could not be loaded, it may have been deleted before processing]`,
+          });
+        }
+      } else {
+        // Binary files behind an authenticated fetch (e.g. Slack's url_private)
+        // go to the workspace so tools can open them. The URL stays as the
+        // fallback: some adapters with fetchData (Discord) have public URLs.
+        let savedPath: string | undefined;
+        if (att.fetchData && !(att.size !== undefined && att.size > MAX_ATTACHMENT_DOWNLOAD_BYTES)) {
+          filesystem ??= this.resolveAttachmentFilesystem(requestContext);
+          const fs = await filesystem;
+          if (fs) savedPath = await this.saveAttachmentToWorkspace(fs, att, att.fetchData, filename, mimeType);
+        }
+        parts.push({
+          type: 'text',
+          text: savedPath
+            ? `[Attached file: ${filename} (${mimeType}) — saved in the workspace at ${savedPath}]`
+            : `[Attached file: ${filename} (${mimeType})${att.url ? ` — ${att.url}` : ''}]`,
+        });
       }
+    }
+    return parts;
+  }
+
+  /**
+   * The agent's workspace filesystem when one is configured and writable, and
+   * the workspace lets the agent write files without approval. Saving follows
+   * the same policy as the write tool so a deployer who disables or gates
+   * writes doesn't get channel participants' files written anyway.
+   */
+  private async resolveAttachmentFilesystem(requestContext: RequestContext): Promise<WorkspaceFilesystem | undefined> {
+    try {
+      const workspace = await this.getDispatchAgent()?.getWorkspace?.({ requestContext });
+      if (!workspace) return undefined;
+      const writeConfig = await resolveToolConfig(workspace.getToolsConfig(), WORKSPACE_TOOLS.FILESYSTEM.WRITE_FILE, {
+        requestContext: Object.fromEntries(requestContext.entries()),
+        workspace,
+      });
+      if (!writeConfig.enabled || writeConfig.requireApproval !== false) return undefined;
+      const fs = await workspace.resolveFilesystem({ requestContext });
+      return fs && !fs.readOnly ? fs : undefined;
     } catch (err) {
-      this.log('debug', 'accepted consume failed', err);
+      this.log('warn', 'Could not resolve the agent workspace for attachments', { error: err });
+      return undefined;
     }
   }
 
   /**
-   * Fetch recent messages from the platform thread to provide context.
-   * Returns messages in chronological order (oldest first), excluding the
-   * current triggering message.
+   * Save an attachment under `channel-attachments/<hash>/<name>` (inside the
+   * first writable mount of a composite filesystem) and return
+   * the path, or undefined when it cannot be downloaded or written, or when
+   * it would push the folder over `maxAttachmentStorageBytes`. The folder
+   * hashes the URL so history walks reuse a saved file without refetching;
+   * attachments without a URL hash their downloaded bytes, so different
+   * files never share a path.
    */
-  private async fetchThreadHistory(
-    chatThread: Thread,
-    currentMessageId: string,
-    maxMessages: number,
-  ): Promise<ThreadHistoryMessage[]> {
-    const messages: ThreadHistoryMessage[] = [];
-
+  private async saveAttachmentToWorkspace(
+    fs: WorkspaceFilesystem,
+    att: Attachment,
+    fetchData: () => Promise<Buffer | ArrayBuffer>,
+    filename: string,
+    mimeType: string,
+  ): Promise<string | undefined> {
+    const dir = attachmentDirFor(fs);
+    if (!dir) return undefined;
+    const safeName = filename.replace(/[^\w.-]+/g, '_').replace(/^\.+/, '') || 'file';
+    const pathFor = (source: string | Uint8Array) =>
+      `${dir}/${createHash('sha256').update(source).digest('hex').slice(0, 16)}/${safeName}`;
+    const limit = this.maxAttachmentStorageBytes;
+    const overLimit = (used: number, size: number) => {
+      if (used + size <= limit) return false;
+      this.log('warn', 'Attachment storage limit reached, not saved', { mimeType, bytes: size, used, limit });
+      return true;
+    };
     try {
-      // chatThread.messages is an async iterator that yields newest-first
-      for await (const msg of chatThread.messages) {
-        // Skip the current message that triggered this request
-        if (msg.id === currentMessageId) continue;
-
-        const historyText = msg.formatted ? chatModule().stringifyMarkdown(msg.formatted).trim() : undefined;
-        messages.push({
-          id: msg.id,
-          author: msg.author.fullName || msg.author.userName || 'Unknown',
-          userId: msg.author.userId,
-          text: historyText || msg.text,
-          isBot: msg.author.isBot === true,
-        });
-
-        if (messages.length >= maxMessages) break;
+      if (att.url && (await fs.exists(pathFor(att.url)))) return pathFor(att.url);
+      const used = await storedAttachmentBytes(fs, dir);
+      if (att.size !== undefined && overLimit(used, att.size)) return undefined;
+      const buf = await fetchData();
+      const bytes = buf instanceof ArrayBuffer ? new Uint8Array(buf) : buf;
+      if (bytes.byteLength > MAX_ATTACHMENT_DOWNLOAD_BYTES) {
+        this.log('warn', 'Attachment exceeds the download ceiling, not saved', { mimeType, bytes: bytes.byteLength });
+        return undefined;
       }
+      const path = pathFor(att.url ?? bytes);
+      if (!att.url && (await fs.exists(path))) return path;
+      if (overLimit(used, bytes.byteLength)) return undefined;
+      await fs.writeFile(path, bytes, { recursive: true, mimeType });
+      return path;
     } catch (err) {
-      this.logger?.warn?.(`Failed to fetch thread history: ${err}`);
-      return [];
+      this.log('warn', 'Attachment could not be saved to the workspace', { mimeType, error: err });
+      return undefined;
     }
+  }
 
-    // Reverse to get chronological order (oldest first)
-    return messages.reverse();
+  /**
+   * Build the history rows, in order: root, gap marker (when messages were
+   * omitted), then the recent window oldest first. Each row carries the same
+   * attribution the live path emits plus `source: 'thread-history'`, its
+   * platform timestamp, and its attachments routed like live attachments.
+   */
+  private async buildThreadHistorySignals(args: {
+    history: ThreadHistoryWindow;
+    chatThread: Thread;
+    platform: string;
+    mastraThread: Pick<StorageThreadType, 'id'>;
+    requestContext: RequestContext;
+  }): Promise<AgentSignalInput[]> {
+    const { history, chatThread, platform, mastraThread, requestContext } = args;
+    const ordered: Array<{ message: Message; gapAfter: boolean }> = [];
+    if (history.root) ordered.push({ message: history.root, gapAfter: history.omitted > 0 });
+    for (const message of history.recent) ordered.push({ message, gapAfter: false });
+
+    const signals: AgentSignalInput[] = [];
+    // Rows without a valid platform timestamp get monotonic fallbacks. The
+    // base is the earliest real timestamp in the window (so an untimestamped
+    // first row cannot land after later rows), else "now" minus the row count
+    // so every row still precedes the trigger. Timestamps are also clamped
+    // nondecreasing so MessageList's createdAt sort keeps thread order.
+    const validDateSent = (message: Message): Date | undefined => {
+      const dateSent = message.metadata?.dateSent;
+      return dateSent instanceof Date && !Number.isNaN(dateSent.getTime()) ? dateSent : undefined;
+    };
+    const earliest = Math.min(...ordered.map(({ message }) => validDateSent(message)?.getTime() ?? Infinity));
+    let previousCreatedAt = new Date((Number.isFinite(earliest) ? earliest : Date.now()) - ordered.length - 2);
+    const resolveCreatedAt = (message: Message): Date => {
+      const valid = validDateSent(message);
+      previousCreatedAt =
+        valid && valid.getTime() > previousCreatedAt.getTime() ? valid : new Date(previousCreatedAt.getTime() + 1);
+      return previousCreatedAt;
+    };
+
+    for (const { message, gapAfter } of ordered) {
+      const createdAt = resolveCreatedAt(message);
+      const text = messageText(message);
+      const parts: Exclude<AgentSignalContents, string> = [
+        ...(text ? [{ type: 'text' as const, text }] : []),
+        ...(await this.attachmentsToParts(message.attachments ?? [], requestContext)),
+      ];
+      if (parts.length > 0) {
+        const { attributes, providerOptions } = await this.buildEventContext({
+          chatThread,
+          platform,
+          eventType: 'mention',
+          messageId: message.id,
+          actor: message.author,
+        });
+        signals.push({
+          id: `thread-history:${mastraThread.id}:${message.id}`,
+          type: 'user',
+          tagName: 'user',
+          contents: parts.length === 1 && parts[0]?.type === 'text' ? parts[0].text : parts,
+          attributes: { ...attributes, source: 'thread-history' },
+          providerOptions,
+          createdAt,
+        });
+      }
+      if (gapAfter) {
+        const omitted = formatOmittedCount(history);
+        previousCreatedAt = new Date(createdAt.getTime() + 1);
+        signals.push({
+          id: `thread-history:${mastraThread.id}:gap`,
+          type: 'user',
+          tagName: 'user',
+          contents: formatOmittedMarker(platform, omitted),
+          attributes: { platform, source: 'thread-history', kind: 'gap', omitted },
+          // Channel context without an author: clients render the platform
+          // badge on the marker without attributing it to anyone.
+          providerOptions: { mastra: { channels: { [platform]: {} } } },
+          createdAt: previousCreatedAt,
+        });
+      }
+    }
+    return signals;
+  }
+
+  /**
+   * Persist the history rows into the Mastra thread without waking the agent.
+   * Returns `false` when the rows were not persisted (the agent has no
+   * memory, or the write failed), in which case the caller falls back to the
+   * legacy text block. History is only collected on the first mention; the
+   * thread is subscribed right after, so a failure here is the only chance
+   * the agent gets at this context. `buildSignals` downloads attachments, so
+   * it is only called once persistence is known to be possible. A failure
+   * building the rows logs and still returns `true`: the legacy block could
+   * not be built from the same input either. The deterministic row ids keep
+   * deliveries that race before the subscription lands from duplicating rows.
+   *
+   * The rows are written straight to memory in one batch rather than sent
+   * through `agent.sendSignal(..., { behavior: 'persist' })`: the runtime
+   * rebroadcasts every persisted signal as a short pseudo-run, and a thread
+   * subscriber that observes it marks the thread active, so the trigger that
+   * follows would attach to that pseudo-run instead of waking the agent.
+   *
+   * Overridden by `AgentControllerChannels`, which resolves memory through its
+   * session's agent and never reads `this.agent`.
+   */
+  protected async persistThreadHistorySignals(args: {
+    /** Builds the rows (downloads attachments); call only after deciding persistence is possible. */
+    buildSignals: () => Promise<AgentSignalInput[]>;
+    requestContext: RequestContext;
+    thread: StorageThreadType;
+    memory: { thread: string; resource: string };
+    /** Platform and message identifiers for log lines. */
+    logContext: ThreadHistoryLogContext;
+  }): Promise<boolean> {
+    const memory = await this.getDispatchAgent().getMemory({ requestContext: args.requestContext });
+    if (!memory) return false;
+    return this.saveThreadHistorySignals({ ...args, memory, target: args.memory });
+  }
+
+  /**
+   * Builds the rows and writes them to `memory` in one batch. Never throws.
+   * Returns `false` only when the write itself failed. The rows may then be
+   * missing, so the caller falls back to the legacy text block; a store that
+   * applied part of the batch before failing shows some history twice, which
+   * beats losing it.
+   */
+  protected async saveThreadHistorySignals(args: {
+    buildSignals: () => Promise<AgentSignalInput[]>;
+    memory: MastraMemory;
+    target: { thread: string; resource: string };
+    logContext: ThreadHistoryLogContext;
+  }): Promise<boolean> {
+    const { platform } = args.logContext;
+    let signals: AgentSignalInput[];
+    try {
+      signals = await args.buildSignals();
+    } catch (err) {
+      this.log('warn', 'Failed to build thread history messages', {
+        ...args.logContext,
+        error: err,
+      });
+      return true;
+    }
+    if (signals.length === 0) return true;
+    try {
+      await args.memory.saveMessages({
+        messages: signals.map(signal =>
+          createSignal(signal).toDBMessage({ resourceId: args.target.resource, threadId: args.target.thread }),
+        ),
+      });
+      this.log('debug', 'Persisted thread history', { ...args.logContext, rows: signals.length });
+      return true;
+    } catch (err) {
+      this.log('warn', 'Failed to persist thread history messages', {
+        ...args.logContext,
+        rows: signals.length,
+        error: err,
+      });
+      return false;
+    }
   }
 
   /**
@@ -1161,7 +2064,10 @@ export class AgentChannels {
   _buildRenderContext(
     chatThread: Thread,
     platform: string,
-    approvalContext?: { toolCallId: string; messageId: string },
+    {
+      approvalContext,
+      requesterId,
+    }: { approvalContext?: { toolCallId: string; messageId: string }; requesterId?: string } = {},
   ): ChatChannelRenderContext {
     const adapter = this.adapters[platform]!;
     const adapterConfig = this.adapterConfigs[platform];
@@ -1177,7 +2083,7 @@ export class AgentChannels {
     const typingGate = { active: false };
 
     const onApprovalPosted = (toolCallId: string, record: PendingApprovalRecord) => {
-      this.pendingApprovalCards.set(toolCallId, record);
+      this.pendingApprovalCards.set(toolCallId, { ...record, requesterId: record.requesterId ?? requesterId });
     };
     const getPendingApproval = (id: string) => this.pendingApprovalCards.get(id);
     const takePendingApproval = (id: string) => {
@@ -1201,8 +2107,24 @@ export class AgentChannels {
       wrapStream: stream => this.withTypingStatus(stream, chatThread, platform, adapterConfig, typingGate),
       typingGate,
       formatError: adapterConfig?.formatError,
+      textFormat: adapterConfig?.textFormat,
+      textDisplay: adapterConfig?.textDisplay,
+      onAbort: adapterConfig?.onAbort,
       approvalContext,
     };
+  }
+
+  /**
+   * Whether a `tool-call-approval` chunk for `toolName` should render
+   * Approve/Deny controls in the chat. The base class always renders them;
+   * subclasses that resolve approval policy themselves (e.g. an agent
+   * controller auto-approving `allow` tools) return `false` when no human
+   * decision is actually pending.
+   *
+   * @internal
+   */
+  async shouldRenderToolApproval(_requestContext: RequestContext | undefined, _toolName: string): Promise<boolean> {
+    return true;
   }
 
   /**
@@ -1227,7 +2149,36 @@ export class AgentChannels {
    * via `chat.thread(externalThreadId)`.
    */
   async buildRenderContextForThread(threadId: string): Promise<ChatChannelRenderContext | null> {
-    const mastra = this.agent?.getMastraInstance();
+    return (await this.loadChannelThread(threadId))?.render ?? null;
+  }
+
+  /**
+   * The channel context and render context for a run on a channel-backed
+   * thread that did not start from a platform message. The channel context is
+   * built exactly as an inbound message's would be, around the thread's last
+   * sender, so `ChatChannelProcessor` gives both kinds of run the same system
+   * prompt and a host switching between them keeps its prompt cache.
+   */
+  async buildChannelContextForThread(
+    threadId: string,
+  ): Promise<{ channel: ChannelContext; render: ChatChannelRenderContext } | null> {
+    const loaded = await this.loadChannelThread(threadId);
+    if (!loaded) return null;
+    const { render, sender } = loaded;
+    const { channelContext } = await this.buildEventContext({
+      chatThread: render.chatThread,
+      platform: render.platform,
+      eventType: 'thread',
+      messageId: undefined,
+      actor: sender?.author ?? { userId: '' },
+    });
+    return { channel: channelContext, render };
+  }
+
+  private async loadChannelThread(
+    threadId: string,
+  ): Promise<{ render: ChatChannelRenderContext; sender: LastSender | undefined } | null> {
+    const mastra = this.getMastra();
     const storage = mastra?.getStorage();
     if (!storage) return null;
 
@@ -1247,7 +2198,69 @@ export class AgentChannels {
     if (!chat) return null;
 
     const chatThread = chat.thread(externalThreadId);
-    return this._buildRenderContext(chatThread, platform);
+    const sender = parseLastSender(thread.metadata?.[LAST_SENDER_KEY]);
+    const storedIsDM = thread.metadata?.[IS_DM_KEY];
+    const isDM = typeof storedIsDM === 'boolean' ? storedIsDM : chatThread.isDM;
+    if (!sender && isDM === chatThread.isDM) return { render: this._buildRenderContext(chatThread, platform), sender };
+
+    // Rebuild the thread the way an inbound message would: around the last
+    // person who wrote in it, and with the DM flag the platform event carried
+    // (not every adapter can tell from the id). Some adapters key behavior off
+    // the current message: Slack only streams natively when it knows who the
+    // reply is for, and otherwise posts and then edits in coarse chunks.
+    const { Message: ChatMessage, ThreadImpl } = await getChatModule();
+    const currentMessage =
+      sender &&
+      new ChatMessage({
+        attachments: [],
+        author: sender.author,
+        formatted: { type: 'root', children: [] },
+        id: '',
+        metadata: { dateSent: new Date(), edited: false },
+        raw: sender.raw,
+        text: '',
+        threadId: externalThreadId,
+      });
+    const rebuilt = new ThreadImpl({
+      adapter: chatThread.adapter,
+      channelId: chatThread.channelId,
+      channelVisibility: chatThread.channelVisibility,
+      ...(currentMessage ? { currentMessage } : {}),
+      id: externalThreadId,
+      isDM,
+      stateAdapter: this.stateAdapter,
+    });
+    return { render: this._buildRenderContext(rebuilt, platform), sender };
+  }
+
+  /**
+   * Remembers who last wrote in a channel-backed thread and whether it is a
+   * DM, so a run on it that didn't start from a message gets the same prompt
+   * and replies the same way an inbound one would (see
+   * {@link buildChannelContextForThread}). Writes only when either changes.
+   */
+  private async rememberThreadFacts(
+    thread: StorageThreadType,
+    chatThread: Thread,
+    message: Message,
+    mastra: Mastra,
+  ): Promise<void> {
+    const sender = lastSenderOf(message);
+    const metadata = (thread.metadata ?? {}) as Record<string, unknown>;
+    if (
+      JSON.stringify(metadata[LAST_SENDER_KEY]) === JSON.stringify(sender) &&
+      metadata[IS_DM_KEY] === chatThread.isDM
+    ) {
+      return;
+    }
+    const memoryStore = await mastra.getStorage()?.getStore('memory');
+    if (!memoryStore) return;
+    // Re-read so keys other writers set since `thread` was loaded survive.
+    const current = (await memoryStore.getThreadById({ threadId: thread.id }))?.metadata ?? metadata;
+    await memoryStore.patchThread({
+      id: thread.id,
+      metadata: { ...current, [LAST_SENDER_KEY]: sender, [IS_DM_KEY]: chatThread.isDM },
+    });
   }
 
   /**
@@ -1275,6 +2288,11 @@ export class AgentChannels {
    * on `chat.stopStream`, so a status set during streaming would stick after
    * the run ends. The static driver leaves the gate `false` so typing works
    * normally in cards/hidden modes.
+   *
+   * When the run's stream ends, an empty status is sent to clear any status
+   * this run set, so runs that end without posting a message (e.g. terminated
+   * by `stopWhen` on a tool call, or aborted) don't leave a stale status
+   * pinned to the thread.
    */
   private async *withTypingStatus(
     stream: AsyncIterable<AgentChunkType<any>>,
@@ -1292,36 +2310,145 @@ export class AgentChannels {
           : defaultTypingStatus;
 
     let currentTypingStatus: string | undefined;
+    let statusSent = false;
 
-    for await (const chunk of stream) {
-      if (typingStatusFn && !typingGate.active) {
-        let result: ReturnType<TypingStatusFn>;
-        try {
-          const ctx: TypingStatusContext = {
-            platform,
-            threadId: chatThread.id,
-            currentStatus: currentTypingStatus,
-            channelTools: this.channelToolNames,
-          };
-          result = typingStatusFn(chunk, ctx);
-        } catch (e) {
-          this.logger?.debug('[CHANNEL] typingStatus function threw (continuing)', { error: e });
-          result = undefined;
+    try {
+      for await (const chunk of stream) {
+        if (typingStatusFn && !typingGate.active) {
+          let result: ReturnType<TypingStatusFn>;
+          try {
+            const ctx: TypingStatusContext = {
+              platform,
+              threadId: chatThread.id,
+              currentStatus: currentTypingStatus,
+              channelTools: this.channelToolNames,
+            };
+            result = typingStatusFn(chunk, ctx);
+          } catch (e) {
+            this.log('debug', 'typingStatus function threw (continuing)', {
+              platform,
+              threadId: chatThread.id,
+              error: e,
+            });
+            result = undefined;
+          }
+          if (typeof result === 'string' && result.length > 0 && result !== currentTypingStatus) {
+            currentTypingStatus = result;
+            statusSent = true;
+            chatThread.startTyping(result).catch(e => {
+              this.log('debug', 'Typing indicator failed (best-effort)', {
+                platform,
+                threadId: chatThread.id,
+                error: e,
+              });
+            });
+          }
         }
-        if (typeof result === 'string' && result.length > 0 && result !== currentTypingStatus) {
-          currentTypingStatus = result;
-          chatThread.startTyping(result).catch(e => {
-            this.logger?.debug('[CHANNEL] Typing indicator failed (best-effort)', { error: e });
-          });
+        // Reset the dedup state on per-step run boundaries so the next step can
+        // re-emit its first status even if it matches the previous step's last
+        // status.
+        if (chunk.type === 'finish' || chunk.type === 'error' || chunk.type === 'abort') {
+          currentTypingStatus = undefined;
         }
+        yield chunk;
       }
-      // Reset the dedup state on run boundaries so the next run can re-emit
-      // its first status even if it matches the previous run's last status.
-      if (chunk.type === 'finish' || chunk.type === 'error' || chunk.type === 'abort') {
-        currentTypingStatus = undefined;
+    } finally {
+      // End of the run's stream (the session queue closed on the terminal
+      // step-finish / error / abort, or the driver stopped consuming). Slack's
+      // `assistant.threads.setStatus` only auto-clears on `chat.postMessage`,
+      // so a run that set a status but never posted a message would leave it
+      // pinned on the thread indefinitely. Send an empty status to clear it —
+      // a no-op when a post already cleared it. Skip the clear while the
+      // streaming gate is active: the in-flight streaming post clears the
+      // status when it completes.
+      if (statusSent && !typingGate.active) {
+        chatThread.startTyping('').catch(e => {
+          this.log('debug', 'Typing clear failed (best-effort)', { platform, threadId: chatThread.id, error: e });
+        });
       }
-      yield chunk;
     }
+  }
+
+  /**
+   * Look up a channel-backed Mastra thread and retain the store/metadata needed
+   * by the create path when no mapping exists.
+   */
+  private async findThreadMapping({
+    externalThreadId,
+    channelId,
+    platform,
+    mastra,
+  }: {
+    externalThreadId: string;
+    channelId: string;
+    platform: string;
+    mastra: Mastra;
+  }) {
+    const storage = mastra.getStorage();
+    if (!storage) {
+      throw new Error('Storage is required for channel thread mapping. Configure storage in your Mastra instance.');
+    }
+
+    const memoryStore = await storage.getStore('memory');
+    if (!memoryStore) {
+      throw new Error(
+        'Memory store is required for channel thread mapping. Configure storage in your Mastra instance.',
+      );
+    }
+
+    const legacyMetadata = {
+      channel_platform: platform,
+      channel_externalThreadId: externalThreadId,
+      channel_externalChannelId: channelId,
+    };
+
+    const ownerId = this.getOwnerId();
+    if (ownerId === null) {
+      // No owner bound yet - scoping is impossible; behave exactly as before
+      // and never stamp a null owner id.
+      const { threads } = await memoryStore.listThreads({
+        filter: { metadata: legacyMetadata },
+        perPage: 1,
+      });
+      return { thread: threads[0], memoryStore, metadata: legacyMetadata };
+    }
+
+    const metadata = { ...legacyMetadata, channel_ownerId: ownerId };
+
+    // Primary lookup: threads already scoped to this agent.
+    const { threads: scoped } = await memoryStore.listThreads({
+      filter: { metadata },
+      perPage: 1,
+    });
+    if (scoped[0]) return { thread: scoped[0], memoryStore, metadata };
+
+    // Legacy fallback: pre-upgrade threads carry no channel_ownerId. Metadata
+    // filters match subsets, so this query also returns threads claimed by
+    // OTHER agents - post-filter to unclaimed rows only, oldest first so
+    // adoption deterministically picks the original thread. If a conversation
+    // somehow accumulates more than 10 candidate rows, an unclaimed one past
+    // the page could be missed and a fresh thread created - acceptable
+    // degradation.
+    const { threads: candidates } = await memoryStore.listThreads({
+      filter: { metadata: legacyMetadata },
+      perPage: 10,
+      orderBy: { field: 'createdAt', direction: 'ASC' },
+    });
+    const unclaimed = candidates.find(candidate => {
+      const candidateMeta = (candidate.metadata ?? {}) as Record<string, unknown>;
+      return !('channel_ownerId' in candidateMeta);
+    });
+    if (unclaimed) {
+      // Lazily adopt the legacy thread: the first agent to touch it claims it
+      // by stamping its own id, preserving all existing metadata.
+      const claimed = await memoryStore.patchThread({
+        id: unclaimed.id,
+        metadata: { ...((unclaimed.metadata ?? {}) as Record<string, unknown>), channel_ownerId: ownerId },
+      });
+      return { thread: claimed, memoryStore, metadata };
+    }
+
+    return { thread: undefined, memoryStore, metadata };
   }
 
   /**
@@ -1352,32 +2479,17 @@ export class AgentChannels {
     threadId?: (resolvedResourceId: string, defaultThreadId: string) => string | Promise<string>;
     mastra: Mastra;
   }): Promise<StorageThreadType> {
-    const storage = mastra.getStorage();
-    if (!storage) {
-      throw new Error('Storage is required for channel thread mapping. Configure storage in your Mastra instance.');
-    }
-
-    const memoryStore = await storage.getStore('memory');
-    if (!memoryStore) {
-      throw new Error(
-        'Memory store is required for channel thread mapping. Configure storage in your Mastra instance.',
-      );
-    }
-
-    const metadata = {
-      channel_platform: platform,
-      channel_externalThreadId: externalThreadId,
-      channel_externalChannelId: channelId,
-    };
-
-    const { threads } = await memoryStore.listThreads({
-      filter: { metadata },
-      perPage: 1,
+    const {
+      thread: existingThread,
+      memoryStore,
+      metadata,
+    } = await this.findThreadMapping({
+      externalThreadId,
+      channelId,
+      platform,
+      mastra,
     });
-
-    if (threads.length > 0) {
-      return threads[0]!;
-    }
+    if (existingThread) return existingThread;
 
     const resolvedResourceId = typeof resourceId === 'function' ? await resourceId() : resourceId;
     const defaultThreadId = crypto.randomUUID();
@@ -1399,7 +2511,7 @@ export class AgentChannels {
     return memoryStore.saveThread({
       thread: {
         id: resolvedThreadId || defaultThreadId,
-        title: `${platform} conversation`,
+        title: '',
         resourceId: resolvedResourceId,
         createdAt: new Date(),
         updatedAt: new Date(),
@@ -1422,7 +2534,7 @@ export class AgentChannels {
           emoji: z.string().describe('The emoji to react with (e.g. "thumbsup")'),
         }),
         execute: async ({ messageId, emoji }, context) => {
-          const { adapter, threadId } = this.getAdapterFromContext(context);
+          const { adapter, threadId } = await this.getAdapterFromContext(context);
           await adapter.addReaction(threadId, messageId, emoji);
           return { ok: true };
         },
@@ -1436,7 +2548,7 @@ export class AgentChannels {
           emoji: z.string().describe('The emoji to remove'),
         }),
         execute: async ({ messageId, emoji }, context) => {
-          const { adapter, threadId } = this.getAdapterFromContext(context);
+          const { adapter, threadId } = await this.getAdapterFromContext(context);
           await adapter.removeReaction(threadId, messageId, emoji);
           return { ok: true };
         },
@@ -1475,9 +2587,9 @@ export class AgentChannels {
             DURATION,
           );
           await done;
-          this.log('info', `[${name}] Gateway session ended, reconnecting...`);
+          this.log('info', 'Gateway session ended, reconnecting...', { platform: name });
         } catch (err) {
-          this.log('error', `[${name}] Gateway error, retrying in ${RETRY_DELAY / 1000}s`, err);
+          this.log('error', `Gateway error, retrying in ${RETRY_DELAY / 1000}s`, { platform: name, error: err });
           await new Promise(r => setTimeout(r, RETRY_DELAY));
         }
       }
@@ -1564,26 +2676,81 @@ export class AgentChannels {
     if (isStreamingOnlyMode && !streamingEnabled) {
       if (!this.warnedToolDisplayFallback.has(platform)) {
         this.warnedToolDisplayFallback.add(platform);
-        this.log(
-          'warn',
-          `[${platform}] toolDisplay: '${toolDisplay}' requires streaming: true; falling back to 'cards'.`,
-        );
+        this.log('warn', `toolDisplay: '${toolDisplay}' requires streaming: true; falling back to 'cards'.`, {
+          platform,
+        });
       }
       return { resolved: 'cards', fn };
     }
     return { resolved: toolDisplay, fn };
   }
 
-  private log(level: 'info' | 'warn' | 'error' | 'debug', message: string, ...args: unknown[]): void {
+  /**
+   * Single entry point for channel logs. `fields.platform` also prefixes the
+   * message as `[platform]`, and `fields.error` is normalized so it serializes
+   * with its message, code and cause instead of as `{}`.
+   */
+  protected log(level: 'info' | 'warn' | 'error' | 'debug', message: string, fields?: ChannelLogContext): void {
     if (!this.logger) return;
-    if (level === 'error') {
-      this.logger.error(message, { args });
-    } else if (level === 'warn') {
-      this.logger.warn(message, { args });
-    } else if (level === 'debug') {
-      this.logger.debug(message, { args });
-    } else {
-      this.logger.info(message, { args });
+    const prefixed = fields?.platform ? `[${fields.platform}] ${message}` : message;
+    if (!fields) {
+      this.logger[level](prefixed);
+      return;
     }
+    // Already-sanitized diagnostics (plain objects) pass through untouched.
+    const payload = fields.error instanceof Error ? { ...fields, error: getErrorFromUnknown(fields.error) } : fields;
+    this.logger[level](prefixed, payload);
   }
+}
+
+const LAST_SENDER_KEY = 'channel_lastSender';
+const IS_DM_KEY = 'channel_isDM';
+
+interface LastSender {
+  author: Message['author'];
+  /** Only the workspace/team ids from the platform event; adapters read the recipient's team from these. */
+  raw: Record<string, unknown>;
+}
+
+function lastSenderOf(message: Message): LastSender {
+  const raw = (message.raw ?? {}) as Record<string, unknown>;
+  const user = raw.user as Record<string, unknown> | undefined;
+  const team = raw.team as Record<string, unknown> | string | undefined;
+  const kept: Record<string, unknown> = {};
+  if (typeof raw.team_id === 'string') kept.team_id = raw.team_id;
+  if (typeof team === 'string') kept.team = team;
+  else if (team && typeof team.id === 'string') kept.team = { id: team.id };
+  if (user && typeof user.team_id === 'string') kept.user = { team_id: user.team_id };
+  const { userId, userName, fullName, isBot, isMe } = message.author;
+  return { author: { userId, userName, fullName, isBot, isMe }, raw: kept };
+}
+
+function parseLastSender(value: unknown): LastSender | undefined {
+  if (!value || typeof value !== 'object') return undefined;
+  const { author, raw } = value as Partial<LastSender>;
+  if (!author || typeof author.userId !== 'string') return undefined;
+  return { author, raw: raw && typeof raw === 'object' ? raw : {} };
+}
+
+/**
+ * Folder for saved attachments. A composite filesystem only accepts paths
+ * under one of its mounts, so the folder goes in the first writable mount.
+ */
+function attachmentDirFor(fs: WorkspaceFilesystem): string | undefined {
+  if (!(fs instanceof CompositeFilesystem)) return ATTACHMENT_DIR;
+  // A "/" mount is skipped: CompositeFilesystem only routes the exact path "/" to it.
+  const mount = fs.mountPaths.find(path => path !== '/' && !fs.mounts.get(path)?.readOnly);
+  return mount === undefined ? undefined : `${mount}/${ATTACHMENT_DIR}`;
+}
+
+/** Total size of the files under `dir` (0 when the folder doesn't exist yet). */
+async function storedAttachmentBytes(fs: WorkspaceFilesystem, dir: string, root = true): Promise<number> {
+  if (root && !(await fs.exists(dir))) return 0;
+  let total = 0;
+  for (const entry of await fs.readdir(dir)) {
+    const path = `${dir}/${entry.name}`;
+    if (entry.type === 'directory') total += await storedAttachmentBytes(fs, path, false);
+    else total += entry.size ?? (await fs.stat(path)).size;
+  }
+  return total;
 }

@@ -1,0 +1,265 @@
+import { Container } from '@earendil-works/pi-tui';
+import type { MastraDBMessage } from '@mastra/core/agent-controller';
+import { describe, expect, it, vi } from 'vitest';
+import { AssistantRenderRegistry, getAssistantSegmentKey } from '../../assistant-render-registry.js';
+import { AssistantMessageComponent } from '../../components/assistant-message.js';
+import type { TUIState } from '../../state.js';
+import { handleAgentAborted, handleAgentEnd, handleAgentError, handleGoalEvaluation } from '../agent-lifecycle.js';
+import type { EventHandlerContext } from '../types.js';
+
+vi.mock('@mastra/code-sdk/utils/project', () => ({
+  getCurrentGitBranchAsync: vi.fn(async () => undefined),
+}));
+
+function assistantMessage(): MastraDBMessage {
+  return {
+    id: 'assistant-1',
+    role: 'assistant',
+    createdAt: new Date(),
+    content: { format: 2, parts: [{ type: 'text', text: 'visible output' }] },
+  } as MastraDBMessage;
+}
+
+function createContext(): { ctx: EventHandlerContext; state: TUIState } {
+  const assistantRenderRegistry = new AssistantRenderRegistry();
+  const message = assistantMessage();
+  const { segment } = assistantRenderRegistry.reconcile(
+    message.id,
+    getAssistantSegmentKey(message.id),
+    message,
+    () => new AssistantMessageComponent(),
+  );
+  const state = {
+    assistantRenderRegistry,
+    streamingComponent: segment.component,
+    streamingMessage: message,
+    chatContainer: new Container(),
+    projectInfo: { rootPath: '/repo', gitBranch: 'main' },
+    ui: { requestRender: vi.fn() },
+    session: {
+      displayState: { get: vi.fn(() => ({ isRunning: false, queuedFollowUps: 0 })) },
+      stream: { isActive: vi.fn(() => false) },
+    },
+    gradientAnimator: undefined,
+    activeGoalJudge: undefined,
+    followUpComponents: [],
+    pendingTools: new Map(),
+    pendingTaskToolIds: new Set(),
+    pendingSlashCommands: [],
+    pendingSlashCommandMessageIds: [],
+    pendingSignalMessageComponentsById: new Map(),
+    allToolComponents: [],
+    allSlashCommandComponents: [],
+    allSystemReminderComponents: [],
+    allShellComponents: [],
+    userInitiatedAbort: false,
+    planRejectionAbort: false,
+  } as unknown as TUIState;
+  state.chatContainer.addChild(segment.component);
+
+  const ctx = {
+    state,
+    updateStatusLine: vi.fn(),
+    addUserMessage: vi.fn(),
+    fireMessage: vi.fn(),
+    handleSlashCommand: vi.fn(async () => {}),
+    showError: vi.fn(),
+  } as unknown as EventHandlerContext;
+  return { ctx, state };
+}
+
+describe('assistant render ownership at agent terminal paths', () => {
+  it.each([
+    ['agent_end', handleAgentEnd],
+    ['agent_aborted', handleAgentAborted],
+    ['agent_error', handleAgentError],
+  ] as const)('finalizes active render state on %s without dropping rendered output', (_name, handler) => {
+    const { ctx, state } = createContext();
+
+    handler(ctx);
+
+    const record = state.assistantRenderRegistry.get('assistant-1')!;
+    expect(record.activeSegmentKey).toBeUndefined();
+    expect([...record.segments.values()].every(segment => segment.finalized)).toBe(true);
+    expect(state.streamingComponent).toBeUndefined();
+    expect(state.streamingMessage).toBeUndefined();
+    expect(record.segments.values().next().value?.component.render(80).join('\n')).toContain('visible output');
+  });
+
+  it('preserves queued assistant output and the interrupted marker when aborting before the next render', () => {
+    const { ctx, state } = createContext();
+    const pendingMessage = assistantMessage();
+    pendingMessage.content = {
+      format: 2,
+      parts: [{ type: 'text', text: 'visible output plus pending suffix' }],
+    };
+    state.streamingMessage = pendingMessage;
+    state.assistantRenderRegistry.queueActive(pendingMessage.id, pendingMessage);
+
+    handleAgentAborted(ctx);
+
+    const component = state.assistantRenderRegistry.get('assistant-1')!.segments.values().next().value!.component;
+    const output = component.render(80).join('\n');
+    expect(output).toContain('visible output plus pending suffix');
+    expect(output).toContain('Interrupted');
+  });
+
+  it('does not duplicate pre-tool output when aborting with pending post-tool output', () => {
+    const { ctx, state } = createContext();
+    state.assistantRenderRegistry.finalizeActive('assistant-1');
+
+    const postToolMessage = {
+      ...assistantMessage(),
+      content: {
+        format: 2,
+        parts: [{ type: 'text', text: 'pending post-tool output' }],
+      },
+    } as MastraDBMessage;
+    const { segment } = state.assistantRenderRegistry.reconcile(
+      postToolMessage.id,
+      getAssistantSegmentKey(postToolMessage.id, 'tool-1'),
+      postToolMessage,
+      () => new AssistantMessageComponent(),
+    );
+    state.streamingComponent = segment.component;
+    state.streamingMessage = {
+      ...postToolMessage,
+      content: {
+        format: 2,
+        parts: [
+          { type: 'text', text: 'visible output' },
+          {
+            type: 'tool-invocation',
+            toolInvocation: { state: 'result', toolCallId: 'tool-1', toolName: 'view', args: {}, result: 'ok' },
+          },
+          { type: 'text', text: 'pending post-tool output' },
+        ],
+      },
+    } as MastraDBMessage;
+
+    handleAgentAborted(ctx);
+
+    const output = segment.component.render(80).join('\n');
+    expect(output).toContain('pending post-tool output');
+    expect(output).toContain('Interrupted');
+    expect(output).not.toContain('visible output');
+  });
+
+  it('renders only the interrupted marker when aborting an empty post-tool segment', () => {
+    const { ctx, state } = createContext();
+    state.assistantRenderRegistry.finalizeActive('assistant-1');
+
+    const { segment } = state.assistantRenderRegistry.start(
+      'assistant-1',
+      getAssistantSegmentKey('assistant-1', 'tool-1'),
+      () => new AssistantMessageComponent(),
+    );
+    state.streamingComponent = segment.component;
+    state.streamingMessage = {
+      ...assistantMessage(),
+      content: {
+        format: 2,
+        parts: [
+          { type: 'text', text: 'visible output' },
+          {
+            type: 'tool-invocation',
+            toolInvocation: { state: 'result', toolCallId: 'tool-1', toolName: 'view', args: {}, result: 'ok' },
+          },
+        ],
+      },
+    } as MastraDBMessage;
+
+    handleAgentAborted(ctx);
+
+    const output = segment.component.render(80).join('\n');
+    expect(output).toContain('Interrupted');
+    expect(output).not.toContain('visible output');
+  });
+});
+
+describe('goal judge display at agent_end', () => {
+  function goalContext() {
+    const { ctx, state } = createContext();
+    (state as any).goalManager = {
+      getGoal: vi.fn(() => ({ status: 'active', judgeModelId: 'judge' })),
+      applyEvaluation: vi.fn(),
+    };
+    return { ctx, state };
+  }
+
+  it('removes a judge display that never received a verdict', () => {
+    const { ctx, state } = goalContext();
+    handleGoalEvaluation(ctx, { pending: true, iteration: 1, maxRuns: 10 } as any);
+    const component = state.activeGoalJudge!.component;
+    expect(state.chatContainer.children).toContain(component);
+
+    handleAgentEnd(ctx);
+
+    expect(state.activeGoalJudge).toBeUndefined();
+    expect(state.chatContainer.children).not.toContain(component);
+  });
+
+  it('keeps a completed judge display in history', () => {
+    const { ctx, state } = goalContext();
+    handleGoalEvaluation(ctx, { pending: true, iteration: 1, maxRuns: 10 } as any);
+    const component = state.activeGoalJudge!.component;
+    handleGoalEvaluation(ctx, {
+      iteration: 1,
+      maxRuns: 10,
+      status: 'active',
+      decision: 'continue',
+      reason: 'keep going',
+    } as any);
+
+    handleAgentEnd(ctx);
+
+    expect(state.chatContainer.children).toContain(component);
+  });
+});
+
+describe('queued slash commands across aborted and failed runs', () => {
+  function queueSlash(state: TUIState, command: string) {
+    state.pendingSlashCommands.push(command);
+    state.pendingSlashCommandMessageIds.push(`queued-${command}`);
+  }
+
+  it.each([
+    ['agent_aborted', handleAgentAborted],
+    ['agent_error', handleAgentError],
+  ] as const)('runs queued slash commands on %s when the thread is idle', (_name, handler) => {
+    const { ctx, state } = createContext();
+    queueSlash(state, '/first');
+    queueSlash(state, '/second');
+
+    handler(ctx);
+
+    expect(ctx.handleSlashCommand).toHaveBeenCalledTimes(1);
+    expect(ctx.handleSlashCommand).toHaveBeenCalledWith('/first');
+    expect(state.pendingSlashCommands).toEqual(['/second']);
+  });
+
+  it('keeps queued slash commands for agent_end when a follow-up run is starting', () => {
+    const { ctx, state } = createContext();
+    (state.session.stream.isActive as ReturnType<typeof vi.fn>).mockReturnValue(true);
+    queueSlash(state, '/later');
+
+    handleAgentAborted(ctx);
+
+    expect(ctx.handleSlashCommand).not.toHaveBeenCalled();
+    expect(state.pendingSlashCommands).toEqual(['/later']);
+  });
+
+  it('defers queued slash commands while core has queued follow-up messages', () => {
+    const { ctx, state } = createContext();
+    (state.session.displayState.get as ReturnType<typeof vi.fn>).mockReturnValue({
+      isRunning: false,
+      queuedFollowUps: 1,
+    });
+    queueSlash(state, '/later');
+
+    handleAgentAborted(ctx);
+
+    expect(ctx.handleSlashCommand).not.toHaveBeenCalled();
+    expect(state.pendingSlashCommands).toEqual(['/later']);
+  });
+});

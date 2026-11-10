@@ -20,11 +20,34 @@ export const coreFeatures = new Set<string>([
   'request-response-id-rotation',
   'workspaces-v1',
   'datasets',
+  // Dataset item data can be permanently purged from history and linked experiment results.
+  'dataset-item-purge',
   'observability:v1.13.2',
   'observability-delta-polling',
+  // Shared span-type-aware input, output, and error preview formatting.
+  'observability-span-previews',
+  'observability-trace-query-tenant-scope',
   'channels',
   'deploy-diagnosis',
   'model-inference-span',
+  'execution-outcomes',
   'internal-usage-rollup',
   'json-prompt-injection:inline',
+  'observability-signal-deletion',
+  'knowledge-v2',
+  // Knowledge schema 4 (pages, notes, stamps, mentions, pins) and its shared bound helpers.
+  'knowledge-pages',
+  // Experiments can be deleted, including experiments orphaned by dataset
+  // deletion, and the deletion cascades to the experiment's observability traces.
+  'experiment-deletion',
+  // Processors can declare the span type they are traced as, and the built-in
+  // subsystems declare theirs: SKILL_ACTION, AGENT_SIGNAL, and the memory and
+  // workspace types for skills, state signals, memory and workspace
+  // instructions.
+  //
+  // A dependent that only needs to know whether one SpanType member exists
+  // should test that member for `undefined` instead of importing this set:
+  // `@mastra/core/features` is itself a recent subpath, so importing it raises
+  // the oldest core the dependent can load against.
+  'processor-span-types',
 ]);

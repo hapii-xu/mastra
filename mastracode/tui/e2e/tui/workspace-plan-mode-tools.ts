@@ -1,3 +1,5 @@
+import { readFileSync, writeFileSync } from 'node:fs';
+import { join } from 'node:path';
 import type { McE2eScenario } from './types.js';
 
 const BUILD_PROMPT = 'Record the build-mode workspace tool list.';
@@ -61,6 +63,12 @@ export const workspacePlanModeToolsScenario: McE2eScenario = {
   testName: 'filters workspace write tools from plan-mode model requests',
   useOpenAIModel: true,
   aimockFixture: 'workspace-plan-mode-tools.json',
+  prepare({ appDataDir }) {
+    const settingsPath = join(appDataDir, 'settings.json');
+    const settings = JSON.parse(readFileSync(settingsPath, 'utf8')) as Record<string, unknown>;
+    settings.lsp = true;
+    writeFileSync(settingsPath, JSON.stringify(settings, null, 2));
+  },
   async run({ terminal, runtime }) {
     runtime.startLiveOutput(terminal);
     await runtime.waitForScreenText(/Resource ID:/i, terminal);
@@ -69,7 +77,7 @@ export const workspacePlanModeToolsScenario: McE2eScenario = {
     await runtime.waitForScreenText(/Build-mode workspace tools observed\./i, terminal, 10_000);
 
     terminal.submit('/mode plan');
-    await runtime.waitForScreenText(/▐plan▌/i, terminal, 8_000);
+    await runtime.waitForScreenText(/\bplan · /i, terminal, 8_000);
 
     terminal.submit(PLAN_PROMPT);
     await runtime.waitForScreenText(/Plan-mode workspace tools observed\./i, terminal, 10_000);

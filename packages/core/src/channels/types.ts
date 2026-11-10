@@ -1,6 +1,17 @@
-import type { Adapter, CardElement, ChatConfig, Message, StateAdapter, StreamChunk, Thread } from 'chat';
+import type {
+  ActionEvent,
+  Adapter,
+  CardElement,
+  ChatConfig,
+  Message,
+  SlashCommandEvent,
+  StateAdapter,
+  StreamChunk,
+  Thread,
+} from 'chat';
 
 import type { Mastra } from '../mastra';
+import type { RequestContext } from '../request-context';
 import type { ApiRoute, CorsOptions } from '../server/types';
 import type { InlineLinkEntry } from './inline-media';
 import type { TypingStatusFn } from './typing-status';
@@ -12,8 +23,22 @@ export type { InlineLinkEntry } from './inline-media';
 // Agent-side configuration types (consumer-facing)
 // =============================================================================
 
-/** Message content that can be posted to a channel. */
-export type PostableMessage = string | CardElement;
+/**
+ * Message content that can be posted to a channel.
+ *
+ * - `string` - posted as-is; standard markdown is not converted, though the
+ *   platform may still apply its own dialect (e.g. Slack mrkdwn).
+ * - `CardElement` - rendered as a rich card (e.g. Slack Block Kit).
+ * - `{ markdown: string }` - converted by the adapter to its platform format
+ *   (e.g. Slack `markdown_text`); adapters without native markdown rendering
+ *   convert it to their own dialect.
+ */
+export type PostableMessage = string | CardElement | { markdown: string };
+
+/** What `formatError` knows about the failure beyond the error itself. */
+export interface ChannelErrorContext {
+  requestContext?: RequestContext;
+}
 
 /** Per-adapter configuration shared across all `toolDisplay` modes. */
 export interface ChannelAdapterBaseConfig {
@@ -35,10 +60,61 @@ export interface ChannelAdapterBaseConfig {
   /**
    * Override how errors are rendered in the chat.
    * Return a user-friendly message instead of exposing the raw error.
+   * `context.requestContext` is the failed run's request context, so a host can
+   * link the message back to whatever the run belongs to.
    *
    * @default `"❌ Error: <error.message>"`
    */
-  formatError?: (error: Error) => PostableMessage;
+  formatError?: (error: Error, context: ChannelErrorContext) => PostableMessage;
+
+  /**
+   * Dialect for the agent's final reply text.
+   * - `'markdown'` (default) - replies post as `{ markdown }`; adapters with native
+   *   markdown rendering (Slack `markdown_text`) use it, others convert to their
+   *   platform format.
+   * - `'plain'` - replies post as literal plain text (the pre-1.x-behavior escape
+   *   hatch for agents prompted to emit a platform dialect such as Slack mrkdwn).
+   *
+   * Applies to final reply text only; tool cards, error messages, and tripwire
+   * notices are unaffected.
+   */
+  textFormat?: 'markdown' | 'plain';
+
+  /**
+   * Whether the agent's reply text is posted to the channel.
+   * - `'show'` (default) - reply text streams (or posts) to the thread as it does today.
+   * - `'hidden'` - reply text is never posted. The agent's own messages reach the
+   *   channel only through tools you give it (for example a reply tool that posts to the thread).
+   *
+   * Tool display, approval prompts, error messages, and typing status are unaffected.
+   */
+  textDisplay?: 'show' | 'hidden';
+
+  /**
+   * What to do with buffered (not-yet-posted) reply text when a run is aborted.
+   * Only affects the static (non-streaming) driver.
+   * - `'flush'` (default) — post the partial buffered text before stopping.
+   * - `'discard'` — drop the buffered text and post nothing.
+   *
+   * Use `'discard'` for human-takeover flows where an operator replies and the
+   * in-flight agent reply should not appear as a truncated message beside it.
+   */
+  onAbort?: 'flush' | 'discard';
+
+  /**
+   * Whether this adapter can render interactive approval buttons.
+   *
+   * When `false`, runs auto-resume suspended tools (e.g. `requireApproval`
+   * tools or `ask_user`) instead of waiting on an approval the user can't
+   * answer. Only consulted for `toolDisplay: 'hidden'`; `'text'` always
+   * auto-resumes and `'cards'`/`'timeline'`/`'grouped'` imply buttons.
+   *
+   * @default `true` for Slack, Discord, Teams, Google Chat and Telegram; `false` otherwise.
+   */
+  approvalButtons?: boolean;
+
+  /** Who may approve or deny a tool call in a shared channel. Defaults to the requester. */
+  toolApprovers?: 'requester' | 'anyone';
 
   /**
    * Show platform typing indicators (and adaptive status text where supported,
@@ -103,7 +179,8 @@ export type ToolDisplay = 'cards' | 'text' | 'timeline' | 'grouped' | 'hidden' |
  * result, error, approval). Returns either a postable message (closes the
  * streaming session if open, posts/edits the message, then reopens on the
  * next chunk), a streaming chunk (pushed into the streaming session — opens
- * one lazily if needed), or `undefined` to skip the event.
+ * one lazily if needed unless `openIfEmpty` is `false`), or `undefined` to
+ * skip the event.
  *
  * In static drivers (`streaming: false`), returning `{ kind: 'stream' }`
  * flattens the chunk to a plain-text fallback message.
@@ -159,6 +236,36 @@ export type ToolDisplayEvent =
       displayName: string;
       argsSummary: string;
       args: unknown;
+    }
+  /**
+   * Fired once after the user approves an approval card. Only `post` results
+   * are honored: the returned message replaces the approval card in place.
+   * Returning nothing (or a blank message) keeps the default "Approved" card.
+   * `byUser` is the approving user's name, or undefined in DMs.
+   */
+  | {
+      kind: 'approved';
+      toolCallId: string;
+      toolName: string;
+      displayName: string;
+      argsSummary: string;
+      args: unknown;
+      byUser?: string;
+    }
+  /**
+   * Fired once after the user denies an approval card. Only `post` results
+   * are honored: the returned message replaces the approval card in place.
+   * Returning nothing (or a blank message) keeps the default "Denied" card.
+   * `byUser` is the denying user's name, or undefined in DMs.
+   */
+  | {
+      kind: 'denied';
+      toolCallId: string;
+      toolName: string;
+      displayName: string;
+      argsSummary: string;
+      args: unknown;
+      byUser?: string;
     };
 
 /** Context about which driver is consuming the function-form result. */
@@ -172,7 +279,18 @@ export interface ToolDisplayContext {
 /** Return value from a {@link ToolDisplayFn}. */
 export type ToolDisplayResult =
   | { kind: 'post'; message: PostableMessage }
-  | { kind: 'stream'; chunk: StreamChunk }
+  | {
+      kind: 'stream';
+      chunk: StreamChunk;
+      /**
+       * Whether this result may open a streaming session when none is active.
+       * Set to `false` for chunks that only apply to an existing session.
+       * Ignored by the static driver.
+       *
+       * @default true
+       */
+      openIfEmpty?: boolean;
+    }
   | undefined
   | void;
 
@@ -287,23 +405,95 @@ export interface ChannelAdapterLegacyConfig extends ChannelAdapterBaseConfig {
 }
 
 /**
+ * Runtime context passed to a {@link ChannelHandler} as its 4th argument.
+ *
+ * Carries handles the channels instance already resolves internally so a
+ * custom handler doesn't have to be injected with them.
+ */
+export interface ChannelHandlerContext {
+  /** The Mastra instance that owns the channels, resolved from the bound agent or controller. */
+  mastra?: Mastra;
+  /**
+   * The request context used when this message starts a run, constructed fresh
+   * per message. A message delivered to an already-active run does not replace
+   * that run's request context.
+   *
+   * A handler may write to it before calling `defaultHandler` — for example to
+   * stamp the tenant a channel sender maps to, so the run resolves that user's
+   * credentials. Core adds the channel and render-context entries afterward and
+   * uses this same instance when the Signal wakes an idle run.
+   */
+  requestContext: RequestContext;
+  /**
+   * Metadata attached to this message's Agent Signal, constructed fresh per
+   * message. A handler may add JSON-serializable, non-sensitive values before
+   * calling `defaultHandler`. Signal metadata may be persisted and published
+   * through PubSub. Unlike run-level request context, it follows the message
+   * through both idle `wake` and active `deliver` paths.
+   */
+  readonly signalMetadata: Record<string, unknown>;
+  /**
+   * Earlier messages from the same sender that the Chat SDK batched into this
+   * turn when a `chatOptions.concurrency` strategy such as `burst`, `debounce`,
+   * or `queue` is set, oldest first. Empty when nothing was batched. A batch
+   * spanning several senders is split into one turn per sender; the handler is
+   * called once per turn with its own context, and `defaultHandler` dispatches
+   * that turn.
+   */
+  readonly skipped: readonly Message[];
+}
+
+/**
  * Handler function for channel events.
- * Receives the thread, message, and the default handler implementation.
+ * Receives the thread, message, the default handler implementation, and a
+ * runtime context ({@link ChannelHandlerContext}) carrying the resolved Mastra
+ * instance.
  * Call `defaultHandler` to run the built-in behavior, or ignore it to fully replace.
  */
 export type ChannelHandler = (
   thread: Thread,
   message: Message,
   defaultHandler: (thread: Thread, message: Message) => Promise<void>,
+  ctx: ChannelHandlerContext,
 ) => Promise<void>;
 
 /**
  * Handler configuration for channel events.
  * - `undefined` or omitted → use default handler
  * - `false` → disable handler entirely
- * - function → custom handler (receives defaultHandler as 3rd arg to wrap/extend)
+ * - function → custom handler (receives defaultHandler as 3rd arg and a
+ *   {@link ChannelHandlerContext} as 4th arg to wrap/extend)
  */
 export type ChannelHandlerConfig = ChannelHandler | false | undefined;
+
+/**
+ * Handler function for slash command events.
+ * Receives the original Chat SDK event, the default handler implementation,
+ * and a runtime context carrying the resolved Mastra instance.
+ */
+export type SlashCommandChannelHandler = (
+  event: SlashCommandEvent,
+  defaultHandler: () => Promise<void>,
+  ctx: ChannelHandlerContext,
+) => Promise<void>;
+
+/** Configuration for slash command handling. */
+export type SlashCommandChannelHandlerConfig = SlashCommandChannelHandler | false | undefined;
+
+/**
+ * Handler function for action events (button clicks, select changes).
+ * Receives the original Chat SDK event, the default handler implementation
+ * (built-in tool approval card handling; a no-op for other action ids), and a
+ * runtime context carrying the resolved Mastra instance.
+ */
+export type ActionChannelHandler = (
+  event: ActionEvent,
+  defaultHandler: () => Promise<void>,
+  ctx: ChannelHandlerContext,
+) => Promise<void>;
+
+/** Configuration for action handling. */
+export type ActionChannelHandlerConfig = ActionChannelHandler | false | undefined;
 
 /**
  * Context passed to {@link ChannelConfig.resolveResourceId}.
@@ -319,6 +509,8 @@ export interface ResolveResourceIdContext {
   message: Message;
   /** The built-in default: `${platform}:${message.author.userId}`. Return this to keep current behavior. */
   defaultResourceId: string;
+  /** The per-message request context. Values set by channel handlers before `defaultHandler` runs are visible here. */
+  requestContext: RequestContext;
 }
 
 /**
@@ -343,6 +535,8 @@ export interface ResolveThreadIdContext {
   resourceId: string;
   /** The built-in default: a random UUID. Return this to keep current behavior. */
   defaultThreadId: string;
+  /** The per-message request context. Values set by channel handlers before `defaultHandler` runs are visible here. */
+  requestContext: RequestContext;
 }
 
 /**
@@ -367,10 +561,31 @@ export interface ChannelHandlers {
   onMention?: ChannelHandlerConfig;
 
   /**
+   * Handler for messages that neither mention the bot nor belong to a subscribed thread.
+   * Opt-in: registered only when a function is supplied; omitted or false ignores these messages.
+   * Calling defaultHandler runs the agent, posts the response, and subscribes the thread.
+   */
+  onMessage?: ChannelHandlerConfig;
+
+  /**
    * Handler for messages in subscribed threads.
    * Default: Routes to agent.stream and posts the response.
    */
   onSubscribedMessage?: ChannelHandlerConfig;
+
+  /**
+   * Handler for slash commands.
+   * Default: Routes the command and its arguments to agent.stream and posts the response.
+   */
+  onSlashCommand?: SlashCommandChannelHandlerConfig;
+
+  /**
+   * Handler for action events (button clicks, select changes).
+   * Default: Handles the built-in tool approval cards
+   * (`tool_approve:<toolCallId>` / `tool_deny:<toolCallId>`) and ignores other action ids.
+   * Setting `false` also disables the built-in tool approval buttons.
+   */
+  onAction?: ActionChannelHandlerConfig;
 }
 
 /** Configuration for agent chat channels. */
@@ -457,6 +672,17 @@ export interface ChannelConfig {
    * ```
    */
   inlineLinks?: InlineLinkEntry[];
+
+  /**
+   * Total bytes of channel attachments the agent may store under
+   * `channel-attachments/` in its workspace. Binary attachments that need an
+   * authenticated download (e.g. Slack files) are saved there so workspace
+   * tools can open them. When saving a file would go over this limit, the
+   * agent gets the attachment URL instead and nothing is written.
+   *
+   * @default 104857600 (100 MiB)
+   */
+  maxAttachmentStorageBytes?: number;
 
   /** State adapter for deduplication, locking, and subscriptions. Defaults to in-memory. */
   state?: StateAdapter;
@@ -756,9 +982,56 @@ export interface ChannelProvider {
 
   /**
    * List active installations for this platform.
-   * Returns public info only (no secrets).
+   * Returns public info only (no secrets). Must be a pure read — any state
+   * repair belongs in {@link reconcileInstallation}.
    */
   listInstallations?(): Promise<ChannelInstallationInfo[]>;
+
+  /**
+   * Reconcile an agent's installation with external platform state — e.g.
+   * confirm a pending install whose connect flow completed out-of-band, where
+   * the platform offers no callback. May persist changes, but only to this
+   * agent's installation: the server exposes it behind write authorization for
+   * that agent. Returns the (possibly updated) installation's public info, or
+   * `null` when the agent has no installation. Omit on platforms whose
+   * connect flows confirm synchronously or via webhook.
+   */
+  reconcileInstallation?(agentId: string): Promise<ChannelInstallationInfo | null>;
+}
+
+/**
+ * Context passed to a {@link ChannelsResolver} when Mastra invokes it.
+ * Mirrors the callback shape of `DynamicArgument` used for agent tools.
+ */
+export interface ChannelsResolverContext {
+  /** The Mastra instance resolving channels, when available. */
+  mastra?: Mastra;
+  /** Reserved for signature symmetry with per-request dynamic arguments; channel resolution is instance-scoped, not request-scoped. */
+  requestContext?: RequestContext;
+}
+
+/**
+ * A live channel-provider source, accepted by `Mastra({ channels })` in place
+ * of a static record. Lets an external system of record (e.g. the Mastra
+ * platform via `@mastra/connect`'s `channels()`) add or remove channel
+ * providers at runtime without redeploying the app.
+ *
+ * Contract:
+ * - **Callable** — returns the current provider map. Mastra invokes it on
+ *   `resolveChannels()`; the resolver owns freshness (caching/TTL), so calls
+ *   must be cheap when nothing changed.
+ * - **`getRoutes()`** — the union of API routes for *every* provider this
+ *   resolver can ever produce, available synchronously at Mastra
+ *   construction. Routes are mounted once, up front; providers late-bind, so
+ *   a route may exist before its provider has an active connection.
+ * - **Stability** — return the *same* provider instance across calls while
+ *   its underlying connection is unchanged. Mastra attaches and initializes
+ *   each distinct instance exactly once.
+ */
+export interface ChannelsResolver<TChannels extends Record<string, ChannelProvider> = Record<string, ChannelProvider>> {
+  (context?: ChannelsResolverContext): Promise<TChannels>;
+  /** Static route surface for every channel this resolver can produce. */
+  getRoutes(): ApiRoute[];
 }
 
 /**
@@ -807,6 +1080,8 @@ export type ChannelContext = {
   botUserId?: string;
   /** The bot's display name on this platform. */
   botUserName?: string;
+  /** The bot's current profile display name, when the adapter resolves one that differs from `botUserName`. */
+  botDisplayName?: string;
   /** The bot's mention string (e.g. '<@U123>' on Slack/Discord). */
   botMention?: string;
 };

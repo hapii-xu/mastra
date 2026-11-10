@@ -11,6 +11,8 @@ import type { StorageColumn, StorageResourceType, UpdateWorkflowStateOptions } f
 import type { StepResult, WorkflowRunState } from '@mastra/core/workflows';
 
 import { ConvexAdminClient } from '../client';
+import { fencedCaller } from '../run-fencing';
+import type { RunFenceCheck, StorageCaller } from '../run-fencing';
 import { TABLE_OBSERVATIONAL_MEMORY } from '../types';
 import type {
   ConvexStorageTable,
@@ -62,8 +64,19 @@ export function resolveConvexConfig(config: ConvexDomainConfig): ConvexAdminClie
 }
 
 export class ConvexDB extends MastraBase {
-  constructor(private readonly client: ConvexAdminClient) {
+  private readonly client: StorageCaller;
+
+  constructor(
+    readonly adminClient: ConvexAdminClient,
+    check?: RunFenceCheck,
+  ) {
     super({ name: 'convex-db' });
+    this.client = fencedCaller(adminClient, check);
+  }
+
+  /** This store with every write applied only while `check.fence` holds the run, or itself without a check. */
+  fenced(check: RunFenceCheck | undefined): ConvexDB {
+    return check ? new ConvexDB(this.adminClient, check) : this;
   }
 
   async hasColumn(_table: string, _column: string): Promise<boolean> {
@@ -148,16 +161,19 @@ export class ConvexDB extends MastraBase {
     tableName,
     id,
     record,
+    expected,
   }: {
     tableName: ConvexStorageTable;
     id: string;
     record: Record<string, any>;
+    expected?: Record<string, any>;
   }): Promise<boolean> {
     return this.client.callStorage<boolean>({
       op: 'patch',
       tableName,
       id,
       record: this.normalizePatch(record),
+      expected,
     });
   }
 
@@ -168,8 +184,8 @@ export class ConvexDB extends MastraBase {
     updatedAt,
   }: {
     id: string;
-    title: string;
-    metadata: Record<string, any>;
+    title?: string;
+    metadata?: Record<string, any>;
     updatedAt: Date;
   }): Promise<(Omit<StorageThreadType, 'createdAt' | 'updatedAt'> & { createdAt: string; updatedAt: string }) | null> {
     return this.client.callStorage({
@@ -263,12 +279,14 @@ export class ConvexDB extends MastraBase {
     stepId,
     result,
     requestContext,
+    state,
   }: {
     workflowName: string;
     runId: string;
     stepId: string;
     result: StepResult<any, any, any, any>;
     requestContext: Record<string, any>;
+    state?: Record<string, any>;
   }): Promise<Record<string, StepResult<any, any, any, any>>> {
     const context = await this.client.callStorage<string>({
       op: 'mergeWorkflowStepResult',
@@ -278,6 +296,7 @@ export class ConvexDB extends MastraBase {
       stepId,
       result: JSON.stringify(result),
       requestContext: JSON.stringify(requestContext),
+      ...(state === undefined ? {} : { state: JSON.stringify(state) }),
     });
     if (!context) {
       throw new Error(`Convex workflow step merge returned no context for runId ${runId}`);
@@ -293,14 +312,27 @@ export class ConvexDB extends MastraBase {
     workflowName: string;
     runId: string;
     opts: UpdateWorkflowStateOptions;
-  }): Promise<WorkflowRunState> {
-    const snapshot = await this.client.callStorage<string>({
-      op: 'mergeWorkflowState',
-      tableName: TABLE_WORKFLOW_SNAPSHOT,
-      workflowName,
-      runId,
-      opts: JSON.stringify(opts),
-    });
+  }): Promise<WorkflowRunState | undefined> {
+    let snapshot: string;
+    try {
+      snapshot = await this.client.callStorage<string>({
+        op: 'mergeWorkflowState',
+        tableName: TABLE_WORKFLOW_SNAPSHOT,
+        workflowName,
+        runId,
+        opts: JSON.stringify(opts),
+      });
+    } catch (error) {
+      // Missing run resolves to undefined, matching the other storage adapters.
+      if (error instanceof Error && error.message.startsWith('Workflow snapshot not found for runId')) {
+        return undefined;
+      }
+      throw error;
+    }
+    if (snapshot === '') {
+      // The `expectedStatus` guard did not match, so the server applied nothing.
+      return undefined;
+    }
     if (!snapshot) {
       throw new Error(`Convex workflow state merge returned no snapshot for runId ${runId}`);
     }
@@ -346,12 +378,14 @@ export class ConvexDB extends MastraBase {
     newNextFireAt,
     lastFireAt,
     lastRunId,
+    newStatus,
   }: {
     id: string;
     expectedNextFireAt: number;
     newNextFireAt: number;
     lastFireAt: number;
     lastRunId: string;
+    newStatus?: string;
   }): Promise<boolean> {
     return this.client.callStorage<boolean>({
       op: 'updateScheduleNextFire',
@@ -361,6 +395,7 @@ export class ConvexDB extends MastraBase {
       newNextFireAt,
       lastFireAt,
       lastRunId,
+      newStatus,
     });
   }
 
@@ -426,6 +461,11 @@ export class ConvexDB extends MastraBase {
     from?: string;
     to?: string;
     offset?: number;
+    groupId?: string;
+    recordId?: string;
+    beforeGeneration?: number;
+    afterGeneration?: number;
+    sortDirection?: 'ASC' | 'DESC';
   }): Promise<R[]> {
     return this.client.callStorage<R[]>({
       op: 'omGetHistory',
@@ -434,28 +474,72 @@ export class ConvexDB extends MastraBase {
     });
   }
 
-  public async omUpdateActive(args: {
+  public async omInitialize<R>(record: Record<string, unknown> & { id: string; lookupKey: string }): Promise<R | null> {
+    return this.client.callStorage<R | null>({
+      op: 'omInitialize',
+      tableName: TABLE_OBSERVATIONAL_MEMORY,
+      record,
+    });
+  }
+
+  public async omCreateReflectionGeneration<R>(args: {
+    currentRecord: SerializedOMCurrentRecord;
+    newId: string;
+    reflection: string;
+    tokenCount: number;
+    now: string;
+  }): Promise<R | null> {
+    return this.client.callStorage<R | null>({
+      op: 'omCreateReflectionGeneration',
+      tableName: TABLE_OBSERVATIONAL_MEMORY,
+      ...args,
+    });
+  }
+
+  public async omSetPendingMessageTokens(args: { id: string; tokenCount: number; updatedAt: string }): Promise<void> {
+    await this.client.callStorage({
+      op: 'omSetPendingMessageTokens',
+      tableName: TABLE_OBSERVATIONAL_MEMORY,
+      ...args,
+    });
+  }
+
+  public async omSetBufferingObservationFlag(args: {
+    id: string;
+    isBuffering: boolean;
+    lastBufferedAtTokens?: number;
+    updatedAt: string;
+  }): Promise<void> {
+    await this.client.callStorage({
+      op: 'omSetBufferingObservationFlag',
+      tableName: TABLE_OBSERVATIONAL_MEMORY,
+      ...args,
+    });
+  }
+
+  public async omUpdateActive<R>(args: {
     id: string;
     observations: string;
     tokenCount: number;
     lastObservedAt: string;
     observedMessageIds: string[] | null;
     updatedAt: string;
-  }): Promise<void> {
-    await this.client.callStorage({
+    expectedActiveObservations?: string;
+  }): Promise<R> {
+    return this.client.callStorage<R>({
       op: 'omUpdateActive',
       tableName: TABLE_OBSERVATIONAL_MEMORY,
       ...args,
     });
   }
 
-  public async omAppendBufferedChunk(args: {
+  public async omAppendBufferedChunk<R>(args: {
     id: string;
     chunk: SerializedOMChunk;
     lastBufferedAtTime?: string;
     updatedAt: string;
-  }): Promise<void> {
-    await this.client.callStorage({
+  }): Promise<R> {
+    return this.client.callStorage<R>({
       op: 'omAppendBufferedChunk',
       tableName: TABLE_OBSERVATIONAL_MEMORY,
       ...args,
@@ -499,8 +583,8 @@ export class ConvexDB extends MastraBase {
     newId: string;
     tokenCount: number;
     now: string;
-  }): Promise<R> {
-    return this.client.callStorage<R>({
+  }): Promise<R | null> {
+    return this.client.callStorage<R | null>({
       op: 'omSwapBufferedReflection',
       tableName: TABLE_OBSERVATIONAL_MEMORY,
       ...args,

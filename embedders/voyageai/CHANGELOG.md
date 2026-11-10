@@ -1,5 +1,113 @@
 # @mastra/voyageai
 
+## 0.4.3
+
+### Patch Changes
+
+- dependencies updates: ([#28417](https://github.com/mastra-ai/mastra/pull/28417))
+  - Updated dependency [`@types/node@22.19.15` ↗︎](https://www.npmjs.com/package/@types/node/v/22.19.15) (from `22.20.5`, in `devDependencies`)
+
+## 0.4.3-alpha.0
+
+### Patch Changes
+
+- dependencies updates: ([#28417](https://github.com/mastra-ai/mastra/pull/28417))
+  - Updated dependency [`@types/node@22.19.15` ↗︎](https://www.npmjs.com/package/@types/node/v/22.19.15) (from `22.20.5`, in `devDependencies`)
+
+## 0.4.2
+
+### Patch Changes
+
+- Added support for the `voyage-code-4` code embedding model. It defaults to 1024 dimensions and also supports 256, 512 and 2048. ([#27761](https://github.com/mastra-ai/mastra/pull/27761))
+
+  ```typescript
+  import { createVoyageTextEmbedding } from '@mastra/voyageai';
+
+  const embedder = createVoyageTextEmbedding({ model: 'voyage-code-4', inputType: 'document' });
+  ```
+
+- Bump for npm ([#27221](https://github.com/mastra-ai/mastra/pull/27221))
+
+## 0.4.2-alpha.1
+
+### Patch Changes
+
+- Added support for the `voyage-code-4` code embedding model. It defaults to 1024 dimensions and also supports 256, 512 and 2048. ([#27761](https://github.com/mastra-ai/mastra/pull/27761))
+
+  ```typescript
+  import { createVoyageTextEmbedding } from '@mastra/voyageai';
+
+  const embedder = createVoyageTextEmbedding({ model: 'voyage-code-4', inputType: 'document' });
+  ```
+
+## 0.4.2-alpha.0
+
+### Patch Changes
+
+- Bump for npm ([#27221](https://github.com/mastra-ai/mastra/pull/27221))
+
+## 0.4.1
+
+### Patch Changes
+
+- Update README to include accurate, up-to-date information ([#22858](https://github.com/mastra-ai/mastra/pull/22858))
+
+- Remove `CHANGELOG.md` from distributed npm files resulting in reduced package size ([#22737](https://github.com/mastra-ai/mastra/pull/22737))
+
+## 0.4.1-alpha.1
+
+### Patch Changes
+
+- Update README to include accurate, up-to-date information ([#22858](https://github.com/mastra-ai/mastra/pull/22858))
+
+## 0.4.1-alpha.0
+
+### Patch Changes
+
+- Remove `CHANGELOG.md` from distributed npm files resulting in reduced package size ([#22737](https://github.com/mastra-ai/mastra/pull/22737))
+
+## 0.4.0
+
+### Minor Changes
+
+- Fixed VoyageAI multimodal embeddings sending text as bare strings (the API rejected the payload) and added a `baseUrl` option so you can point the embedder, reranker, and contextualized models at a provider-hosted Voyage endpoint. ([#19804](https://github.com/mastra-ai/mastra/pull/19804))
+
+  **Before**
+
+  ```ts
+  // multimodal text was serialized as inputs: [["text"]] -> HTTP 400
+  ```
+
+  **After**
+
+  ```ts
+  const embedder = voyage.multimodalEmbedding({
+    model: 'voyage-multimodal-3.5',
+    baseUrl: 'https://ai.mongodb.com/v1',
+  });
+  ```
+
+## 0.4.0-alpha.0
+
+### Minor Changes
+
+- Fixed VoyageAI multimodal embeddings sending text as bare strings (the API rejected the payload) and added a `baseUrl` option so you can point the embedder, reranker, and contextualized models at a provider-hosted Voyage endpoint. ([#19804](https://github.com/mastra-ai/mastra/pull/19804))
+
+  **Before**
+
+  ```ts
+  // multimodal text was serialized as inputs: [["text"]] -> HTTP 400
+  ```
+
+  **After**
+
+  ```ts
+  const embedder = voyage.multimodalEmbedding({
+    model: 'voyage-multimodal-3.5',
+    baseUrl: 'https://ai.mongodb.com/v1',
+  });
+  ```
+
 ## 0.3.0
 
 ### Minor Changes

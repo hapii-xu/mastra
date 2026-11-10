@@ -1,5 +1,6 @@
 import { createAnthropic } from '@ai-sdk/anthropic';
 import { createOpenAI } from '@ai-sdk/openai';
+import type { ToolsInput } from '@mastra/core/agent';
 import type { AgentControllerRequestContext } from '@mastra/core/agent-controller';
 import { createNotificationInboxTool, NotificationsStorage } from '@mastra/core/notifications';
 import type {
@@ -7,22 +8,37 @@ import type {
   ListDueNotificationsInput,
   ListNotificationsInput,
   UpdateNotificationInput,
+  UpdateNotificationsStatusInput,
 } from '@mastra/core/notifications';
 import type { RequestContext } from '@mastra/core/request-context';
 import type { MastraCompositeStore } from '@mastra/core/storage';
 import type { ToolAfterHookContext, ToolHooks } from '@mastra/core/tools';
+import { jsonSchema } from 'ai';
 import type { HookManager } from '../hooks/index.js';
 import type { McpManager } from '../mcp/index.js';
 import type { MastraCodeComposedState } from '../schema.js';
 import { MC_TOOLS } from '../tool-names.js';
-import { createWebSearchTool, createWebExtractTool, hasTavilyKey, requestSandboxAccessTool } from '../tools/index.js';
+import { createConfiguredWebTools, requestSandboxAccessTool } from '../tools/index.js';
+import { createWorkflowTool } from '../tools/workflows/create-workflow.js';
+import { deleteWorkflowTool } from '../tools/workflows/delete-workflow.js';
+import { getWorkflowTool } from '../tools/workflows/get-workflow.js';
+import { listWorkflowsTool } from '../tools/workflows/list-workflows.js';
+import { runWorkflowTool } from '../tools/workflows/run-workflow.js';
+import { WORKFLOW_MANAGEMENT_TOOL_IDS } from '../tools/workflows/tool-ids.js';
+import { prepareProviderWebSearchRoute, resolveProviderWebSearchRoute } from './model.js';
+import type { ProviderWebSearchRoute } from './model.js';
 
 /** Minimal shape for tools passed to createDynamicTools. */
 export type ToolLike = {
   execute?: (...args: any[]) => Promise<unknown> | unknown;
 } & Record<string, any>;
 
-class LazyNotificationsStorage extends NotificationsStorage {
+function configurePluginTool(tool: ToolLike, backgroundToolsEnabled: boolean): ToolLike {
+  if (backgroundToolsEnabled || !tool.background) return tool;
+  return { ...tool, background: { ...tool.background, enabled: false } };
+}
+
+export class LazyNotificationsStorage extends NotificationsStorage {
   constructor(private readonly storage: MastraCompositeStore) {
     super();
   }
@@ -53,6 +69,10 @@ class LazyNotificationsStorage extends NotificationsStorage {
 
   async updateNotification(input: UpdateNotificationInput) {
     return (await this.getNotificationsStorage()).updateNotification(input);
+  }
+
+  override async updateNotificationsStatus(input: UpdateNotificationsStatusInput) {
+    return (await this.getNotificationsStorage()).updateNotificationsStatus(input);
   }
 
   async dangerouslyClearAll() {
@@ -106,31 +126,67 @@ type DynamicToolProvider =
       requestContext: RequestContext;
     }) => Record<string, ToolLike | undefined> | Promise<Record<string, ToolLike | undefined>>);
 
+/**
+ * The provider-executed search tool for a route. The Mastra gateway's OpenRouter
+ * chat endpoint takes `openrouter:web_search` (the OpenRouter provider sends a
+ * provider tool `openrouter.web_search` with that type), as Mastra's own
+ * templates use against the gateway.
+ */
+function createProviderWebSearchTool(route: ProviderWebSearchRoute): ToolLike {
+  switch (route) {
+    case 'anthropic':
+      return createAnthropic({}).tools.webSearch_20250305();
+    case 'openai':
+      return createOpenAI({}).tools.webSearch();
+    case 'mastra-gateway':
+      return {
+        type: 'provider',
+        id: 'openrouter.web_search',
+        args: {},
+        inputSchema: jsonSchema({ type: 'object', properties: {} }),
+      } as unknown as ToolLike;
+  }
+}
+
 export function createDynamicTools(
   mcpManager?: McpManager,
   extraTools?: DynamicToolProvider,
   disabledTools?: string[],
   storage?: MastraCompositeStore,
   pluginTools?: Record<string, ToolLike>,
+  backgroundToolsEnabled = false,
+  builtinTools?: Record<string, ToolLike>,
 ) {
   return function getDynamicTools({
     requestContext,
   }: {
     requestContext: RequestContext;
-  }): Record<string, ToolLike> | Promise<Record<string, ToolLike>> {
+  }): ToolsInput | Promise<ToolsInput> {
     const ctx = requestContext.get('controller') as AgentControllerRequestContext<MastraCodeComposedState> | undefined;
     const state = ctx?.getState();
 
-    const modelId = ctx?.session?.modelId;
-    const isAnthropicModel = modelId?.startsWith('anthropic/');
-    const isOpenAIModel = modelId?.startsWith('openai/');
+    // In deployed Factory, the search route reads tenant credentials; prepare them first if needed.
+    const preparing = prepareProviderWebSearchRoute(ctx?.session?.modelId, { requestContext });
+    if (preparing) return preparing.then(() => getDynamicTools({ requestContext }));
+    const webSearchRoute = resolveProviderWebSearchRoute(ctx?.session?.modelId, { requestContext });
 
     // Filesystem, grep, glob, edit, write, execute_command, and process
     // management tools are now provided by the workspace (see workspace.ts).
     // Only tools without a workspace equivalent remain here.
     const tools: Record<string, ToolLike> = {
       request_access: requestSandboxAccessTool,
+      // Workflow surface. `create-workflow` delegates to the workflow-builder
+      // sub-agent; the other four are Dynamic Workflow management operations.
+      // Permission categories live in permissions.ts (TOOL_CATEGORY_MAP).
+      [WORKFLOW_MANAGEMENT_TOOL_IDS.createWorkflow]: createWorkflowTool,
+      [WORKFLOW_MANAGEMENT_TOOL_IDS.listWorkflows]: listWorkflowsTool,
+      [WORKFLOW_MANAGEMENT_TOOL_IDS.getWorkflow]: getWorkflowTool,
+      [WORKFLOW_MANAGEMENT_TOOL_IDS.runWorkflow]: runWorkflowTool,
+      [WORKFLOW_MANAGEMENT_TOOL_IDS.deleteWorkflow]: deleteWorkflowTool,
     };
+
+    // Opt-in built-ins (e.g. the experimental schedule tools).
+    if (builtinTools) Object.assign(tools, builtinTools);
 
     if (storage) {
       tools[MC_TOOLS.NOTIFICATION_INBOX] = createNotificationInboxTool({
@@ -138,21 +194,14 @@ export function createDynamicTools(
       });
     }
 
-    if (hasTavilyKey()) {
-      tools.web_search = createWebSearchTool();
-      tools.web_extract = createWebExtractTool();
-    } else if (isAnthropicModel) {
-      const anthropic = createAnthropic({});
-      tools.web_search = anthropic.tools.webSearch_20250305();
-    } else if (isOpenAIModel) {
-      const openai = createOpenAI({});
-      tools.web_search = openai.tools.webSearch();
+    // Async only when a Tavily/Parallel key is set; otherwise the tool list stays synchronous.
+    const configuredWebTools = createConfiguredWebTools();
+    if (!configuredWebTools && webSearchRoute) {
+      tools.web_search = createProviderWebSearchTool(webSearchRoute);
     }
 
-    if (mcpManager) {
-      const mcpTools = mcpManager.getTools();
-      Object.assign(tools, mcpTools);
-    }
+    const mcpTools = mcpManager?.getTools();
+    if (mcpTools) Object.assign(tools, mcpTools);
 
     const finish = (resolvedExtra: Record<string, ToolLike | undefined> | undefined) => {
       if (resolvedExtra) {
@@ -166,7 +215,7 @@ export function createDynamicTools(
       if (pluginTools) {
         for (const [name, tool] of Object.entries(pluginTools)) {
           if (!(name in tools)) {
-            tools[name] = tool;
+            tools[name] = configurePluginTool(tool, backgroundToolsEnabled);
           }
         }
       }
@@ -188,18 +237,29 @@ export function createDynamicTools(
         }
       }
 
-      return tools;
+      return tools as ToolsInput;
     };
 
-    if (typeof extraTools === 'function') {
-      const resolved = extraTools({ requestContext });
-      // Stay synchronous for sync providers; only go async when the provider does.
-      if (resolved && typeof (resolved as PromiseLike<unknown>).then === 'function') {
-        return Promise.resolve(resolved).then(finish);
+    const resolveExtra = (): ToolsInput | Promise<ToolsInput> => {
+      if (typeof extraTools === 'function') {
+        const resolved = extraTools({ requestContext });
+        // Stay synchronous for sync providers; only go async when the provider does.
+        if (resolved && typeof (resolved as PromiseLike<unknown>).then === 'function') {
+          return Promise.resolve(resolved).then(finish);
+        }
+        return finish(resolved as Record<string, ToolLike | undefined>);
       }
-      return finish(resolved as Record<string, ToolLike | undefined>);
+      return finish(extraTools);
+    };
+
+    if (configuredWebTools) {
+      return configuredWebTools.then(webTools => {
+        // MCP tools keep precedence over the web tools, as when both were assigned in order.
+        Object.assign(tools, webTools, mcpTools);
+        return resolveExtra();
+      });
     }
 
-    return finish(extraTools);
+    return resolveExtra();
   };
 }

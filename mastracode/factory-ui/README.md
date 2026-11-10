@@ -1,0 +1,76 @@
+# Factory UI
+
+`@internal/factory-ui` is the Factory React application. It owns pages, client state, API access, and browser tests.
+
+## Development
+
+Complete the [repository setup](../README.md#setup) and [GitHub App setup](../web/README.md#configure-local-onboarding). Then start the Docker services, the API, and the Vite dev server:
+
+```shell
+pnpm --dir mastracode/web dev:ui
+```
+
+Open `http://localhost:5173`. To restart one side without losing the other, start the Docker services with `pnpm --dir mastracode/web db:up`, then run `pnpm --dir mastracode/web api` and `pnpm --filter ./mastracode/factory-ui dev` in separate terminals.
+
+Keep policy, validation, and persistence in [`@mastra/factory`](../factory/README.md), not in React.
+
+## Onboarding
+
+The onboarding Setup step offers three equal choices, one per existing `modelScope` creation value:
+
+| Choice                             | Scope     | Factory work                                  | Interactive sessions                             |
+| ---------------------------------- | --------- | --------------------------------------------- | ------------------------------------------------ |
+| Company account                    | `factory` | Organization credentials and Factory default  | Organization credentials and Factory default     |
+| Company work and personal sessions | `hybrid`  | Organization credentials and Factory default  | Session owner's personal credentials and default |
+| Personal accounts                  | `user`    | Work owner's personal credentials and default | Session owner's personal credentials and default |
+
+There is no fallback between account scopes. Each teammate configures their own personal account. Onboarding asks for one connection in `factory` or `user`, and a separate connection for each scope in `hybrid`. Existing scoped connections can be reused. Only organization key admins can add shared credentials; members can use connections already configured by an admin. When no company connection exists and the member cannot add one, Setup only offers personal accounts. Scope changes happen only in Setup, never as a side effect of a later step. Local servers without web authentication skip Setup and create a `factory` Factory, so sessions and Factory work share the model chosen in their single connection step.
+
+Model pickers and final confirmation use `/web/config/models?scope=org` or `?scope=user`; live session catalogs still resolve the session owner and policy before considering settings filters. Credentials are saved when connected. Factory creation and the applicable default-model writes happen on final confirmation; setting a personal default also affects other work using that person's default.
+
+The session-storage draft contains choices, never credentials. Legacy drafts without `modelScope` return to Setup with their repository and model preserved. Failed creation resumes the pending Factory; changing its scope recreates that unfinished Factory rather than bypassing the admin-only scope update. Preview fixtures and screenshot tooling stay outside this package.
+
+## Board views
+
+Boards open as a list grouped by workflow status. Click a status heading, or focus it and press Enter or Space, to collapse or expand its issues. Counts and create actions remain available when a group is collapsed; creating an issue or following an issue link reveals its group.
+
+Saved views can use either the list or Kanban layout. Existing saved views keep their selected layout.
+
+## Board activity
+
+Cards on the **Work** and **Review** boards show the last person recorded in the work item's audit history. Hover over the person's name or profile image to open the recent event timeline for that card.
+
+Factory stores actor names and profile images in audit event metadata when events are written. For older events without that metadata, Factory resolves actor profiles through the configured authentication provider and falls back to the stored actor ID and an initial.
+
+## Navigation
+
+Opening a Factory lands on its first board. The retired Activity, Overview, Attention, Metrics, and Audit URLs also open that Factory's board landing. Activity and Audit log are no longer offered in the sidebar or global search.
+
+Activity's unread badge, open-item dot, and attention chime are retired, including alerts for failed runs, mentions, and waiting agents. The Needs you and followed-discussion lists and their inbox read, archive, and restore actions are also removed. Board cards still offer failed-decision retries and proposal approval and dismissal.
+
+Successful run completions continue to use the live Ready indicator and completion sound on sidebar session rows.
+
+## Session titles
+
+Slack sessions use the same automatic title generation as web sessions, including the preceding Slack thread context available to the agent. Until naming succeeds, the sidebar shows the session's work item title, or its branch when it has none. Older sessions that still show the generic `slack conversation` label keep it until observational memory retitles the conversation or the owner regenerates the title.
+
+Owners can choose **Regenerate title** from a web or Slack session's sidebar menu to name it from its stored conversation. Regeneration uses the existing title model and does not start a workspace. Automatic naming failures leave the conversation usable; an explicit regeneration reports its error.
+
+## Settings
+
+The sidebar footer shows your profile picture (or an initial) and name, and links straight to settings, opening **Preferences**. **Preferences** holds the theme control (system, light, or dark appearance); **My account** shows your profile and holds **Log out**.
+
+Settings navigation groups pages by topic: **Account**, **Agent** (Models, Memory, Skills, Behavior), and **Factory**. **Models** picks the Factory's routing (`user`, `hybrid`, or `factory`) and shows the personal and Factory defaults side by side; the defaults the routing leaves unused fold behind a **Settings** toggle, which `#personal-defaults` / `#factory-defaults` links open, so they can be set up before switching routing. Chats never borrow from the defaults their routing leaves unused. Without a chosen model, a session starts on the built-in default model its keys can run, which the empty model picker shows as **Built-in default**; the New session page asks for a provider or a model only when no key can run it. Without a personal thinking level, a personal chat starts at medium. **Memory** holds personal and Factory observational memory. Retired `personal-models`, `factory-memory` and `environment` URLs redirect to Models, Memory and Repositories, and navigation stays searchable. **Back to app** returns to the page where settings was opened, including its filters, even after switching sections or reopening settings from the sidebar footer.
+
+## Tests
+
+Use unit tests for isolated code and MSW tests for pages, routes, hooks, mutations, and React Query behavior.
+
+```shell
+pnpm --filter ./mastracode/factory-ui test:unit
+pnpm --filter ./mastracode/factory-ui test:msw
+pnpm --filter ./mastracode/factory-ui typecheck
+pnpm --filter ./mastracode/factory-ui build
+```
+
+See [`AGENTS.md`](./AGENTS.md) for testing conventions.

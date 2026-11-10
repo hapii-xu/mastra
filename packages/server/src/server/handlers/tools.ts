@@ -18,7 +18,8 @@ import { createRoute } from '../server-adapter/routes/route-builder';
 
 import { getAgentFromSystem } from './agents';
 import { handleError } from './error';
-import { validateBody } from './utils';
+import { stripInjectedToolOverrideFields } from './tool-schema-overrides';
+import { getHandlerFGAProvider, validateBody } from './utils';
 
 /**
  * Resolves a schema that may be a lazy function (e.g. AI SDK provider tools).
@@ -41,10 +42,10 @@ function schemaToJsonSchema(schema: PublicSchema<unknown> | undefined) {
   return standardSchemaToJSONSchema(toStandardSchema(schema), { target: 'draft-2020-12' });
 }
 
-function serializeSchema(schema: unknown): string | undefined {
+function serializeSchema(schema: unknown, options?: { stripInjectedOverrides?: boolean }): string | undefined {
   const jsonSchema = schemaToJsonSchema(resolveLazySchema(schema) as PublicSchema<unknown> | undefined);
   if (jsonSchema === undefined) return undefined;
-  return stringify(jsonSchema);
+  return stringify(options?.stripInjectedOverrides ? stripInjectedToolOverrideFields(jsonSchema) : jsonSchema);
 }
 
 /**
@@ -100,7 +101,7 @@ function serializeTool(tool: any): any {
 
   return {
     ...tool,
-    inputSchema: serializeSchema(tool.inputSchema),
+    inputSchema: serializeSchema(tool.inputSchema, { stripInjectedOverrides: true }),
     outputSchema: serializeSchema(tool.outputSchema),
     requestContextSchema: serializeSchema(tool.requestContextSchema),
   };
@@ -148,16 +149,13 @@ export const LIST_TOOLS_ROUTE = createRoute({
         allTools[key] = tool;
       }
 
-      const serializedTools = Object.entries(allTools).reduce(
-        (acc, [id, _tool]) => {
-          acc[id] = serializeTool(_tool);
-          return acc;
-        },
-        {} as Record<string, any>,
-      );
+      const serializedTools = Object.entries(allTools).reduce<Record<string, any>>((acc, [id, _tool]) => {
+        acc[id] = serializeTool(_tool);
+        return acc;
+      }, {});
 
       // Filter tools by FGA if configured
-      const fgaProvider = mastra.getServer?.()?.fga;
+      const fgaProvider = getHandlerFGAProvider(mastra, requestContext);
       const user = requestContext?.get('user');
       if (fgaProvider && user) {
         const toolList = Object.entries(serializedTools).map(([id, t]) => ({ id, ...t }));

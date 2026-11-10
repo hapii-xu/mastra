@@ -1,13 +1,13 @@
 ---
 title: "Quick Checks | Evals"
-description: "Zero-LLM micro-scorers for fast, deterministic assertions on agent output text and tool usage."
+description: "Add fast, deterministic Quick Checks to Mastra evals for assertions on output text and tool calls without using an LLM or changing scorer workflows."
 packages:
   - "@mastra/evals"
 ---
 
-# Quick Checks
+# Quick checks
 
-Quick Checks are composable micro-scorers for common assertions like "output contains X" or "agent called tool Y." They require no LLM, run instantly, and plug into the same `scorers: [...]` array as any other scorer.
+Quick Checks are composable micro-scorers for common assertions like "output contains X" or "agent called tool Y." They run instantly without an LLM and plug into the same `scorers: [...]` array as any other scorer.
 
 ## When to use Quick Checks
 
@@ -40,7 +40,7 @@ console.log(result.scores)
 
 ## Available checks
 
-Quick Checks fall into two categories:
+Quick Checks fall into these categories:
 
 ### Text checks
 
@@ -50,7 +50,7 @@ These scorers evaluate the agent's text output:
 | - | - | - |
 | `checks.includes(str)` | Output contains substring | 1 or 0 |
 | `checks.excludes(str)` | Output doesn't contain substring | 1 or 0 |
-| `checks.equals(str)` | Output exactly equals string | 1 or 0 |
+| `checks.equals(str)` | Output equals string (case-insensitive by default; pass `{ ignoreCase: false }` for an exact match) | 1 or 0 |
 | `checks.matches(regex)` | Output matches regular expression | 1 or 0 |
 | `checks.similarity(str)` | Dice coefficient similarity to string | 0-1 (or binary with `threshold`) |
 
@@ -93,7 +93,7 @@ const result = await runEvals({
     checks.noToolErrors(),
 
     // LLM-based scorer (semantic, costs tokens)
-    createFaithfulnessScorer({ model: '__GATEWAY_OPENAI_MODEL_MINI__' }),
+    createFaithfulnessScorer({ model: '__GATEWAY_OPENAI_MODEL_LUNA__' }),
   ],
 })
 ```

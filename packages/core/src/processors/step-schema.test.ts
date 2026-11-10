@@ -274,12 +274,13 @@ describe('ProcessorInputPhaseSchema', () => {
 });
 
 describe('ProcessorInputStepPhaseSchema', () => {
-  it('accepts valid inputStep phase with stepNumber', () =>
+  it('accepts valid inputStep phase with stepNumber and runId', () =>
     ok(ProcessorInputStepPhaseSchema, {
       phase: 'inputStep',
       messages: [baseMsg],
       messageList: fakeMessageList,
       stepNumber: 0,
+      runId: 'run-123',
     }));
   it('rejects missing stepNumber', () =>
     fail(ProcessorInputStepPhaseSchema, { phase: 'inputStep', messages: [], messageList: fakeMessageList }));
@@ -321,6 +322,22 @@ describe('ProcessorOutputResultPhaseSchema', () => {
       messages: [],
       messageList: fakeMessageList,
       result: { text: 'hi', usage: {}, finishReason: 'stop', steps: [] },
+    }));
+  it('keeps inputAccepted on the result when parsing', () => {
+    const parsed = ProcessorOutputResultPhaseSchema.parse({
+      phase: 'outputResult',
+      messages: [],
+      messageList: fakeMessageList,
+      result: { text: '', usage: {}, finishReason: 'error', steps: [], inputAccepted: true },
+    });
+    expect(parsed.result?.inputAccepted).toBe(true);
+  });
+  it('rejects a non-boolean inputAccepted', () =>
+    fail(ProcessorOutputResultPhaseSchema, {
+      phase: 'outputResult',
+      messages: [],
+      messageList: fakeMessageList,
+      result: { text: '', usage: {}, finishReason: 'error', steps: [], inputAccepted: 'yes' },
     }));
   it('rejects wrong phase', () =>
     fail(ProcessorOutputResultPhaseSchema, { phase: 'input', messages: [], messageList: fakeMessageList }));

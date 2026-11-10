@@ -1,0 +1,606 @@
+import { ErrorCategory, ErrorDomain, MastraError } from '@mastra/core/error';
+import {
+  createStorageErrorId,
+  isRunFenceConflictError,
+  normalizePerPage,
+  resolveRunFence,
+  TABLE_WORKFLOW_RUN_OWNERS,
+  TABLE_WORKFLOW_SNAPSHOT,
+  matchesExpectedWorkflowStatus,
+  WorkflowsStorage,
+  ensureDate,
+} from '@mastra/core/storage';
+import type {
+  ClaimRunOwnershipInput,
+  ClaimRunOwnershipResult,
+  RenewRunOwnershipInput,
+  RenewRunOwnershipResult,
+  RunFence,
+  RunOwnershipRecord,
+  StorageListWorkflowRunsInput,
+  WorkflowRun,
+  WorkflowRuns,
+  UpdateWorkflowStateOptions,
+} from '@mastra/core/storage';
+import type { StepResult, WorkflowRunState } from '@mastra/core/workflows';
+
+import { ValkeyDB } from '../../db';
+import type { ValkeyDomainConfig } from '../../db';
+import type { ValkeyClient } from '../../types';
+import {
+  claimRunOwnership,
+  getRunOwnership,
+  releaseRunOwnership,
+  renewRunOwnership,
+  runClaimKey,
+  writeBatch,
+} from '../run-fencing';
+import type { RunFenceCheck } from '../run-fencing';
+import { getKey, processRecord } from '../utils';
+
+function parseWorkflowRun(row: Record<string, unknown>): WorkflowRun {
+  let parsedSnapshot: WorkflowRunState | string = row.snapshot as string;
+  if (typeof parsedSnapshot === 'string') {
+    try {
+      parsedSnapshot = JSON.parse(row.snapshot as string) as WorkflowRunState;
+    } catch (e) {
+      console.warn(`Failed to parse snapshot for workflow ${row.workflow_name}: ${e}`);
+    }
+  }
+
+  return {
+    workflowName: row.workflow_name as string,
+    runId: row.run_id as string,
+    snapshot: parsedSnapshot,
+    createdAt: ensureDate(row.createdAt as string | Date)!,
+    updatedAt: ensureDate(row.updatedAt as string | Date)!,
+    resourceId: row.resourceId as string | undefined,
+  };
+}
+
+export class WorkflowsValkey extends WorkflowsStorage {
+  private client: ValkeyClient;
+  private db: ValkeyDB;
+
+  constructor(config: ValkeyDomainConfig) {
+    super();
+    this.client = config.client;
+    this.db = new ValkeyDB({ client: config.client });
+  }
+
+  public supportsConcurrentUpdates(): boolean {
+    return false;
+  }
+
+  public override supportsRunFencing(): boolean {
+    return true;
+  }
+
+  public async dangerouslyClearAll(): Promise<void> {
+    await this.db.deleteData({ tableName: TABLE_WORKFLOW_SNAPSHOT });
+    await this.db.scanAndDelete(`${runClaimKey(TABLE_WORKFLOW_RUN_OWNERS, '')}*`);
+  }
+
+  #runFenceCheck(fence: RunFence | undefined, runId: string, operation: string): RunFenceCheck | undefined {
+    const resolved = resolveRunFence(this, fence, runId);
+    return resolved && { claims: TABLE_WORKFLOW_RUN_OWNERS, fence: resolved, operation };
+  }
+
+  #ownershipError(operation: string, runId: string, error: unknown): MastraError {
+    return new MastraError(
+      {
+        id: createStorageErrorId('VALKEY', operation, 'FAILED'),
+        domain: ErrorDomain.STORAGE,
+        category: ErrorCategory.THIRD_PARTY,
+        details: { runId },
+      },
+      error,
+    );
+  }
+
+  // Each operation is one script over the run's ownership hash, so racing
+  // claimers and renewals serialize on Valkey and resolve to a single winner.
+  public override async claimRunOwnership(args: ClaimRunOwnershipInput): Promise<ClaimRunOwnershipResult> {
+    try {
+      return await claimRunOwnership(this.client, args);
+    } catch (error) {
+      throw this.#ownershipError('CLAIM_RUN_OWNERSHIP', args.runId, error);
+    }
+  }
+
+  public override async renewRunOwnership(args: RenewRunOwnershipInput): Promise<RenewRunOwnershipResult> {
+    try {
+      return await renewRunOwnership(this.client, args);
+    } catch (error) {
+      throw this.#ownershipError('RENEW_RUN_OWNERSHIP', args.runId, error);
+    }
+  }
+
+  public override async releaseRunOwnership(fence: RunFence): Promise<boolean> {
+    try {
+      return await releaseRunOwnership(this.client, fence);
+    } catch (error) {
+      throw this.#ownershipError('RELEASE_RUN_OWNERSHIP', fence.runId, error);
+    }
+  }
+
+  public override async getRunOwnership({ runId }: { runId: string }): Promise<RunOwnershipRecord | null> {
+    try {
+      return await getRunOwnership(this.client, runId);
+    } catch (error) {
+      throw this.#ownershipError('GET_RUN_OWNERSHIP', runId, error);
+    }
+  }
+
+  public async updateWorkflowResults({
+    workflowName,
+    runId,
+    stepId,
+    result,
+    requestContext,
+    state,
+    fence,
+  }: {
+    workflowName: string;
+    runId: string;
+    stepId: string;
+    result: StepResult<unknown, unknown, unknown, unknown>;
+    requestContext: Record<string, unknown>;
+    state?: Record<string, unknown>;
+    fence?: RunFence;
+  }): Promise<Record<string, StepResult<unknown, unknown, unknown, unknown>>> {
+    const resolvedFence = resolveRunFence(this, fence, runId);
+    try {
+      const existingRecord = await this.db.get<{
+        namespace: string;
+        workflow_name: string;
+        run_id: string;
+        snapshot: WorkflowRunState;
+        createdAt: string | Date;
+        updatedAt: string | Date;
+      }>({
+        tableName: TABLE_WORKFLOW_SNAPSHOT,
+        keys: {
+          namespace: 'workflows',
+          workflow_name: workflowName,
+          run_id: runId,
+        },
+      });
+
+      const existingSnapshot = existingRecord?.snapshot;
+      let snapshot = existingSnapshot;
+
+      if (!snapshot) {
+        snapshot = {
+          context: {},
+          activePaths: [],
+          timestamp: Date.now(),
+          suspendedPaths: {},
+          activeStepsPath: {},
+          resumeLabels: {},
+          serializedStepGraph: [],
+          status: 'pending',
+          value: {},
+          waitingPaths: {},
+          runId,
+          requestContext: {},
+        } as WorkflowRunState;
+      }
+
+      snapshot.context[stepId] = result;
+      if (state !== undefined) {
+        (snapshot.context as Record<string, unknown>).__state = state;
+      }
+      snapshot.requestContext = { ...snapshot.requestContext, ...requestContext };
+
+      await this.persistWorkflowSnapshot({
+        namespace: 'workflows',
+        workflowName,
+        runId,
+        snapshot,
+        createdAt: existingRecord?.createdAt ? ensureDate(existingRecord.createdAt) : undefined,
+        fence: resolvedFence,
+      });
+
+      return snapshot.context;
+    } catch (error) {
+      if (error instanceof MastraError) {
+        throw error;
+      }
+      throw new MastraError(
+        {
+          id: createStorageErrorId('VALKEY', 'UPDATE_WORKFLOW_RESULTS', 'FAILED'),
+          domain: ErrorDomain.STORAGE,
+          category: ErrorCategory.THIRD_PARTY,
+          details: { workflowName, runId, stepId },
+        },
+        error,
+      );
+    }
+  }
+
+  public async updateWorkflowState({
+    workflowName,
+    runId,
+    opts,
+    fence,
+  }: {
+    workflowName: string;
+    runId: string;
+    opts: UpdateWorkflowStateOptions;
+    fence?: RunFence;
+  }): Promise<WorkflowRunState | undefined> {
+    const resolvedFence = resolveRunFence(this, fence, runId);
+    try {
+      const existingRecord = await this.db.get<{
+        namespace: string;
+        workflow_name: string;
+        run_id: string;
+        snapshot: WorkflowRunState;
+        createdAt: string | Date;
+        updatedAt: string | Date;
+      }>({
+        tableName: TABLE_WORKFLOW_SNAPSHOT,
+        keys: {
+          namespace: 'workflows',
+          workflow_name: workflowName,
+          run_id: runId,
+        },
+      });
+
+      const existingSnapshot = existingRecord?.snapshot;
+
+      if (!existingSnapshot || !existingSnapshot.context) {
+        return undefined;
+      }
+
+      // Best-effort only: this store reports `supportsConcurrentUpdates() === false`, so the
+      // read and the write are not a single critical section.
+      const { expectedStatus, ...state } = opts;
+      if (!matchesExpectedWorkflowStatus(existingSnapshot.status, expectedStatus)) {
+        return undefined;
+      }
+
+      const updatedSnapshot = { ...existingSnapshot, ...state };
+
+      await this.persistWorkflowSnapshot({
+        namespace: 'workflows',
+        workflowName,
+        runId,
+        snapshot: updatedSnapshot,
+        createdAt: existingRecord?.createdAt ? ensureDate(existingRecord.createdAt) : undefined,
+        fence: resolvedFence,
+      });
+
+      return updatedSnapshot;
+    } catch (error) {
+      if (error instanceof MastraError) {
+        throw error;
+      }
+      throw new MastraError(
+        {
+          id: createStorageErrorId('VALKEY', 'UPDATE_WORKFLOW_STATE', 'FAILED'),
+          domain: ErrorDomain.STORAGE,
+          category: ErrorCategory.THIRD_PARTY,
+          details: { workflowName, runId },
+        },
+        error,
+      );
+    }
+  }
+
+  public async persistWorkflowSnapshot(params: {
+    namespace?: string;
+    workflowName: string;
+    runId: string;
+    resourceId?: string;
+    snapshot: WorkflowRunState;
+    createdAt?: Date;
+    updatedAt?: Date;
+    fence?: RunFence;
+  }): Promise<void> {
+    const { namespace = 'workflows', workflowName, runId, resourceId, snapshot, createdAt, updatedAt } = params;
+    const check = this.#runFenceCheck(params.fence, runId, 'persistWorkflowSnapshot');
+    try {
+      let finalCreatedAt = createdAt;
+      if (!finalCreatedAt) {
+        const existing = await this.db.get<{
+          namespace: string;
+          workflow_name: string;
+          run_id: string;
+          snapshot: WorkflowRunState;
+          createdAt: string | Date;
+          updatedAt: string | Date;
+        }>({
+          tableName: TABLE_WORKFLOW_SNAPSHOT,
+          keys: {
+            namespace,
+            workflow_name: workflowName,
+            run_id: runId,
+          },
+        });
+        finalCreatedAt = existing?.createdAt ? ensureDate(existing.createdAt) : new Date();
+      }
+
+      const { key, processedRecord } = processRecord(TABLE_WORKFLOW_SNAPSHOT, {
+        namespace,
+        workflow_name: workflowName,
+        run_id: runId,
+        resourceId,
+        snapshot,
+        createdAt: finalCreatedAt,
+        updatedAt: updatedAt ?? new Date(),
+      });
+      const batch = writeBatch(this.client, check);
+      batch.set(key, JSON.stringify(processedRecord));
+      await batch.exec();
+    } catch (error) {
+      if (isRunFenceConflictError(error)) throw error;
+      throw new MastraError(
+        {
+          id: createStorageErrorId('VALKEY', 'PERSIST_WORKFLOW_SNAPSHOT', 'FAILED'),
+          domain: ErrorDomain.STORAGE,
+          category: ErrorCategory.THIRD_PARTY,
+          details: {
+            namespace,
+            workflowName,
+            runId,
+          },
+        },
+        error,
+      );
+    }
+  }
+
+  public async loadWorkflowSnapshot(params: {
+    namespace: string;
+    workflowName: string;
+    runId: string;
+  }): Promise<WorkflowRunState | null> {
+    const { namespace = 'workflows', workflowName, runId } = params;
+    const key = getKey(TABLE_WORKFLOW_SNAPSHOT, {
+      namespace,
+      workflow_name: workflowName,
+      run_id: runId,
+    });
+    try {
+      const data = await this.client.get(key);
+      if (!data) {
+        return null;
+      }
+      const parsed = JSON.parse(data) as {
+        namespace: string;
+        workflow_name: string;
+        run_id: string;
+        snapshot: WorkflowRunState;
+      };
+      return parsed.snapshot;
+    } catch (error) {
+      throw new MastraError(
+        {
+          id: createStorageErrorId('VALKEY', 'LOAD_WORKFLOW_SNAPSHOT', 'FAILED'),
+          domain: ErrorDomain.STORAGE,
+          category: ErrorCategory.THIRD_PARTY,
+          details: {
+            namespace,
+            workflowName,
+            runId,
+          },
+        },
+        error,
+      );
+    }
+  }
+
+  public async getWorkflowRunById({
+    runId,
+    workflowName,
+  }: {
+    runId: string;
+    workflowName?: string;
+  }): Promise<WorkflowRun | null> {
+    try {
+      const key =
+        getKey(TABLE_WORKFLOW_SNAPSHOT, { namespace: 'workflows', workflow_name: workflowName, run_id: runId }) + '*';
+      const keys = await this.db.scanKeys(key);
+
+      if (keys.length === 0) {
+        return null;
+      }
+
+      const results = await this.client.mGet(keys);
+      const workflows = results
+        .filter((data): data is string => data !== null)
+        .map(
+          data =>
+            JSON.parse(data) as {
+              workflow_name: string;
+              run_id: string;
+              snapshot: WorkflowRunState | string;
+              createdAt: string | Date;
+              updatedAt: string | Date;
+              resourceId: string;
+            },
+        );
+
+      const data = workflows.find(workflow => {
+        if (!workflow) {
+          return false;
+        }
+
+        const runIdMatch = workflow.run_id === runId;
+
+        if (workflowName) {
+          return runIdMatch && workflow.workflow_name === workflowName;
+        }
+
+        return runIdMatch;
+      });
+
+      if (!data) {
+        return null;
+      }
+
+      return parseWorkflowRun(data as Record<string, unknown>);
+    } catch (error) {
+      throw new MastraError(
+        {
+          id: createStorageErrorId('VALKEY', 'GET_WORKFLOW_RUN_BY_ID', 'FAILED'),
+          domain: ErrorDomain.STORAGE,
+          category: ErrorCategory.THIRD_PARTY,
+          details: {
+            namespace: 'workflows',
+            runId,
+            workflowName: workflowName || '',
+          },
+        },
+        error,
+      );
+    }
+  }
+
+  public async deleteWorkflowRunById({
+    runId,
+    workflowName,
+    fence,
+  }: {
+    runId: string;
+    workflowName: string;
+    fence?: RunFence;
+  }): Promise<void> {
+    const key = getKey(TABLE_WORKFLOW_SNAPSHOT, { namespace: 'workflows', workflow_name: workflowName, run_id: runId });
+    const check = this.#runFenceCheck(fence, runId, 'deleteWorkflowRunById');
+    try {
+      const batch = writeBatch(this.client, check);
+      batch.del(key);
+      await batch.exec();
+    } catch (error) {
+      if (isRunFenceConflictError(error)) throw error;
+      throw new MastraError(
+        {
+          id: createStorageErrorId('VALKEY', 'DELETE_WORKFLOW_RUN_BY_ID', 'FAILED'),
+          domain: ErrorDomain.STORAGE,
+          category: ErrorCategory.THIRD_PARTY,
+          details: {
+            namespace: 'workflows',
+            runId,
+            workflowName,
+          },
+        },
+        error,
+      );
+    }
+  }
+
+  public async listWorkflowRuns({
+    workflowName,
+    fromDate,
+    toDate,
+    perPage,
+    page,
+    resourceId,
+    status,
+  }: StorageListWorkflowRunsInput = {}): Promise<WorkflowRuns> {
+    try {
+      if (page !== undefined && page < 0) {
+        throw new MastraError(
+          {
+            id: createStorageErrorId('VALKEY', 'LIST_WORKFLOW_RUNS', 'INVALID_PAGE'),
+            domain: ErrorDomain.STORAGE,
+            category: ErrorCategory.USER,
+            details: { page },
+          },
+          new Error('page must be >= 0'),
+        );
+      }
+
+      const normalizedFrom = fromDate ? ensureDate(fromDate) : undefined;
+      const normalizedTo = toDate ? ensureDate(toDate) : undefined;
+
+      let pattern = getKey(TABLE_WORKFLOW_SNAPSHOT, { namespace: 'workflows' }) + ':*';
+      if (workflowName && resourceId) {
+        pattern = getKey(TABLE_WORKFLOW_SNAPSHOT, {
+          namespace: 'workflows',
+          workflow_name: workflowName,
+          run_id: '*',
+          resourceId,
+        });
+      } else if (workflowName) {
+        pattern = getKey(TABLE_WORKFLOW_SNAPSHOT, { namespace: 'workflows', workflow_name: workflowName }) + ':*';
+      } else if (resourceId) {
+        pattern = getKey(TABLE_WORKFLOW_SNAPSHOT, {
+          namespace: 'workflows',
+          workflow_name: '*',
+          run_id: '*',
+          resourceId,
+        });
+      }
+      const keys = await this.db.scanKeys(pattern);
+
+      if (keys.length === 0) {
+        return { runs: [], total: 0 };
+      }
+
+      const results = await this.client.mGet(keys);
+
+      let runs = results
+        .filter((data): data is string => data !== null)
+        .map(data => JSON.parse(data) as Record<string, unknown>)
+        .filter(
+          (record): record is Record<string, unknown> =>
+            record !== null && record !== undefined && typeof record === 'object' && 'workflow_name' in record,
+        )
+        .filter(record => !workflowName || record.workflow_name === workflowName)
+        .map(w => parseWorkflowRun(w))
+        .filter(w => {
+          if (normalizedFrom && w.createdAt < normalizedFrom) {
+            return false;
+          }
+          if (normalizedTo && w.createdAt > normalizedTo) {
+            return false;
+          }
+          if (status) {
+            let snapshot = w.snapshot;
+            if (typeof snapshot === 'string') {
+              try {
+                snapshot = JSON.parse(snapshot) as WorkflowRunState;
+              } catch (e) {
+                console.warn(`Failed to parse snapshot for workflow ${w.workflowName}: ${e}`);
+                return false;
+              }
+            }
+            return snapshot.status === status;
+          }
+          return true;
+        })
+        .sort((a, b) => b.createdAt.getTime() - a.createdAt.getTime());
+
+      const total = runs.length;
+
+      if (typeof perPage === 'number' && typeof page === 'number') {
+        const normalizedPerPage = normalizePerPage(perPage, Number.MAX_SAFE_INTEGER);
+        const offset = page * normalizedPerPage;
+        runs = runs.slice(offset, offset + normalizedPerPage);
+      }
+
+      return { runs, total };
+    } catch (error) {
+      if (error instanceof MastraError) {
+        throw error;
+      }
+      throw new MastraError(
+        {
+          id: createStorageErrorId('VALKEY', 'LIST_WORKFLOW_RUNS', 'FAILED'),
+          domain: ErrorDomain.STORAGE,
+          category: ErrorCategory.THIRD_PARTY,
+          details: {
+            namespace: 'workflows',
+            workflowName: workflowName || '',
+            resourceId: resourceId || '',
+          },
+        },
+        error,
+      );
+    }
+  }
+}

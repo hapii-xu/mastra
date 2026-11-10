@@ -3,16 +3,35 @@ export type {
   LogMessage,
   LogHandler,
   MastraMCPServerDefinition,
-  ElicitationHandler,
+  MCPClientCapabilities,
+  MCPClientInfo,
+  MCPClientProtocolVersion,
+  MCPClientTasksOptions,
+  MCPTaskProgress,
+  MCPInputRequestSuspendPayload,
+  MCPInputRequestResumeData,
+  MCPInputRequest,
+  MCPInputRequestHandler,
+  MCPServerImplementation,
   ProgressHandler,
   InternalMastraMCPClientOptions,
   RequireToolApproval,
   RequireToolApprovalFn,
   RequireToolApprovalContext,
   ToolAnnotations,
+  SerializableMCPToolDefinition,
+  SerializableMCPToolCatalog,
+  MCPServerMap,
+  MCPClientServers,
+  MCPClientTools,
+  MCPClientToolsets,
 } from './types';
+export { MCP_CLIENT_PROTOCOL_VERSION } from './types';
 export * from './client';
+export type * from './events';
+export type { MCPDetailedTask, MCPTask, MCPTaskInputRequests, MCPTaskInputResponses } from '../shared/tasks';
 export * from './configuration';
+export type { MCPDiscoveryErrorDetails } from './error-utils';
 export * from './oauth-provider';
 export * from './oauth-callback-server';
 export { MCPClientServerProxy } from './server-proxy';

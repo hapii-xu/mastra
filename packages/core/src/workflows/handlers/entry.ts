@@ -1,10 +1,15 @@
 import type { ActorSignal } from '../../auth/ee';
 import type { RequestContext } from '../../di';
+import { getErrorFromUnknown } from '../../error';
 import type { SerializedError } from '../../error';
 import type { PubSub } from '../../events/pubsub';
-import { resolveObservabilityContext } from '../../observability';
+import { SpanType, createObservabilityContext, resolveObservabilityContext } from '../../observability';
 import type { ObservabilityContext } from '../../observability';
+import { WORKFLOW_RUN_STATUSES } from '../../storage/domains/workflows/run-statuses';
+import { WORKFLOW_CANCELLED_SYMBOL } from '../constants';
 import type { DefaultExecutionEngine } from '../default';
+import { workflowChildTermination as workflowTermination } from '../execution-outcome';
+import type { RunJournal } from '../run-journal';
 import type {
   EntryExecutionResult,
   ExecutionContext,
@@ -18,6 +23,16 @@ import type {
   WorkflowRunStatus,
   WorkflowRunState,
 } from '../types';
+import { getSingleStepEntryId, isSingleStepEntry } from '../utils';
+import { getControlFlowIdentityAttributes, getControlFlowSpanName } from './control-flow';
+
+function publishStepEvent(
+  engine: DefaultExecutionEngine,
+  pubsub: PubSub,
+  ...args: Parameters<PubSub['publish']>
+): Promise<void> {
+  return engine.options.emitStepEvents === false ? Promise.resolve() : pubsub.publish(...args);
+}
 
 /**
  * After resuming a single step within a parallel or conditional block, check whether
@@ -33,12 +48,12 @@ function buildResumedBlockResult(
   opts?: { onlyExecutedSteps?: boolean },
 ): any {
   const stepsToCheck = opts?.onlyExecutedSteps
-    ? entrySteps.filter(s => s.type === 'step' && stepResults[s.step.id] !== undefined)
+    ? entrySteps.filter(s => isSingleStepEntry(s) && stepResults[getSingleStepEntryId(s)] !== undefined)
     : entrySteps;
 
   const allComplete = stepsToCheck.every(s => {
-    if (s.type === 'step') {
-      const r = stepResults[s.step.id];
+    if (isSingleStepEntry(s)) {
+      const r = stepResults[getSingleStepEntryId(s)];
       return r && r.status === 'success';
     }
     return true;
@@ -49,10 +64,11 @@ function buildResumedBlockResult(
     result = {
       status: 'success',
       output: entrySteps.reduce((acc: Record<string, any>, s) => {
-        if (s.type === 'step') {
-          const r = stepResults[s.step.id];
+        if (isSingleStepEntry(s)) {
+          const id = getSingleStepEntryId(s);
+          const r = stepResults[id];
           if (r && r.status === 'success') {
-            acc[s.step.id] = r.output;
+            acc[id] = r.output;
           }
         }
         return acc;
@@ -60,18 +76,24 @@ function buildResumedBlockResult(
     };
   } else {
     // Check for failed steps before assuming suspended
-    const failedStep = stepsToCheck.find(s => s.type === 'step' && stepResults[s.step.id]?.status === 'failed');
-    if (failedStep && failedStep.type === 'step') {
-      const failedResult = stepResults[failedStep.step.id] as StepFailure<any, any, any, any> | undefined;
+    const failedStep = stepsToCheck.find(
+      s => isSingleStepEntry(s) && stepResults[getSingleStepEntryId(s)]?.status === 'failed',
+    );
+    if (failedStep && isSingleStepEntry(failedStep)) {
+      const failedResult = stepResults[getSingleStepEntryId(failedStep)] as StepFailure<any, any, any, any> | undefined;
       result = {
         status: 'failed',
         error: failedResult?.error ?? new Error('Workflow step failed after resume'),
         tripwire: failedResult?.tripwire,
       };
     } else {
-      const stillSuspended = entrySteps.find(s => s.type === 'step' && stepResults[s.step.id]?.status === 'suspended');
+      const stillSuspended = entrySteps.find(
+        s => isSingleStepEntry(s) && stepResults[getSingleStepEntryId(s)]?.status === 'suspended',
+      );
       const suspendData =
-        stillSuspended && stillSuspended.type === 'step' ? stepResults[stillSuspended.step.id]?.suspendPayload : {};
+        stillSuspended && isSingleStepEntry(stillSuspended)
+          ? stepResults[getSingleStepEntryId(stillSuspended)]?.suspendPayload
+          : {};
       result = {
         status: 'suspended',
         payload: suspendData,
@@ -83,8 +105,8 @@ function buildResumedBlockResult(
 
   if (result.status === 'suspended') {
     entrySteps.forEach((s, stepIndex) => {
-      if (s.type === 'step' && stepResults[s.step.id]?.status === 'suspended') {
-        executionContext.suspendedPaths[s.step.id] = [...executionContext.executionPath, stepIndex];
+      if (isSingleStepEntry(s) && stepResults[getSingleStepEntryId(s)]?.status === 'suspended') {
+        executionContext.suspendedPaths[getSingleStepEntryId(s)] = [...executionContext.executionPath, stepIndex];
       }
     });
   }
@@ -132,11 +154,59 @@ export interface PersistStepUpdateParams {
     parentSpanId?: string;
   };
   /**
-   * Optional phase suffix appended to the durable operation ID to prevent
-   * duplicate step IDs when persistStepUpdate is called multiple times for
-   * the same execution path (e.g. 'start' before execution, 'end' after).
+   * Phase suffix appended to the durable operation ID to prevent duplicate
+   * step IDs when persistStepUpdate is called multiple times for the same
+   * execution path (e.g. 'start' before execution, 'entry-end' after).
+   *
+   * Every call site must pass a phase that is unique among the persists that
+   * can run for one execution path in a single execution; otherwise replay
+   * engines (Inngest) see duplicate step IDs. Optional only for backward
+   * compatibility with external callers.
    */
   phase?: string;
+  /**
+   * Persist the `running` update even if the last persisted status was `suspended`.
+   * Used when a resumed step starts, so its resume data survives a crash mid-step.
+   */
+  recordResumedStepStart?: boolean;
+  /**
+   * Storage v2: set by a step's start write, which can be in flight together with the start writes
+   * of other steps of a parallel or branch block. Only these steps' results are written, and no
+   * other write in flight may name them. Unset, the write sends every change.
+   */
+  stepIds?: string[];
+  /**
+   * Storage v2: set by a running foreach's progress write. The foreach's result differs from the
+   * one it last wrote only by these indices' `metadata.foreachProgress` entries, so the journal can
+   * send just those (see `RunJournal.write`).
+   */
+  foreachItems?: { stepId: string; indices: readonly number[] };
+  /**
+   * Storage v2: the journal of the execution this write belongs to, set by the engine's own writes,
+   * which aren't made from one of the execution's entries. Unset, the write uses the journal of the
+   * execution it is made from (see `getRunJournal`).
+   */
+  journal?: RunJournal;
+}
+
+// Every status but `canceled`, so only a persisted cancellation rejects the write.
+// Terminal statuses stay writable because restart and time travel re-run finished runs.
+const NOT_CANCELED_STATUSES = WORKFLOW_RUN_STATUSES.filter(
+  (status): status is Exclude<WorkflowRunStatus, 'canceled'> => status !== 'canceled',
+);
+
+export async function isWorkflowRunCanceled(
+  engine: DefaultExecutionEngine,
+  workflowId: string,
+  runId: string,
+): Promise<boolean> {
+  try {
+    const workflowsStore = await engine.mastra?.getStorage()?.getStore('workflows');
+    const status = await workflowsStore?.loadWorkflowRunStatus({ workflowName: workflowId, runId });
+    return status === 'canceled';
+  } catch {
+    return false;
+  }
 }
 
 export async function persistStepUpdate(
@@ -156,14 +226,27 @@ export async function persistStepUpdate(
     requestContext,
     tracingContext,
     phase,
+    recordResumedStepStart,
+    stepIds,
+    foreachItems,
   } = params;
 
   const operationId = `workflow.${workflowId}.run.${runId}.path.${JSON.stringify(executionContext.executionPath)}.stepUpdate${phase ? `.${phase}` : ''}`;
 
-  await engine.wrapDurableOperation(operationId, async () => {
-    const shouldPersistSnapshot = engine.options?.shouldPersistSnapshot?.({ stepResults, workflowStatus });
+  // A run-scoped override (e.g. the transient per-chunk runs of a workflow used as an
+  // agent output processor, #19605) wins over the workflow-wide option and is always
+  // evaluated durably because callers may provide an arbitrary predicate.
+  const runPersistenceOverride = engine.getRunPersistenceOverride(runId);
+  const persistencePredicate = runPersistenceOverride ?? engine.options?.shouldPersistSnapshot;
+  const evaluateBeforeDurableOperation =
+    engine.options?.evaluatePersistencePredicateBeforeDurableOperation && !runPersistenceOverride;
 
-    if (!shouldPersistSnapshot) {
+  if (evaluateBeforeDurableOperation && !persistencePredicate?.({ stepResults, workflowStatus })) {
+    return;
+  }
+
+  const write = async () => {
+    if (!evaluateBeforeDurableOperation && !persistencePredicate?.({ stepResults, workflowStatus })) {
       return;
     }
 
@@ -173,7 +256,7 @@ export async function persistStepUpdate(
     // otherwise clobber the suspend record before the resume actually
     // completes. The engine tracks its own last-persisted status for this
     // run (process-local) so we don't need an extra storage read per step.
-    if (workflowStatus === 'running') {
+    if (workflowStatus === 'running' && !recordResumedStepStart) {
       const lastPersisted = engine.getLastPersistedStatus(runId);
       if (lastPersisted === 'suspended' || lastPersisted === 'paused') {
         return;
@@ -184,6 +267,7 @@ export async function persistStepUpdate(
 
     const snapshot: WorkflowRunState = {
       runId,
+      parentWorkflow: executionContext.parentWorkflow,
       status: workflowStatus,
       value: executionContext.state,
       context: stepResults as any,
@@ -202,15 +286,50 @@ export async function persistStepUpdate(
       tracingContext,
     };
 
-    const workflowsStore = await engine.mastra?.getStorage()?.getStore('workflows');
-    await workflowsStore?.persistWorkflowSnapshot({
-      workflowName: workflowId,
-      runId,
-      resourceId,
-      snapshot: engine.options?.pruneSnapshot ? engine.options.pruneSnapshot({ snapshot, workflowStatus }) : snapshot,
-    });
+    // A run canceled from another process must not be overwritten. Storage v2 stores and v1 stores
+    // that support it reject the write atomically; other v1 stores get a status read first.
+    const guardCancellation = workflowStatus !== 'canceled' && engine.honorsStoredCancellation(runId);
+    const journal = params.journal ?? engine.getRunJournal(runId);
+    if (journal) {
+      const written = await journal.write({
+        resourceId,
+        snapshot,
+        stepIds,
+        foreachItems,
+        ...(guardCancellation ? { expectedStatus: NOT_CANCELED_STATUSES } : {}),
+      });
+      if (!written) {
+        engine.setLastPersistedStatus(runId, 'canceled');
+        return;
+      }
+    } else {
+      const workflowsStore = await engine.mastra?.getStorage()?.getStore('workflows');
+      const atomicGuard = guardCancellation && !!workflowsStore?.supportsGuardedSnapshotWrites?.();
+      if (guardCancellation && !atomicGuard && (await isWorkflowRunCanceled(engine, workflowId, runId))) {
+        engine.setLastPersistedStatus(runId, 'canceled');
+        return;
+      }
+
+      const written = await workflowsStore?.persistWorkflowSnapshot({
+        workflowName: workflowId,
+        runId,
+        resourceId,
+        snapshot: engine.options?.pruneSnapshot ? engine.options.pruneSnapshot({ snapshot, workflowStatus }) : snapshot,
+        ...(atomicGuard ? { expectedStatus: NOT_CANCELED_STATUSES } : {}),
+      });
+      if (atomicGuard && written === false) {
+        engine.setLastPersistedStatus(runId, 'canceled');
+        return;
+      }
+    }
     engine.setLastPersistedStatus(runId, workflowStatus);
-  });
+  };
+
+  await engine.wrapDurableOperation(operationId, () =>
+    // Engines that replay memoized durable operations (Inngest) record each write as its own
+    // durable step, so only the in-process engine needs writes kept in call order.
+    engine.requiresDurableContextSerialization() ? write() : engine.serializeSnapshotWrite(runId, write),
+  );
 }
 
 export interface ExecuteEntryParams extends ObservabilityContext {
@@ -228,6 +347,7 @@ export interface ExecuteEntryParams extends ObservabilityContext {
     stepResults: Record<string, StepResult<any, any, any, any>>;
     resumePayload: any;
     resumePath: number[];
+    forEachIndex?: number;
   };
   executionContext: ExecutionContext;
   pubsub: PubSub;
@@ -243,11 +363,57 @@ export async function executeEntry(
   engine: DefaultExecutionEngine,
   params: ExecuteEntryParams,
 ): Promise<EntryExecutionResult> {
+  const { entry, resume, executionContext, workflowId, runId } = params;
+  if (!resume?.resumePath?.length || (entry.type !== 'parallel' && entry.type !== 'conditional'))
+    return executeEntryBody(engine, params);
+
+  // Resume selects the suspended branch directly; it does not re-evaluate conditions
+  // or re-run completed branches. This invocation still owns a new block execution.
+  const context = resolveObservabilityContext(params);
+  const operationId = `workflow.${workflowId}.run.${runId}.${entry.type}.${executionContext.executionPath.join('-')}.resume.span`;
+  const span = await engine.createChildSpan({
+    parentSpan: context.tracingContext.currentSpan,
+    operationId: `${operationId}.start`,
+    options: {
+      type: entry.type === 'parallel' ? SpanType.WORKFLOW_PARALLEL : SpanType.WORKFLOW_CONDITIONAL,
+      name: getControlFlowSpanName(entry, `${entry.type}: resumed branch`),
+      outcome: null,
+      attributes: getControlFlowIdentityAttributes(entry),
+      tracingPolicy: engine.options?.tracingPolicy,
+    },
+    executionContext,
+  });
+  try {
+    const result = await executeEntryBody(engine, { ...params, ...createObservabilityContext({ currentSpan: span }) });
+    const settled = result.result;
+    const termination = workflowTermination(settled, params.abortController.signal);
+    if (settled.status === 'failed')
+      await engine.errorChildSpan({
+        span,
+        operationId: `${operationId}.error`,
+        errorOptions: { ...termination, error: getErrorFromUnknown(settled.error) },
+      });
+    else await engine.endChildSpan({ span, operationId: `${operationId}.end`, endOptions: termination });
+    return result;
+  } catch (error) {
+    await engine.errorChildSpan({
+      span,
+      operationId: `${operationId}.error`,
+      errorOptions: { ...workflowTermination({ status: 'failed', error }), error: getErrorFromUnknown(error) },
+    });
+    throw error;
+  }
+}
+
+async function executeEntryBody(
+  engine: DefaultExecutionEngine,
+  params: ExecuteEntryParams,
+): Promise<EntryExecutionResult> {
   const {
     workflowId,
     runId,
     resourceId,
-    entry,
+    entry: rawEntry,
     prevStep,
     serializedStepGraph,
     stepResults,
@@ -266,27 +432,37 @@ export async function executeEntry(
   } = params;
   const observabilityContext = resolveObservabilityContext(rest);
 
+  const entry = rawEntry;
+
   const prevOutput = engine.getStepOutput(stepResults, prevStep);
   let execResults: any;
   let entryRequestContext: Record<string, any> | undefined;
 
-  if (entry.type === 'step') {
-    const isResumedStep = resume?.steps?.includes(entry.step.id) ?? false;
+  if (isSingleStepEntry(entry)) {
+    // The engine dispatches by step type: a plain `step` runs as-is, while the
+    // declarative `agent` / `tool` / `mapping` variants each have their own
+    // execute method that resolves and runs the step. Resume bookkeeping keys
+    // off the entry id and is shared across all single-step kinds.
+    const stepId = getSingleStepEntryId(entry);
+    const isResumedStep = resume?.steps?.includes(stepId) ?? false;
+    // On crash-restart the running snapshot preserved this step's own payload
+    // (pruneRunningHistory exempts active steps), while terminal predecessors may
+    // have had fields like messageListState pruned. Prefer the step's recorded
+    // payload over the predecessor's pruned output. See #22636.
+    const isRestartedActiveStep = Boolean(restart?.activeStepsPath?.[stepId]);
     if (!isResumedStep) {
-      executionContext.stepExecutionPath?.push(entry.step.id);
+      executionContext.stepExecutionPath?.push(stepId);
     }
-    const { step } = entry;
     const stepPrevOutput = getResumeStepPrevOutput({
-      isResumedStep,
-      stepId: step.id,
+      isResumedStep: isResumedStep || isRestartedActiveStep,
+      stepId,
       stepResults,
       prevOutput,
     });
-    const stepExecResult = await engine.executeStep({
+    const singleStepParams = {
       workflowId,
       runId,
       resourceId,
-      step,
       stepResults,
       executionContext,
       timeTravel,
@@ -302,7 +478,17 @@ export async function executeEntry(
       disableScorers,
       serializedStepGraph,
       perStep,
-    });
+    };
+    const stepExecResult =
+      entry.type === 'step'
+        ? await engine.executeStep({ ...singleStepParams, step: entry.step })
+        : entry.type === 'agent'
+          ? await engine.executeAgent({ ...singleStepParams, entry })
+          : entry.type === 'tool'
+            ? await engine.executeTool({ ...singleStepParams, entry })
+            : entry.type === 'classifier'
+              ? await engine.executeClassifier({ ...singleStepParams, entry })
+              : await engine.executeMapping({ ...singleStepParams, entry });
 
     // Extract result and apply context changes
     execResults = stepExecResult.result;
@@ -323,6 +509,7 @@ export async function executeEntry(
       executionContext: {
         workflowId,
         runId,
+        parentWorkflow: executionContext.parentWorkflow,
         executionPath: [...executionContext.executionPath, idx!],
         stepExecutionPath: executionContext.stepExecutionPath ? [...executionContext.stepExecutionPath] : undefined,
         suspendedPaths: executionContext.suspendedPaths,
@@ -383,8 +570,9 @@ export async function executeEntry(
 
     let branchResult: EntryExecutionResult;
 
-    if (branchStep.type !== 'step') {
-      // Recurse through executeEntry for nested block types (parallel, conditional, etc.)
+    if (branchStep.type !== 'step' || engine.getRunJournal(runId)) {
+      // Through executeEntry for nested block types (parallel, conditional, etc.). Storage v2 takes a
+      // plain step this way too, like a resumed parallel branch, so its result is written when it ends.
       branchResult = await executeEntry(engine, {
         workflowId,
         runId,
@@ -397,6 +585,7 @@ export async function executeEntry(
         executionContext: {
           workflowId,
           runId,
+          parentWorkflow: executionContext.parentWorkflow,
           executionPath: [...executionContext.executionPath, idx!],
           stepExecutionPath: executionContext.stepExecutionPath ? [...executionContext.stepExecutionPath] : undefined,
           suspendedPaths: executionContext.suspendedPaths,
@@ -436,6 +625,7 @@ export async function executeEntry(
         executionContext: {
           workflowId,
           runId,
+          parentWorkflow: executionContext.parentWorkflow,
           executionPath: [...executionContext.executionPath, idx!],
           stepExecutionPath: executionContext.stepExecutionPath ? [...executionContext.stepExecutionPath] : undefined,
           suspendedPaths: executionContext.suspendedPaths,
@@ -515,9 +705,10 @@ export async function executeEntry(
       perStep,
     });
   } else if (entry.type === 'foreach') {
+    const foreachStepId = getSingleStepEntryId(entry.step);
     const foreachPrevOutput = getResumeStepPrevOutput({
-      isResumedStep: resume?.steps?.includes(entry.step.id) ?? false,
-      stepId: entry.step.id,
+      isResumedStep: resume?.steps?.includes(foreachStepId) ?? false,
+      stepId: foreachStepId,
       stepResults,
       prevOutput,
     });
@@ -549,7 +740,7 @@ export async function executeEntry(
     const startedAt = Date.now();
     const sleepWaitingOperationId = `workflow.${workflowId}.run.${runId}.sleep.${entry.id}.waiting_ev`;
     await engine.wrapDurableOperation(sleepWaitingOperationId, async () => {
-      await pubsub.publish(`workflow.events.v2.${runId}`, {
+      await publishStepEvent(engine, pubsub, `workflow.events.v2.${runId}`, {
         type: 'watch',
         runId,
         data: {
@@ -578,6 +769,7 @@ export async function executeEntry(
       executionContext,
       workflowStatus: 'waiting',
       requestContext,
+      phase: 'sleep-waiting',
     });
 
     await engine.executeSleep({
@@ -599,60 +791,65 @@ export async function executeEntry(
 
     delete executionContext.activeStepsPath[entry.id];
 
-    await engine.persistStepUpdate({
-      workflowId,
-      runId,
-      resourceId,
-      serializedStepGraph,
-      stepResults,
-      executionContext,
-      workflowStatus: 'running',
-      requestContext,
-    });
-
-    const endedAt = Date.now();
-    const stepInfo = {
-      payload: prevOutput,
-      startedAt,
-      endedAt,
-    };
-
-    execResults = { ...stepInfo, status: 'success', output: prevOutput };
-    stepResults[entry.id] = { ...stepInfo, status: 'success', output: prevOutput };
-    const sleepResultOperationId = `workflow.${workflowId}.run.${runId}.sleep.${entry.id}.result_ev`;
-    await engine.wrapDurableOperation(sleepResultOperationId, async () => {
-      await pubsub.publish(`workflow.events.v2.${runId}`, {
-        type: 'watch',
+    if (abortController?.signal?.aborted) {
+      execResults = { status: 'canceled' };
+    } else {
+      await engine.persistStepUpdate({
+        workflowId,
         runId,
-        data: {
-          type: 'workflow-step-result',
-          payload: {
-            id: entry.id,
-            endedAt,
-            status: 'success',
-            output: prevOutput,
-          },
-        },
+        resourceId,
+        serializedStepGraph,
+        stepResults,
+        executionContext,
+        workflowStatus: 'running',
+        requestContext,
+        phase: 'sleep-end',
       });
 
-      await pubsub.publish(`workflow.events.v2.${runId}`, {
-        type: 'watch',
-        runId,
-        data: {
-          type: 'workflow-step-finish',
-          payload: {
-            id: entry.id,
-            metadata: {},
+      const endedAt = Date.now();
+      const stepInfo = {
+        payload: prevOutput,
+        startedAt,
+        endedAt,
+      };
+
+      execResults = { ...stepInfo, status: 'success', output: prevOutput };
+      stepResults[entry.id] = { ...stepInfo, status: 'success', output: prevOutput };
+      const sleepResultOperationId = `workflow.${workflowId}.run.${runId}.sleep.${entry.id}.result_ev`;
+      await engine.wrapDurableOperation(sleepResultOperationId, async () => {
+        await publishStepEvent(engine, pubsub, `workflow.events.v2.${runId}`, {
+          type: 'watch',
+          runId,
+          data: {
+            type: 'workflow-step-result',
+            payload: {
+              id: entry.id,
+              endedAt,
+              status: 'success',
+              output: prevOutput,
+            },
           },
-        },
+        });
+
+        await publishStepEvent(engine, pubsub, `workflow.events.v2.${runId}`, {
+          type: 'watch',
+          runId,
+          data: {
+            type: 'workflow-step-finish',
+            payload: {
+              id: entry.id,
+              metadata: {},
+            },
+          },
+        });
       });
-    });
+    }
   } else if (entry.type === 'sleepUntil') {
     executionContext.stepExecutionPath?.push(entry.id);
     const startedAt = Date.now();
     const sleepUntilWaitingOperationId = `workflow.${workflowId}.run.${runId}.sleepUntil.${entry.id}.waiting_ev`;
     await engine.wrapDurableOperation(sleepUntilWaitingOperationId, async () => {
-      await pubsub.publish(`workflow.events.v2.${runId}`, {
+      await publishStepEvent(engine, pubsub, `workflow.events.v2.${runId}`, {
         type: 'watch',
         runId,
         data: {
@@ -683,6 +880,7 @@ export async function executeEntry(
       executionContext,
       workflowStatus: 'waiting',
       requestContext,
+      phase: 'sleep-until-waiting',
     });
 
     await engine.executeSleepUntil({
@@ -704,63 +902,73 @@ export async function executeEntry(
 
     delete executionContext.activeStepsPath[entry.id];
 
-    await engine.persistStepUpdate({
-      workflowId,
-      runId,
-      resourceId,
-      serializedStepGraph,
-      stepResults,
-      executionContext,
-      workflowStatus: 'running',
-      requestContext,
-    });
-
-    const endedAt = Date.now();
-    const stepInfo = {
-      payload: prevOutput,
-      startedAt,
-      endedAt,
-    };
-
-    execResults = { ...stepInfo, status: 'success', output: prevOutput };
-    stepResults[entry.id] = { ...stepInfo, status: 'success', output: prevOutput };
-
-    const sleepUntilResultOperationId = `workflow.${workflowId}.run.${runId}.sleepUntil.${entry.id}.result_ev`;
-    await engine.wrapDurableOperation(sleepUntilResultOperationId, async () => {
-      await pubsub.publish(`workflow.events.v2.${runId}`, {
-        type: 'watch',
+    if (abortController?.signal?.aborted) {
+      execResults = { status: 'canceled' };
+    } else {
+      await engine.persistStepUpdate({
+        workflowId,
         runId,
-        data: {
-          type: 'workflow-step-result',
-          payload: {
-            id: entry.id,
-            endedAt,
-            status: 'success',
-            output: prevOutput,
-          },
-        },
+        resourceId,
+        serializedStepGraph,
+        stepResults,
+        executionContext,
+        workflowStatus: 'running',
+        requestContext,
+        phase: 'sleep-until-end',
       });
 
-      await pubsub.publish(`workflow.events.v2.${runId}`, {
-        type: 'watch',
-        runId,
-        data: {
-          type: 'workflow-step-finish',
-          payload: {
-            id: entry.id,
-            metadata: {},
+      const endedAt = Date.now();
+      const stepInfo = {
+        payload: prevOutput,
+        startedAt,
+        endedAt,
+      };
+
+      execResults = { ...stepInfo, status: 'success', output: prevOutput };
+      stepResults[entry.id] = { ...stepInfo, status: 'success', output: prevOutput };
+
+      const sleepUntilResultOperationId = `workflow.${workflowId}.run.${runId}.sleepUntil.${entry.id}.result_ev`;
+      await engine.wrapDurableOperation(sleepUntilResultOperationId, async () => {
+        await publishStepEvent(engine, pubsub, `workflow.events.v2.${runId}`, {
+          type: 'watch',
+          runId,
+          data: {
+            type: 'workflow-step-result',
+            payload: {
+              id: entry.id,
+              endedAt,
+              status: 'success',
+              output: prevOutput,
+            },
           },
-        },
+        });
+
+        await publishStepEvent(engine, pubsub, `workflow.events.v2.${runId}`, {
+          type: 'watch',
+          runId,
+          data: {
+            type: 'workflow-step-finish',
+            payload: {
+              id: entry.id,
+              metadata: {},
+            },
+          },
+        });
       });
-    });
+    }
   }
 
-  if (entry.type === 'step' || entry.type === 'loop' || entry.type === 'foreach') {
-    stepResults[entry.step.id] = execResults;
+  if (isSingleStepEntry(entry)) {
+    stepResults[getSingleStepEntryId(entry)] = execResults;
+  } else if (entry.type === 'loop' || entry.type === 'foreach') {
+    stepResults[getSingleStepEntryId(entry.step)] = execResults;
   }
 
   if (abortController?.signal?.aborted) {
-    execResults = { ...execResults, status: 'canceled' };
+    execResults = {
+      ...execResults,
+      status: abortController.signal.reason === WORKFLOW_CANCELLED_SYMBOL ? 'canceled' : 'waiting',
+    };
   }
 
   await engine.persistStepUpdate({
@@ -772,10 +980,11 @@ export async function executeEntry(
     executionContext,
     workflowStatus: execResults.status === 'success' ? 'running' : execResults.status,
     requestContext,
+    phase: 'entry-end',
   });
 
   if (execResults.status === 'canceled') {
-    await pubsub.publish(`workflow.events.v2.${runId}`, {
+    await publishStepEvent(engine, pubsub, `workflow.events.v2.${runId}`, {
       type: 'watch',
       runId,
       data: { type: 'workflow-canceled', payload: {} },
@@ -786,6 +995,13 @@ export async function executeEntry(
     result: execResults,
     stepResults,
     mutableContext: engine.buildMutableContext(executionContext),
-    requestContext: entryRequestContext ?? engine.serializeRequestContext(requestContext),
+    // Serialize requestContext only for engines that restore it from serialized
+    // results (Inngest memoization). The default engine keeps the original
+    // reference and never reads this field, so serializing here would be pure
+    // per-entry overhead — RequestContext.toJSON() probes every stored value
+    // with JSON.stringify.
+    requestContext:
+      entryRequestContext ??
+      (engine.requiresDurableContextSerialization() ? engine.serializeRequestContext(requestContext) : undefined),
   };
 }

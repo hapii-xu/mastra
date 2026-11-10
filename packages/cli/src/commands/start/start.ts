@@ -4,7 +4,7 @@ import { join } from 'node:path';
 import { config } from 'dotenv';
 import { getAnalytics } from '../../analytics/index.js';
 import { logger } from '../../utils/logger';
-import { shouldSkipDotenvLoading } from '../utils';
+import { getSourceMapNodeArgs, shouldSkipDotenvLoading } from '../utils';
 interface StartOptions {
   dir?: string;
   env?: string;
@@ -39,7 +39,10 @@ export async function start(options: StartOptions = {}) {
       throw new Error(`Output directory ${outputPath} does not exist`);
     }
 
-    const commands = [];
+    // The build output is all `start` has (src/ may not exist where it runs), so
+    // the presence of the map tells whether `bundler.sourcemap` was on at build time.
+    const hasSourceMaps = fs.existsSync(join(outputPath, 'index.mjs.map'));
+    const commands = getSourceMapNodeArgs(hasSourceMaps, process.env.NODE_OPTIONS);
 
     if (options.customArgs) {
       commands.push(...options.customArgs);
@@ -69,8 +72,8 @@ export async function start(options: StartOptions = {}) {
       process.stderr.write(data);
     });
 
-    server.on('exit', code => {
-      if (code !== 0) {
+    server.on('exit', (code, signal) => {
+      if (code !== 0 && code !== null) {
         // Raw stderr has already been streamed live above. On a crash, add a
         // friendly hint for the common "missing dependency" case on top of it.
         if (stderrBuffer.includes('ERR_MODULE_NOT_FOUND')) {
@@ -81,8 +84,8 @@ export async function start(options: StartOptions = {}) {
             logger.error('Module not found while starting Mastra server', { package: packageName });
           }
         }
-        process.exit(code);
       }
+      process.exit(code ?? (signal ? 1 : 0));
     });
 
     server.on('error', err => {
@@ -90,14 +93,16 @@ export async function start(options: StartOptions = {}) {
       process.exit(1);
     });
 
+    // Forward shutdown signals to the server and wait for it to exit (the
+    // `exit` handler above ends this process with the server's code). Exiting
+    // immediately here would orphan the server mid graceful shutdown and drop
+    // its exit code.
     process.on('SIGINT', () => {
       server.kill('SIGINT');
-      process.exit(0);
     });
 
     process.on('SIGTERM', () => {
       server.kill('SIGTERM');
-      process.exit(0);
     });
   } catch (error: any) {
     logger.error('Failed to start Mastra server', { error: error.message });

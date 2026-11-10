@@ -7,7 +7,7 @@ import { EventedAgent } from '../evented-agent';
 describe('durable workflow actor forwarding', () => {
   it.each([
     ['DurableAgent', DurableAgent, 'start'],
-    ['EventedAgent', EventedAgent, 'startAsync'],
+    ['EventedAgent', EventedAgent, 'start'],
   ] as const)('%s forwards the initial actor', async (_, AgentType, startMethod) => {
     const pubsub = new EventEmitterPubSub();
     const actor = { actorKind: 'system' as const, sourceWorkflow: 'initial-run' };
@@ -20,6 +20,7 @@ describe('durable workflow actor forwarding', () => {
     const durableAgent = new AgentType({ agent: baseAgent, pubsub });
     const start = vi.fn().mockResolvedValue(undefined);
     vi.spyOn(durableAgent, 'getWorkflow').mockReturnValue({
+      runs: new Map(),
       createRun: vi.fn().mockResolvedValue({ [startMethod]: start }),
     } as any);
 

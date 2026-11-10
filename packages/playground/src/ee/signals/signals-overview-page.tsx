@@ -1,100 +1,54 @@
-import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from '@mastra/playground-ui/components/Select';
-import { SignalsOverviewPage as SignalsEmptyState } from '@mastra/playground-ui/ee/signals';
-import { useState } from 'react';
-
+import { PageLayout } from '@mastra/playground-ui/components/PageLayout';
+import { TraceIntelligenceEntityIndex, TraceIntelligenceProvider } from '@mastra/playground-ui/ee/signals';
+import { Navigate, useSearchParams } from 'react-router';
 import { Link } from '../../lib/link';
-import { useThemeEntities } from './hooks';
-import { SankeySignals } from './sankey-signals';
-import { SignalsErrorState } from './signals-error-state';
-import { SignalsLoadingSkeleton } from './signals-loading-skeleton';
-import type { ThemeLearningEntity, TraceSignalName } from './types';
+import { useEntityIndexUrlState } from './use-entity-index-url-state';
+import { PageBreadcrumbs } from '@/components/ui/page-breadcrumbs';
+import { navCrumb } from '@/domains/navigation/crumbs';
 
-const SIGNAL_ORDER: TraceSignalName[] = ['goal', 'outcome', 'behavior', 'sentiment'];
+const crumbs = [navCrumb('/intelligence')];
 
-function formatSignalName(signalName: TraceSignalName) {
-  return signalName.charAt(0).toUpperCase() + signalName.slice(1);
-}
-
-function AgentSelector({
-  entities,
-  selectedEntityId,
-  onEntityChange,
-}: {
-  entities: ThemeLearningEntity[];
-  selectedEntityId: string;
-  onEntityChange: (entityId: string) => void;
-}) {
+export function SignalsOverviewPage() {
   return (
-    <div className="flex min-w-0 flex-wrap items-center gap-3 px-4 pt-4 lg:px-6 lg:pt-6">
-      <label className="text-neutral4 text-xs font-medium" htmlFor="signals-agent-selector">
-        Agent
-      </label>
-      <Select value={selectedEntityId} onValueChange={onEntityChange}>
-        <SelectTrigger className="min-w-0 flex-1 sm:w-64 sm:flex-none" id="signals-agent-selector" size="sm">
-          <SelectValue />
-        </SelectTrigger>
-        <SelectContent>
-          {entities.map(entity => (
-            <SelectItem key={entity.entityId} value={entity.entityId}>
-              {entity.entityId}
-            </SelectItem>
-          ))}
-        </SelectContent>
-      </Select>
-    </div>
+    <PageLayout breadcrumbs={<PageBreadcrumbs crumbs={crumbs} />}>
+      <h1 className="sr-only">Intelligence</h1>
+      <TraceIntelligenceProvider cacheScope="oss-studio" LinkComponent={Link}>
+        <SignalsOverviewContent />
+      </TraceIntelligenceProvider>
+    </PageLayout>
   );
 }
 
-export function SignalsOverviewPage() {
-  const entitiesQuery = useThemeEntities('agent');
-  const [selectedEntityId, setSelectedEntityId] = useState<string>();
+function SignalsOverviewContent() {
+  const urlState = useEntityIndexUrlState();
+  const [searchParams] = useSearchParams();
+  const legacyEntityId = searchParams.get('agent');
 
-  if (entitiesQuery.isPending) {
-    return <SignalsLoadingSkeleton />;
+  if (legacyEntityId) {
+    const detailSearch = new URLSearchParams(searchParams);
+    detailSearch.delete('agent');
+    const query = detailSearch.toString();
+    return (
+      <Navigate
+        replace
+        to={`/intelligence/entities/agent/${encodeURIComponent(legacyEntityId)}${query ? `?${query}` : ''}`}
+      />
+    );
   }
-
-  if (entitiesQuery.isError) {
-    return <SignalsErrorState message="Unable to load signal entities." onRetry={() => void entitiesQuery.refetch()} />;
-  }
-
-  const entities = entitiesQuery.data?.entities ?? [];
-  const entity =
-    entities.find(currentEntity => currentEntity.entityId === selectedEntityId) ??
-    entities.find(currentEntity => currentEntity.availableSignals.length >= 2) ??
-    entities[0];
-
-  if (!entity) {
-    return <SignalsEmptyState LinkComponent={Link} />;
-  }
-
-  const signalNames = SIGNAL_ORDER.filter(signalName => entity.availableSignals.includes(signalName));
 
   return (
-    <>
-      <AgentSelector entities={entities} selectedEntityId={entity.entityId} onEntityChange={setSelectedEntityId} />
-      {signalNames.length >= 2 ? (
-        <SankeySignals
-          key={`${entity.entityId}:${signalNames.join(',')}`}
-          entityId={entity.entityId}
-          entityType="agent"
-          signalNames={signalNames}
-        />
-      ) : (
-        <section
-          className="border-border1 bg-surface2 m-4 rounded-lg border p-6 lg:m-6"
-          aria-labelledby="signals-data-heading"
-        >
-          <h1 className="text-neutral6 text-lg font-semibold" id="signals-data-heading">
-            Not enough signal data yet
-          </h1>
-          <p className="text-neutral3 mt-2 text-sm">
-            At least two signal types are needed to show how themes connect across traces.
-          </p>
-          <p className="text-neutral4 mt-4 text-xs">
-            Available signals: {signalNames.length > 0 ? signalNames.map(formatSignalName).join(', ') : 'None'}
-          </p>
-        </section>
-      )}
-    </>
+    <TraceIntelligenceEntityIndex
+      entityType="agent"
+      {...urlState}
+      getEntityHref={entity => {
+        const detailSearch = new URLSearchParams();
+        for (const key of ['datePreset', 'dateFrom', 'dateTo']) {
+          const value = searchParams.get(key);
+          if (value) detailSearch.set(key, value);
+        }
+        const query = detailSearch.toString();
+        return `/intelligence/entities/${encodeURIComponent(entity.entityType)}/${encodeURIComponent(entity.entityId)}${query ? `?${query}` : ''}`;
+      }}
+    />
   );
 }

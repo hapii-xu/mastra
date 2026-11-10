@@ -48,6 +48,11 @@ export interface WorkflowRun {
   createdAt: Date;
   updatedAt: Date;
   resourceId?: string;
+  /**
+   * Set to 2 for runs stored as a header plus entries. Absent for v1 runs.
+   * @experimental
+   */
+  storageVersion?: 2;
 }
 
 export type PaginationInfo = {
@@ -62,6 +67,10 @@ export type PaginationInfo = {
 };
 
 export type MastraMessageFormat = 'v1' | 'v2';
+
+export type StorageMetadataFilterValue = string | number | boolean | null;
+
+export type StorageMetadataFilter = Record<string, StorageMetadataFilterValue>;
 
 /**
  * Common options for listing messages (pagination, filtering, ordering)
@@ -100,8 +109,25 @@ type StorageListMessagesOptions = {
        */
       endExclusive?: boolean;
     };
+    /**
+     * Filter messages by shallow scalar metadata key-value pairs from message content metadata.
+     * All specified key-value pairs must match with exact type equality (AND logic).
+     * Keys must start with a letter or underscore, contain only letters, numbers, and underscores,
+     * be at most 128 characters, and cannot be `__proto__`, `prototype`, or `constructor`.
+     */
+    metadata?: StorageMetadataFilter;
   };
   orderBy?: StorageOrderBy<'createdAt'>;
+  /**
+   * Whether to compute the total count of matching messages.
+   *
+   * Defaults to `true` to preserve Studio pagination, which relies on `total`.
+   * Callers that only need a bounded window of recent messages (e.g. agent
+   * last-N reads) can pass `false` so the store skips the `COUNT(*)` work and
+   * derives `hasMore` from a single extra row. When `false`, `total` is not a
+   * reliable count and should not be used for pagination math.
+   */
+  includeTotal?: boolean;
 };
 
 /**
@@ -151,7 +177,28 @@ export type StorageListWorkflowRunsInput = {
    */
   page?: number;
   resourceId?: string;
+  /**
+   * Best-effort narrowing filter on the thread id embedded in the snapshot JSON.
+   *
+   * Unlike `resourceId`, the thread id is not a column — it lives inside the
+   * snapshot at one of two locations (see `getSnapshotMemoryInfo` in
+   * `domains/workflows/snapshot-memory-info.ts` for the canonical extraction):
+   * 1. agentic-loop: `context.<suspended step>.suspendPayload.__streamState.messageList.memoryInfo.threadId`
+   * 2. durable loop: `context.input.messageListState.memoryInfo.threadId`
+   *
+   * Adapters MAY ignore this field entirely (returning a superset), but MUST
+   * NOT exclude rows the canonical extraction would match. Callers must
+   * re-verify the thread id on returned rows; most adapters currently ignore
+   * the field and only jsonb/json-capable stores (e.g. pg, libsql) push it down.
+   */
+  threadId?: string;
   status?: WorkflowRunStatus;
+  /**
+   * When true, callers only need run metadata. Adapters MAY reduce each run's
+   * snapshot to `{ status, timestamp }` to avoid loading the full snapshot.
+   * Adapters that ignore this return full snapshots.
+   */
+  summary?: boolean;
 };
 
 export type StorageListThreadsInput = {
@@ -229,15 +276,22 @@ export type StorageCloneThreadInput = {
 };
 
 /**
+ * Output from copying a thread. Message payloads are copied inside the store and
+ * never returned; only the id mapping is produced.
+ */
+export type StorageCopyThreadOutput = {
+  /** The newly created thread */
+  thread: StorageThreadType;
+  /** Map from source message IDs to copied message IDs (used for OM remapping) */
+  messageIdMap?: Record<string, string>;
+};
+
+/**
  * Output from cloning a thread
  */
-export type StorageCloneThreadOutput = {
-  /** The newly created cloned thread */
-  thread: StorageThreadType;
+export type StorageCloneThreadOutput = StorageCopyThreadOutput & {
   /** The messages that were copied to the new thread */
   clonedMessages: MastraDBMessage[];
-  /** Map from source message IDs to cloned message IDs (used for OM remapping) */
-  messageIdMap?: Record<string, string>;
 };
 
 export type StorageResourceType = {
@@ -288,10 +342,11 @@ export interface StorageToolConfig {
 /**
  * Per-MCP-client tool configuration stored in agent snapshots.
  * Specifies which tools from an MCP client are enabled and their overrides.
- * When `tools` is omitted, all tools from the MCP client/server are included.
+ * An empty `tools` map (`{}`) includes all tools from the MCP client/server.
+ * When `tools` is omitted, no tools are included.
  */
 export interface StorageMCPClientToolsConfig {
-  /** When omitted, all tools from the source are included. */
+  /** `{}` includes all tools from the source; when omitted, no tools are included. */
   tools?: Record<string, StorageToolConfig>;
 }
 
@@ -360,6 +415,15 @@ export interface StorageModelConfig {
   [key: string]: unknown;
 }
 
+/** Serializable model fallback entry stored in agent snapshots. */
+export interface StorageModelListEntry {
+  id: string;
+  provider: string;
+  modelId: string;
+  enabled: boolean;
+  maxRetries: number;
+}
+
 /**
  * Default options stored in agent snapshots.
  * Based on AgentExecutionOptionsBase but omitting non-serializable properties.
@@ -425,6 +489,19 @@ export interface StorageConditionalVariant<T> {
 export type StorageConditionalField<T> = T | StorageConditionalVariant<T>[];
 
 /**
+ * Serializable subset of `AgentDurableOption` that can be persisted on a stored
+ * agent version snapshot. `cache` and `pubsub` are live runtime objects and are
+ * intentionally excluded — they are inherited from the Mastra instance at
+ * hydration time. This controls resumable streams, not durable execution.
+ */
+export type StorageDurableConfig =
+  | boolean
+  | {
+      /** Auto-cleanup timer for durable stream state (ms). `0` disables cleanup. */
+      cleanupTimeoutMs?: number;
+    };
+
+/**
  * Agent version snapshot type containing ALL agent configuration fields.
  * These fields live exclusively in version snapshot rows, not on the agent record.
  */
@@ -437,6 +514,8 @@ export interface StorageAgentSnapshotType {
   instructions: string | AgentInstructionBlock[];
   /** Model configuration (provider, name, etc.) — static or conditional on request context */
   model: StorageConditionalField<StorageModelConfig>;
+  /** Ordered model fallback list owned by Studio for opted-in code agents. */
+  modelList?: StorageModelListEntry[];
   /** Tool keys with optional per-tool config — static or conditional on request context */
   tools?: StorageConditionalField<Record<string, StorageToolConfig>>;
   /** Default options for generate/stream calls — static or conditional on request context */
@@ -461,8 +540,8 @@ export interface StorageAgentSnapshotType {
   inputProcessors?: StorageConditionalField<StoredProcessorGraph>;
   /** Processor graph for output processing — static or conditional on request context */
   outputProcessors?: StorageConditionalField<StoredProcessorGraph>;
-  /** Memory configuration object — static or conditional on request context */
-  memory?: StorageConditionalField<SerializedMemoryConfig>;
+  /** Memory reference (registered memory id) or inline config — static or conditional on request context */
+  memory?: StorageConditionalField<StorageMemoryRef>;
   /** Scorer keys with optional sampling config — static or conditional on request context */
   scorers?: StorageConditionalField<Record<string, StorageScorerConfig>>;
   /** Map of stored MCP client IDs to their tool configurations — static or conditional on request context */
@@ -475,6 +554,12 @@ export interface StorageAgentSnapshotType {
   skills?: StorageConditionalField<Record<string, StorageSkillConfig>>;
   /** Skill format for system message injection (default: 'xml') */
   skillsFormat?: 'xml' | 'json' | 'markdown';
+  /**
+   * Opt the hydrated agent into durable execution. Serializable subset of
+   * `AgentDurableOption` — `cache`/`pubsub` are live objects and stay code-level.
+   * Not conditional: durability is decided at registration time, not per request.
+   */
+  durable?: StorageDurableConfig;
   /** JSON Schema for validating request context values. Stored as JSON Schema since Zod is not serializable. */
   requestContextSchema?: Record<string, unknown>;
 }
@@ -563,7 +648,7 @@ export type StorageUpdateAgentInput = {
   status?: 'draft' | 'published' | 'archived';
 } & Partial<Omit<StorageAgentSnapshotType, 'memory' | 'browser'>> & {
     /** Memory configuration object (static or conditional), or null to disable memory */
-    memory?: StorageConditionalField<SerializedMemoryConfig> | null;
+    memory?: StorageConditionalField<StorageMemoryRef> | null;
     /** Browser configuration (inline ref), or null to disable browser */
     browser?: StorageConditionalField<StorageBrowserRef> | null;
   };
@@ -635,7 +720,7 @@ export type StorageListAgentsResolvedOutput = PaginationInfo & {
 /** Instruction block discriminated union, stored in agent snapshots */
 export type AgentInstructionBlock =
   | { type: 'text'; content: string }
-  | { type: 'prompt_block_ref'; id: string }
+  | { type: 'prompt_block_ref'; id: string; rules?: RuleGroup }
   | { type: 'prompt_block'; content: string; rules?: RuleGroup };
 
 /** Condition operators for rule evaluation */
@@ -1146,8 +1231,18 @@ export interface ObservationalMemoryHistoryOptions {
   from?: Date;
   /** Only return records created at or before this date */
   to?: Date;
-  /** Number of records to skip (for pagination) */
+  /** Number of records to skip after filtering and ordering (for pagination) */
   offset?: number;
+  /** Match the literal canonical `<observation-group id="..."` prefix in active or buffered observations. */
+  groupId?: string;
+  /** Only return generations strictly before this generation count. */
+  beforeGeneration?: number;
+  /** Only return generations strictly after this generation count. */
+  afterGeneration?: number;
+  /** Generation ordering. Defaults to DESC (newest first). */
+  sortDirection?: 'ASC' | 'DESC';
+  /** Only return the record with this ID, if it belongs to the requested thread or resource. */
+  recordId?: string;
 }
 
 export interface ObservationalMemoryRecord {
@@ -1177,6 +1272,14 @@ export interface ObservationalMemoryRecord {
   originType: ObservationalMemoryOriginType;
   /** Generation counter - incremented each time a reflection creates a new record */
   generationCount: number;
+  /**
+   * Liveness marker. `null`/absent means this record is live (it is the head for its
+   * thread or resource). When a reflection creates the next generation, this record's
+   * `supersededBy` is set to the successor's id in the same atomic step, and it is never
+   * cleared. A superseded record is frozen: lifecycle writes aimed at it are redirected
+   * to the head or rejected, never applied to it.
+   */
+  supersededBy?: string | null;
 
   // Observation content
   /**
@@ -1306,7 +1409,16 @@ export interface UpdateActiveObservationsInput {
    * Captured from Intl.DateTimeFormat().resolvedOptions().timeZone
    */
   observedTimezone?: string;
+  /**
+   * The `activeObservations` text this commit was composed from. When provided, the
+   * write is applied only if the stored text still equals it exactly; otherwise nothing
+   * is written and the result is `{ applied: false, reason: 'conflict' }`. When omitted,
+   * the write is last-write-wins.
+   */
+  expectedActiveObservations?: string;
 }
+
+export type { UpdateActiveObservationsResult } from '@internal/core/memory';
 
 /**
  * Input for updating buffered observations.
@@ -1320,6 +1432,8 @@ export interface UpdateBufferedObservationsInput {
   /** Timestamp cursor for the last buffered message boundary. Set to max message timestamp + 1ms. */
   lastBufferedAtTime?: Date;
 }
+
+export type { UpdateBufferedObservationsResult } from '@internal/core/memory';
 
 /**
  * Input for swapping buffered observations to active.
@@ -1397,6 +1511,11 @@ export interface SwapBufferedToActiveResult {
   suggestedContinuation?: string;
   /** Current task from the most recent activated chunk (if any) */
   currentTask?: string;
+  /**
+   * True when the target record was superseded by a newer generation. Nothing was
+   * written and nothing was activated; the caller should re-read the head and retry.
+   */
+  retired?: boolean;
 }
 
 /**
@@ -1430,15 +1549,33 @@ export interface SwapBufferedReflectionToActiveInput {
    * Computed by the processor using its token counter before calling the adapter.
    */
   tokenCount: number;
+  /**
+   * Id for the new generation. When provided, the caller can tell whether its reflection
+   * was applied: it was iff the returned record's id equals `newRecordId`. If
+   * `currentRecord` was already superseded, nothing is created and the head is returned.
+   */
+  newRecordId?: string;
 }
 
 /**
- * Input for creating a reflection generation (creates a new record, archives the old one)
+ * Input for creating a reflection generation (creates a new record, archives the old one).
+ *
+ * The new generation is built from the **stored** state of `currentRecord.id`, not from the
+ * snapshot: buffered observation chunks are moved to it (in order), and the cursor, buffering
+ * markers, flags, and counters are carried over. If observations were appended to the stored
+ * text after the snapshot was taken (activation), they are kept after the reflection. If the
+ * stored text was rewritten in any other way, nothing is created and the stored record is
+ * returned. If `currentRecord` was superseded, nothing is created and the head is returned.
  */
 export interface CreateReflectionGenerationInput {
   currentRecord: ObservationalMemoryRecord;
   reflection: string;
   tokenCount: number;
+  /**
+   * Id for the new generation. When provided, the caller can tell whether its reflection
+   * was applied: it was iff the returned record's id equals `newRecordId`.
+   */
+  newRecordId?: string;
 }
 
 /**
@@ -2182,6 +2319,18 @@ export type StorageWorkspaceRef =
   | { type: 'inline'; config: StorageWorkspaceSnapshotType }
   | { type: 'provider'; provider: string; config: Record<string, unknown> };
 
+/**
+ * Memory reference configuration stored in agent snapshots.
+ * - `{ type: 'id', memoryId }` references a Memory instance registered on Mastra
+ *   (looked up by registry key first, then by the instance's own id).
+ * - `{ type: 'inline', config }` builds a new Memory from serialized config.
+ * - An untagged `SerializedMemoryConfig` is the legacy inline form and behaves like `inline`.
+ */
+export type StorageMemoryRef =
+  | { type: 'id'; memoryId: string }
+  | { type: 'inline'; config: SerializedMemoryConfig }
+  | SerializedMemoryConfig;
+
 // ============================================
 // Workflow Storage Types
 // ============================================
@@ -2205,6 +2354,35 @@ export interface UpdateWorkflowStateOptions {
     spanId?: string;
     parentSpanId?: string;
   };
+  /** When an agent resume claimed this suspended run. See `WorkflowRunState.resumeClaimedAt`. */
+  resumeClaimedAt?: number;
+  /** The claim an agent resume started under a run-ownership lease. See `WorkflowRunState.resumeLeasedClaimAt`. */
+  resumeLeasedClaimAt?: number;
+  /**
+   * Optional compare-and-set guard. When provided, the update is applied only if the
+   * persisted snapshot's status matches one of these values. Otherwise the update is a
+   * no-op and `updateWorkflowState` resolves to `undefined`.
+   *
+   * This is only enforced atomically by stores that report `supportsConcurrentUpdates()`,
+   * because those stores load and write the snapshot inside a single critical section.
+   * Stores without concurrent update support apply it on a best-effort basis.
+   *
+   * This field is a guard only: it is never merged into the persisted snapshot.
+   */
+  expectedStatus?: WorkflowRunStatus | WorkflowRunStatus[];
+}
+
+/**
+ * Returns true when a snapshot's current status satisfies an `expectedStatus` guard.
+ * Stores call this inside their `updateWorkflowState` critical section.
+ */
+export function matchesExpectedWorkflowStatus(
+  currentStatus: WorkflowRunStatus | undefined,
+  expectedStatus: UpdateWorkflowStateOptions['expectedStatus'],
+): boolean {
+  if (expectedStatus === undefined) return true;
+  const expected = Array.isArray(expectedStatus) ? expectedStatus : [expectedStatus];
+  return currentStatus !== undefined && expected.includes(currentStatus);
 }
 
 function unwrapSchema(schema: z.ZodTypeAny): { base: z.ZodTypeAny; nullable: boolean } {
@@ -2451,11 +2629,17 @@ export interface DatasetItemToolMock {
  * Diagnostic receipt for tool-mock usage on a single experiment result.
  * Structurally mirrors `ToolMockReport` in the experiment engine.
  */
+export type DatasetUnmockedToolPolicy = 'allow' | 'deny';
+
 export interface DatasetToolMockReport {
   served: { mockIndex: number; toolName: string; args: unknown }[];
   unconsumed: { mockIndex: number; toolName: string; args: unknown }[];
   liveCalls: { toolName: string; args: unknown }[];
-  failure?: { code: 'TOOL_MOCK_MISMATCH' | 'TOOL_MOCK_EXHAUSTED'; toolName: string; args: unknown };
+  failure?: {
+    code: 'TOOL_MOCK_MISMATCH' | 'TOOL_MOCK_EXHAUSTED' | 'TOOL_MOCK_NOT_DECLARED';
+    toolName: string;
+    args: unknown;
+  };
 }
 
 export interface DatasetItem {
@@ -2471,10 +2655,12 @@ export interface DatasetItem {
   input: unknown;
   groundTruth?: unknown;
   expectedTrajectory?: unknown;
-  toolMocks?: DatasetItemToolMock[];
-  requestContext?: Record<string, unknown>;
-  metadata?: Record<string, unknown>;
-  source?: DatasetItemSource;
+  toolMocks?: DatasetItemToolMock[] | null;
+  unmockedToolPolicy?: DatasetUnmockedToolPolicy | null;
+  scorerIds?: string[] | null;
+  requestContext?: Record<string, unknown> | null;
+  metadata?: Record<string, unknown> | null;
+  source?: DatasetItemSource | null;
   createdAt: Date;
   updatedAt: Date;
 }
@@ -2494,10 +2680,12 @@ export interface DatasetItemRow {
   input: unknown;
   groundTruth?: unknown;
   expectedTrajectory?: unknown;
-  toolMocks?: DatasetItemToolMock[];
-  requestContext?: Record<string, unknown>;
-  metadata?: Record<string, unknown>;
-  source?: DatasetItemSource;
+  toolMocks?: DatasetItemToolMock[] | null;
+  unmockedToolPolicy?: DatasetUnmockedToolPolicy | null;
+  scorerIds?: string[] | null;
+  requestContext?: Record<string, unknown> | null;
+  metadata?: Record<string, unknown> | null;
+  source?: DatasetItemSource | null;
   createdAt: Date;
   updatedAt: Date;
 }
@@ -2611,6 +2799,9 @@ export interface DatasetItemPayload {
   groundTruth?: unknown;
   expectedTrajectory?: unknown;
   toolMocks?: DatasetItemToolMock[];
+  /** Overrides the experiment's handling of tool calls not declared in `toolMocks`. */
+  unmockedToolPolicy?: DatasetUnmockedToolPolicy;
+  scorerIds?: string[];
   requestContext?: Record<string, unknown>;
   metadata?: Record<string, unknown>;
   source?: DatasetItemSource;
@@ -2633,9 +2824,10 @@ export interface AddDatasetItemInput extends DatasetItemPayload {
  * The optional `filters` field is a tenancy read-scope for the parent dataset;
  * see {@link AddDatasetItemInput.filters}.
  */
-export interface UpdateDatasetItemInput extends Partial<Omit<DatasetItemPayload, 'externalId'>> {
+export interface UpdateDatasetItemInput extends Partial<Omit<DatasetItemPayload, 'externalId' | 'scorerIds'>> {
   id: string;
   datasetId: string;
+  scorerIds?: string[] | null;
   filters?: DatasetTenancyFilters;
 }
 
@@ -2651,6 +2843,17 @@ export interface DatasetItemIdentityConflictDetail {
  * tenancy read-scope for the parent dataset; see {@link AddDatasetItemInput.filters}.
  */
 export interface DeleteDatasetItemInput {
+  id: string;
+  datasetId: string;
+  filters?: DatasetTenancyFilters;
+}
+
+/**
+ * Permanently scrubs user-supplied content from every SCD-2 row for an item
+ * and from experiment results that reference it, while retaining identity and
+ * versioning skeletons for referential integrity and reproducibility.
+ */
+export interface PurgeDatasetItemInput {
   id: string;
   datasetId: string;
   filters?: DatasetTenancyFilters;
@@ -2675,14 +2878,31 @@ export interface ListDatasetsFilters extends DatasetTenancyFilters {
    */
   targetIds?: string[];
   /**
+   * Only return datasets with these IDs. Unlike `targetIds`, an empty array
+   * matches no datasets.
+   */
+  datasetIds?: string[];
+  /**
    * Substring match on dataset `name`, case-insensitive.
    */
   name?: string;
 }
 
+export type DatasetOrderByField = 'createdAt' | 'updatedAt' | 'name';
+export type DatasetItemOrderByField = 'createdAt' | 'updatedAt';
+export type ExperimentOrderByField = 'createdAt' | 'status';
+export type ExperimentResultOrderByField = 'startedAt' | 'createdAt';
+
+export interface ListOrderBy<TField extends string> {
+  field?: TField;
+  direction?: ThreadSortDirection;
+}
+
 export interface ListDatasetsInput {
   pagination: StoragePagination;
   filters?: ListDatasetsFilters;
+  /** Sort order. Defaults to `createdAt DESC`. Ties are broken by `id ASC`. */
+  orderBy?: ListOrderBy<DatasetOrderByField>;
 }
 
 export interface ListDatasetsOutput {
@@ -2696,6 +2916,8 @@ export interface ListDatasetItemsInput {
   search?: string;
   pagination: StoragePagination;
   filters?: DatasetTenancyFilters;
+  /** Sort order. Defaults to `createdAt DESC`. Ties are broken by `id ASC`. */
+  orderBy?: ListOrderBy<DatasetItemOrderByField>;
 }
 
 export interface ListDatasetItemsOutput {
@@ -2733,23 +2955,108 @@ export interface BatchDeleteItemsInput {
 
 export type ExperimentStatus = 'pending' | 'running' | 'completed' | 'failed';
 
+/**
+ * Caller-provided information describing the source of an experiment execution.
+ *
+ * A typical mapping is source system, source-owned identifier, and revision. For
+ * example, `source: 'github'`, `sourceId: 'mastra-ai/mastra'`, and
+ * `sourceVersion: '<commit-sha>'`. These values are persisted as unverified
+ * caller claims; use {@link ExperimentRunnerAttestation} for trusted
+ * runner-generated execution identity.
+ *
+ * Provenance is assigned when an experiment is created and cannot be changed
+ * through the experiment update contract.
+ */
+export interface ExperimentProvenance {
+  /** Source system or source kind, such as `github`, `ci`, or `local`. */
+  source?: string;
+  /** Stable identifier owned by the source, such as a repository or benchmark definition. */
+  sourceId?: string;
+  /** Revision of the source, such as a commit SHA, release version, or configuration digest. */
+  sourceVersion?: string;
+  /** Additional caller-defined source context. */
+  metadata?: Record<string, unknown>;
+}
+
+/**
+ * Caller-defined dimensions used to group related experiment executions.
+ *
+ * For a study comparing baseline and candidate variants across repeated trials:
+ * - `experimentSetId` identifies the overall study and is shared by every related run.
+ * - `comparisonId` identifies one controlled comparison within the study and is
+ *   shared by all variants and trials in that comparison.
+ * - `variantId` identifies an alternative within the comparison, such as
+ *   `baseline` or `candidate`.
+ * - `trialIndex` is the zero-based repetition index for that variant.
+ *
+ * The natural caller-defined identity is
+ * `(experimentSetId, comparisonId, variantId, trialIndex)`. Mastra does not
+ * enforce uniqueness or require every dimension, so callers own identifier scope
+ * and consistency. Grouping is assigned when an experiment is created and cannot
+ * be changed through the experiment update contract.
+ *
+ * @example
+ * ```ts
+ * const sharedGrouping = {
+ *   experimentSetId: 'support-agent-benchmark',
+ *   comparisonId: 'prompt-v1-vs-v2',
+ * };
+ *
+ * const runs = [
+ *   { ...sharedGrouping, variantId: 'baseline', trialIndex: 0 },
+ *   { ...sharedGrouping, variantId: 'baseline', trialIndex: 1 },
+ *   { ...sharedGrouping, variantId: 'candidate', trialIndex: 0 },
+ *   { ...sharedGrouping, variantId: 'candidate', trialIndex: 1 },
+ * ];
+ * ```
+ */
+export interface ExperimentGrouping {
+  /** Overall study or benchmark campaign identifier. */
+  experimentSetId?: string;
+  /** Controlled comparison identifier within the experiment set. */
+  comparisonId?: string;
+  /** Alternative identifier within the comparison. */
+  variantId?: string;
+  /** Zero-based repetition index for the variant. */
+  trialIndex?: number;
+}
+
+/** Trusted runner-generated execution identity. Not accepted by caller-facing run APIs. */
+export interface ExperimentRunnerAttestation {
+  runnerId: string;
+  invocationId: string;
+  runnerVersion?: string;
+}
+
 export interface Experiment {
   id: string;
   name?: string;
   description?: string;
   metadata?: Record<string, unknown>;
+  provenance?: ExperimentProvenance | null;
+  runnerAttestation?: ExperimentRunnerAttestation | null;
+  experimentSetId?: string | null;
+  comparisonId?: string | null;
+  variantId?: string | null;
+  trialIndex?: number | null;
   datasetId: string | null;
   datasetVersion: number | null;
   /**
    * The kind of executor this experiment runs against (agent / workflow / scorer / processor).
    *
-   * Required: an experiment by definition replays inputs against a specific target, so the runner
-   * always needs a target type to resolve the executor. This differs from
-   * {@link CreateDatasetInput.targetType} (optional) — a dataset can exist without a designated
-   * target, but a dataset without one is not experiment-eligible.
+   * `null` for caller-driven ingestion experiments: the caller executes items
+   * itself and submits results, so there is no registered target to resolve.
+   * Runner-owned and item-run experiments always carry a non-null target.
    */
-  targetType: TargetType;
-  targetId: string;
+  targetType: TargetType | null;
+  targetId: string | null;
+  /**
+   * Run-level scorer IDs pinned at create time for caller-driven experiments.
+   * Acts as the highest-priority scorer source when Mastra executes items
+   * (`runExperimentItem`), mirroring the runner's `scorers` option. `null`
+   * falls through to item-level then dataset-level scorer IDs.
+   */
+  scorerIds?: string[] | null;
   status: ExperimentStatus;
   totalItems: number;
   succeededCount: number;
@@ -2776,13 +3083,23 @@ export interface ExperimentResult {
   input: unknown;
   output: unknown | null;
   groundTruth: unknown | null;
+  metadata: Record<string, unknown> | null;
   error: { message: string; stack?: string; code?: string } | null;
   startedAt: Date;
   completedAt: Date;
   retryCount: number;
+  /**
+   * Zero-based repetition index for this item within the experiment. Part of
+   * the natural result identity `(experimentId, itemId, attempt)` used by
+   * {@link ExperimentsStorage.upsertExperimentResult} so external runners can
+   * retry submissions safely (retries converge on one row) while repeated
+   * trials use distinct attempt values on purpose.
+   */
+  attempt: number;
   traceId: string | null;
   status: ExperimentResultStatus | null;
   tags: string[] | null;
+  comment?: string | null;
   toolMockReport?: DatasetToolMockReport | null;
   /** Multi-tenant organization/account scope. Denormalized from the parent experiment for efficient tenancy-scoped queries. */
   organizationId?: string | null;
@@ -2797,6 +3114,7 @@ export interface UpdateExperimentResultInput {
   experimentId?: string;
   status?: ExperimentResultStatus | null;
   tags?: string[] | null;
+  comment?: string | null;
 }
 
 export interface CreateExperimentInput {
@@ -2804,17 +3122,25 @@ export interface CreateExperimentInput {
   name?: string;
   description?: string;
   metadata?: Record<string, unknown>;
+  provenance?: ExperimentProvenance;
+  runnerAttestation?: ExperimentRunnerAttestation;
+  experimentSetId?: string;
+  comparisonId?: string;
+  variantId?: string;
+  trialIndex?: number;
   datasetId: string | null;
   datasetVersion: number | null;
   agentVersion?: string;
   /**
-   * Discriminator for the target this experiment runs against. Required because
-   * an experiment by definition replays inputs through a specific target; the
-   * runner uses this to resolve the correct executor. Datasets whose
-   * {@link CreateDatasetInput.targetType} is absent are not experiment-eligible.
+   * Discriminator for the target this experiment runs against. `null` for
+   * caller-driven ingestion experiments where the caller owns execution and
+   * submits results; non-null whenever Mastra executes items (runner loop or
+   * per-item `runExperimentItem`).
    */
-  targetType: TargetType;
-  targetId: string;
+  targetType: TargetType | null;
+  targetId: string | null;
+  /** Run-level scorer IDs pinned at create time. See {@link Experiment.scorerIds}. */
+  scorerIds?: string[] | null;
   totalItems: number;
   /**
    * Multi-tenant organization/account scope. Should be hydrated from the parent
@@ -2851,10 +3177,16 @@ export interface AddExperimentResultInput {
   input: unknown;
   output: unknown | null;
   groundTruth: unknown | null;
+  metadata?: Record<string, unknown> | null;
   error: { message: string; stack?: string; code?: string } | null;
   startedAt: Date;
   completedAt: Date;
   retryCount: number;
+  /**
+   * Zero-based repetition index. Defaults to `0`. See
+   * {@link ExperimentResult.attempt} for the identity contract.
+   */
+  attempt?: number;
   traceId?: string | null;
   status?: ExperimentResultStatus | null;
   tags?: string[] | null;
@@ -2869,6 +3201,15 @@ export interface AddExperimentResultInput {
   /** Platform project scope. Hydrated from the parent experiment on insert. */
   projectId?: string | null;
 }
+
+/**
+ * Input for {@link ExperimentsStorage.upsertExperimentResult}. Identical to
+ * {@link AddExperimentResultInput} minus the caller-supplied `id`: the row is
+ * identified by the natural key `(experimentId, itemId, attempt)` instead.
+ * Submitting the same key twice converges on a single row (last write wins),
+ * which makes retried external submissions idempotent.
+ */
+export type UpsertExperimentResultInput = Omit<AddExperimentResultInput, 'id'>;
 
 /**
  * Multi-tenant scoping filters for experiment queries. Mirrors
@@ -2925,9 +3266,15 @@ export interface ListExperimentsInput {
   targetId?: string;
   agentVersion?: string;
   status?: ExperimentStatus;
+  experimentSetId?: string;
+  comparisonId?: string;
+  variantId?: string;
+  trialIndex?: number;
   /** Multi-tenant scoping filters. See {@link ExperimentTenancyFilters}. */
   filters?: ExperimentTenancyFilters;
   pagination: StoragePagination;
+  /** Sort order. Defaults to `createdAt DESC`. Ties are broken by `id ASC`. */
+  orderBy?: ListOrderBy<ExperimentOrderByField>;
 }
 
 export interface ListExperimentsOutput {
@@ -2939,9 +3286,13 @@ export interface ListExperimentResultsInput {
   experimentId: string;
   traceId?: string;
   status?: ExperimentResultStatus;
+  /** Return only results that have *all* of these tags. Empty/undefined disables the filter. */
+  tags?: string[];
   /** Multi-tenant scoping filters. See {@link ExperimentTenancyFilters}. */
   filters?: ExperimentTenancyFilters;
   pagination: StoragePagination;
+  /** Sort order. Defaults to `startedAt ASC` (execution order). Ties are broken by `id ASC`. */
+  orderBy?: ListOrderBy<ExperimentResultOrderByField>;
 }
 
 export interface ListExperimentResultsOutput {

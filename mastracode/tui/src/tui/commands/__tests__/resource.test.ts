@@ -1,5 +1,7 @@
 import { describe, it, expect, vi, beforeEach } from 'vitest';
 import { createMockAgentController as createBaseMockAgentController } from '../../__tests__/agent-controller-mock.js';
+import { AssistantRenderRegistry, getAssistantSegmentKey } from '../../assistant-render-registry.js';
+import { AssistantMessageComponent } from '../../components/assistant-message.js';
 import { handleResourceCommand } from '../resource.js';
 import type { SlashCommandContext } from '../types.js';
 
@@ -61,18 +63,28 @@ function createMockAgentController(opts?: { id?: string; resourceId?: string }) 
 function createMockCtx(controller: ReturnType<typeof createMockAgentController>) {
   const infoMessages: string[] = [];
   const errorMessages: string[] = [];
+  const assistantRenderRegistry = new AssistantRenderRegistry();
+  const assistantSegment = assistantRenderRegistry.start(
+    'assistant-1',
+    getAssistantSegmentKey('assistant-1'),
+    () => new AssistantMessageComponent(),
+  ).segment;
+  vi.spyOn(assistantSegment.component, 'disposeRenderState');
 
   return {
     ctx: {
       state: {
+        assistantRenderRegistry,
+        assistantSegment,
         pendingNewThread: false,
         chatContainer: { clear: vi.fn() },
-        pendingTools: { clear: vi.fn() },
+        pendingTools: new Map(),
         allToolComponents: [] as any[],
         allSystemReminderComponents: [] as any[],
         allShellComponents: [] as any[],
         messageComponentsById: new Map<string, any>(),
         session: (controller as any).session,
+        local: { controller, session: (controller as any).session },
         ui: { requestRender: vi.fn() },
       },
       controller: controller as any,
@@ -153,8 +165,10 @@ describe('handleResourceCommand', () => {
       await handleResourceCommand(ctx, ['other-resource']);
 
       expect(ctx.state.chatContainer.clear).toHaveBeenCalled();
-      expect(ctx.state.pendingTools.clear).toHaveBeenCalled();
+      expect(ctx.state.pendingTools.size).toBe(0);
       expect(ctx.state.allToolComponents).toEqual([]);
+      expect(ctx.state.assistantRenderRegistry.size).toBe(0);
+      expect((ctx.state as any).assistantSegment.component.disposeRenderState).toHaveBeenCalledOnce();
     });
   });
 
@@ -165,6 +179,8 @@ describe('handleResourceCommand', () => {
       expect(controller.setResourceId).toHaveBeenCalledWith(expect.anything(), { resourceId: 'brand-new-resource' });
       expect(controller.session.thread.switch).not.toHaveBeenCalled();
       expect(ctx.state.pendingNewThread).toBe(true);
+      expect(ctx.state.assistantRenderRegistry.size).toBe(0);
+      expect((ctx.state as any).assistantSegment.component.disposeRenderState).toHaveBeenCalledOnce();
       expect(infoMessages[0]).toContain('no existing threads');
       expect(infoMessages[0]).toContain('brand-new-resource');
     });

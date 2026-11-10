@@ -1,13 +1,12 @@
 {
   "name": "@mastra/schema-compat",
-  "version": "1.3.4",
+  "version": "1.3.17",
   "description": "Tool schema compatibility layer for Mastra.ai",
   "type": "module",
   "main": "dist/index.js",
   "types": "dist/index.d.ts",
   "files": [
-    "dist",
-    "CHANGELOG.md"
+    "dist"
   ],
   "exports": {
     ".": {
@@ -83,11 +82,11 @@
     "./package.json": "./package.json"
   },
   "scripts": {
-    "build": "tsup --silent --config tsup.config.ts",
-    "build:watch": "tsup --watch --silent --config tsup.config.ts",
+    "build": "tsdown --silent --config tsdown.config.ts",
+    "build:watch": "tsdown --watch --silent --config tsdown.config.ts",
     "test": "vitest run",
-    "lint": "oxlint . && eslint .",
-    "lint:fix": "oxlint --fix . && eslint --fix ."
+    "lint": "oxlint --type-aware .",
+    "lint:fix": "oxlint --type-aware --fix ."
   },
   "keywords": [
     "mastra",
@@ -99,38 +98,37 @@
   "author": "",
   "license": "Apache-2.0",
   "dependencies": {
-    "json-schema-to-zod": "^2.7.0",
-    "zod-from-json-schema": "^0.5.2",
-    "zod-from-json-schema-v3": "npm:zod-from-json-schema@^0.0.5",
-    "zod-to-json-schema": "^3.25.1"
+    "json-schema-to-zod": "^2.8.1",
+    "zod-from-json-schema": "0.5.2"
   },
   "peerDependencies": {
     "zod": "^3.25.0 || ^4.0.0"
   },
   "devDependencies": {
-    "@ai-sdk/anthropic": "^3.0.98",
-    "@ai-sdk/google": "^3.0.95",
-    "@ai-sdk/openai": "^3.0.86",
+    "@ai-sdk/anthropic": "^3.0.137",
+    "@ai-sdk/google": "^3.0.140",
+    "@ai-sdk/openai": "^3.0.135",
     "@internal/ai-sdk-v4": "workspace:*",
     "@internal/ai-sdk-v5": "workspace:*",
     "@internal/ai-v6": "workspace:*",
-    "@internal/llm-recorder": "workspace:*",
     "@internal/lint": "workspace:*",
+    "@internal/llm-recorder": "workspace:*",
     "@internal/test-utils": "workspace:*",
     "@internal/types-builder": "workspace:*",
     "@standard-schema/spec": "^1.1.0",
     "@types/json-schema": "^7.0.15",
-    "@types/node": "22.20.1",
+    "@types/node": "22.19.15",
     "@vitest/coverage-v8": "catalog:",
     "@vitest/ui": "catalog:",
     "ajv": "^8.20.0",
-    "arktype": "^2.2.0",
-    "eslint": "^10.7.0",
+    "arktype": "^2.2.9",
     "json-schema-traverse": "^1.0.0",
-    "tsup": "^8.5.1",
+    "tsdown": "0.23.1",
     "typescript": "catalog:",
     "vitest": "catalog:",
     "zod": "catalog:",
+    "zod-from-json-schema-v3": "npm:zod-from-json-schema@^0.0.5",
+    "zod-to-json-schema": "^3.25.2",
     "zod-v3": "npm:zod@^3.25.76"
   },
   "homepage": "https://mastra.ai",

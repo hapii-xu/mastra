@@ -6,7 +6,6 @@
  * CorrelationContext and metadata are snapshotted at construction time.
  */
 
-import { generateSignalId } from '@mastra/core/observability';
 import type {
   MetricsContext,
   Counter,
@@ -20,6 +19,7 @@ import type {
 } from '@mastra/core/observability';
 
 import type { ObservabilityBus } from '../bus';
+import { generateSignalId } from '../ids';
 import type { CardinalityFilter } from '../metrics/cardinality';
 
 /** Configuration for creating a MetricsContextImpl. */
@@ -87,6 +87,7 @@ export class MetricsContextImpl implements MetricsContext {
       labels: filteredLabels,
       correlationContext: this.correlationContext,
       costContext,
+      ...(options?.usageId ? { usageId: options.usageId } : {}),
       metadata: this.metadata,
     };
 

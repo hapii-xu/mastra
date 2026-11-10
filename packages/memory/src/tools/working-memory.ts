@@ -14,10 +14,25 @@ const SET_WORKING_MEMORY_TOOL_NAME = 'setWorkingMemory';
 /**
  * Deep merges two objects, with special handling for null values (delete) and arrays (replace).
  * - Object properties are recursively merged
- * - null values in the update will delete the corresponding property
+ * - null values in the update will delete the corresponding property, even when the property
+ *   or its parent object does not exist yet (so padded nulls never get stored literally)
  * - Arrays are replaced entirely (not merged element-by-element)
  * - Primitive values are overwritten
+ * - The returned object is always newly constructed and never aliases `update`
  */
+/**
+ * Parses stored JSON working memory. Invalid or empty data yields `null` (start fresh).
+ */
+export function parseWorkingMemoryJson(raw: unknown): Record<string, unknown> | null {
+  if (!raw) return null;
+  if (typeof raw !== 'string') return raw as Record<string, unknown>;
+  try {
+    return JSON.parse(raw);
+  } catch {
+    return null;
+  }
+}
+
 export function deepMergeWorkingMemory(
   existing: Record<string, unknown> | null | undefined,
   update: Record<string, unknown> | null | undefined,
@@ -27,15 +42,17 @@ export function deepMergeWorkingMemory(
     return existing && typeof existing === 'object' ? { ...existing } : {};
   }
 
-  if (!existing || typeof existing !== 'object') {
-    return update;
-  }
-
-  const result: Record<string, unknown> = { ...existing };
+  const base = existing && typeof existing === 'object' && !Array.isArray(existing) ? existing : {};
+  const result: Record<string, unknown> = { ...base };
 
   for (const key of Object.keys(update)) {
     const updateValue = update[key];
     const existingValue = result[key];
+
+    // undefined means the field was omitted - leave existing value untouched
+    if (updateValue === undefined) {
+      continue;
+    }
 
     // null means delete the property
     if (updateValue === null) {
@@ -45,18 +62,15 @@ export function deepMergeWorkingMemory(
     else if (Array.isArray(updateValue)) {
       result[key] = updateValue;
     }
-    // Recursively merge nested objects
-    else if (
-      typeof updateValue === 'object' &&
-      updateValue !== null &&
-      typeof existingValue === 'object' &&
-      existingValue !== null &&
-      !Array.isArray(existingValue)
-    ) {
-      result[key] = deepMergeWorkingMemory(
-        existingValue as Record<string, unknown>,
-        updateValue as Record<string, unknown>,
-      );
+    // Recursively merge nested objects. Brand-new branches recurse too, so nulls inside
+    // them are dropped instead of being stored literally.
+    else if (typeof updateValue === 'object') {
+      const existingBranch =
+        existingValue && typeof existingValue === 'object' && !Array.isArray(existingValue)
+          ? (existingValue as Record<string, unknown>)
+          : undefined;
+
+      result[key] = deepMergeWorkingMemory(existingBranch, updateValue as Record<string, unknown>);
     }
     // Primitive values or new properties: just set them
     else {
@@ -67,7 +81,21 @@ export function deepMergeWorkingMemory(
   return result;
 }
 
-function stripNullsFromOptional(value: unknown, schema: Record<string, unknown>): unknown {
+/** `.nullable()` wraps a schema as `anyOf: [schema, { type: 'null' }]`; unwrap it so its declared fields are visible. */
+function resolveNullableBranch(value: unknown, schema: Record<string, unknown>): Record<string, unknown> {
+  const branches = schema.anyOf ?? schema.oneOf;
+  if (!Array.isArray(branches)) {
+    return schema;
+  }
+
+  const kind = Array.isArray(value) ? 'array' : 'object';
+  const matching = (branches as Record<string, unknown>[]).filter(branch => branch.type === kind);
+  return matching.length === 1 ? matching[0]! : schema;
+}
+
+export function stripNullsFromOptional(value: unknown, rawSchema: Record<string, unknown>): unknown {
+  const schema = resolveNullableBranch(value, rawSchema);
+
   if (Array.isArray(value)) {
     const itemSchema = (schema.items as Record<string, unknown>) ?? {};
     return value.map(item => stripNullsFromOptional(item, itemSchema));
@@ -79,7 +107,9 @@ function stripNullsFromOptional(value: unknown, schema: Record<string, unknown>)
     const result: Record<string, unknown> = {};
 
     for (const [key, propertyValue] of Object.entries(value as Record<string, unknown>)) {
-      if (propertyValue === null && !required.includes(key)) {
+      // Only declared optional properties: an undeclared null key must still reach the schema validator, so strict
+      // schemas can reject it and record-style schemas keep it.
+      if (propertyValue === null && Object.hasOwn(properties, key) && !required.includes(key)) {
         continue;
       }
 
@@ -147,9 +177,14 @@ export const updateWorkingMemoryTool = (memoryConfig?: MemoryConfigInternal) => 
           // stripping nulls from the raw value and validating it as the memory payload.
           const hasWrapper =
             !!value && typeof value === 'object' && !Array.isArray(value) && 'memory' in (value as object);
-          const memoryValue = hasWrapper
-            ? (value as { memory: unknown }).memory
-            : stripNullsFromOptional(value, jsonSchema as Record<string, unknown>);
+          // Strict-mode providers (e.g. OpenAI) require every property to be listed in
+          // `required`, so models must emit an explicit `null` for fields they are not
+          // updating. Since `null` means "delete this field" to the merge, those padded
+          // nulls would wipe unrelated sections. Drop nulls for fields the user's schema
+          // marks optional so they are treated as "not provided", matching the tool's
+          // documented contract that omitted fields preserve existing data.
+          const rawMemoryValue = hasWrapper ? (value as { memory: unknown }).memory : value;
+          const memoryValue = stripNullsFromOptional(rawMemoryValue, jsonSchema as Record<string, unknown>);
 
           const result = validateMemory(memoryValue);
           return result instanceof Promise ? result.then(toWrappedResult) : toWrappedResult(result);
@@ -182,6 +217,10 @@ export const updateWorkingMemoryTool = (memoryConfig?: MemoryConfigInternal) => 
     id: 'update-working-memory',
     description,
     inputSchema,
+    // Merge semantics depend on the model being able to omit fields it is not updating.
+    // Strict structured outputs would force every field into `required`, so the model has to
+    // emit placeholder values for untouched sections, which then overwrite stored data.
+    ...(usesMergeSemantics ? { strict: false as const } : {}),
     execute: async (inputData, context) => {
       const workingMemoryInput = inputData as { memory: any };
       const threadId = context?.agent?.threadId;
@@ -222,23 +261,6 @@ export const updateWorkingMemoryTool = (memoryConfig?: MemoryConfigInternal) => 
       let workingMemory: string;
 
       if (usesMergeSemantics) {
-        // Schema-based: fetch existing, merge, save
-        const existingRaw = await memory.getWorkingMemory({
-          threadId,
-          resourceId,
-          memoryConfig,
-        });
-
-        let existingData: Record<string, unknown> | null = null;
-        if (existingRaw) {
-          try {
-            existingData = typeof existingRaw === 'string' ? JSON.parse(existingRaw) : existingRaw;
-          } catch {
-            // If existing data is not valid JSON, start fresh
-            existingData = null;
-          }
-        }
-
         // Handle case where LLM passes empty object or no memory field
         const memoryInput = workingMemoryInput.memory;
         if (memoryInput === undefined || memoryInput === null) {
@@ -261,7 +283,31 @@ export const updateWorkingMemoryTool = (memoryConfig?: MemoryConfigInternal) => 
           newData = memoryInput;
         }
 
-        const mergedData = deepMergeWorkingMemory(existingData, newData as Record<string, unknown>);
+        // Merge atomically in storage when possible so concurrent writers can't drop each other's fields
+        if (
+          scope === 'resource' &&
+          typeof memory.supportsAtomicWorkingMemoryMerge === 'function' &&
+          (await memory.supportsAtomicWorkingMemoryMerge())
+        ) {
+          await memory.mergeWorkingMemory({
+            threadId,
+            resourceId,
+            workingMemory: newData,
+            memoryConfig,
+          });
+          return { success: true };
+        }
+
+        // Fallback: fetch existing, merge, save
+        const existingRaw = await memory.getWorkingMemory({
+          threadId,
+          resourceId,
+          memoryConfig,
+        });
+        const mergedData = deepMergeWorkingMemory(
+          parseWorkingMemoryJson(existingRaw),
+          newData as Record<string, unknown>,
+        );
         workingMemory = JSON.stringify(mergedData);
       } else {
         // Template-based (Markdown): use existing replace semantics

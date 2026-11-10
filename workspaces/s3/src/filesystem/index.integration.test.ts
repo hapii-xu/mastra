@@ -2,14 +2,14 @@
  * S3 Filesystem Integration Tests
  *
  * These tests require real S3-compatible credentials and run against
- * actual cloud storage (AWS S3, Cloudflare R2, MinIO, etc.)
+ * actual cloud storage (AWS S3, Cloudflare R2, Neon Object Storage, MinIO, etc.)
  *
  * Required environment variables:
  * - S3_BUCKET: Bucket name
  * - S3_ACCESS_KEY_ID: Access key
  * - S3_SECRET_ACCESS_KEY: Secret key
  * - S3_REGION: Region (optional, defaults to 'auto')
- * - S3_ENDPOINT: Endpoint URL (optional, for R2/MinIO)
+ * - S3_ENDPOINT: Endpoint URL (optional, for R2/Neon/MinIO)
  */
 
 import {
@@ -156,6 +156,21 @@ describe.skipIf(!hasS3Credentials)('S3Filesystem Integration', () => {
     expect(stat.name).toBe('stats.txt');
     expect(stat.type).toBe('file');
     expect(stat.size).toBeGreaterThan(0);
+    expect(stat.mimeType).toBe('text/plain');
+  });
+
+  it('surfaces Content-Type as mimeType for image uploads', async () => {
+    await fs.init();
+
+    const png = Buffer.from(
+      'iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNkYAAAAAYAAjCB0C8AAAAASUVORK5CYII=',
+      'base64',
+    );
+    await fs.writeFile('/pixel.png', png);
+    const stat = await fs.stat('/pixel.png');
+
+    expect(stat.type).toBe('file');
+    expect(stat.mimeType).toBe('image/png');
   });
 });
 

@@ -13,6 +13,32 @@ import type { CommandResult } from '../types';
 import type { SpawnProcessOptions } from './types';
 
 export const DEFAULT_MAX_RETAINED_PROCESS_OUTPUT_BYTES = 1024 * 1024;
+/**
+ * Most output one stream can retain, even with `maxRetainedBytes: Infinity`.
+ * Retained chunks are joined into one string, and V8 throws `RangeError: Invalid string length`
+ * past ~512 Mi UTF-16 code units. A string never has more code units than UTF-8 bytes, so
+ * 256 MiB keeps the join well inside that limit.
+ */
+export const MAX_RETAINED_PROCESS_OUTPUT_BYTES = 256 * 1024 * 1024;
+
+/**
+ * A process asked to keep all of its output (`maxRetainedBytes` above
+ * {@link MAX_RETAINED_PROCESS_OUTPUT_BYTES}, e.g. Infinity) produced more than can be held.
+ * The process is killed and `wait()` rejects with this error rather than returning partial output.
+ */
+export class ProcessOutputLimitError extends Error {
+  readonly name = 'ProcessOutputLimitError';
+
+  constructor(
+    readonly stream: 'stdout' | 'stderr',
+    readonly limitBytes: number,
+  ) {
+    super(
+      `Process ${stream} exceeded ${limitBytes} bytes, the most output that can be retained in full; the process was killed. ` +
+        'Redirect large output to a file or set a finite maxRetainedBytes to keep only the newest output.',
+    );
+  }
+}
 const RETAINED_OUTPUT_COMPACT_CHUNK_THRESHOLD = 128;
 
 /** @internal */
@@ -53,17 +79,42 @@ interface RetainedOutputChunk {
   dataBytes: number;
 }
 
-class RetainedOutputBuffer {
+export class RetainedOutputBuffer {
   private chunks: RetainedOutputChunk[] = [];
   private bytes = 0;
   private droppedBytes = 0;
   private cachedValue: string | undefined;
+  private overflowedLimit = false;
 
-  constructor(private readonly maxBytes: number) {}
+  /**
+   * @param maxBytes keep the newest `maxBytes`; above `hardLimitBytes` (e.g. Infinity) means keep everything
+   * @param hardLimitBytes overridable only so tests can reach the limit without allocating 256 MiB
+   */
+  constructor(
+    private readonly maxBytes: number,
+    readonly hardLimitBytes: number = MAX_RETAINED_PROCESS_OUTPUT_BYTES,
+  ) {}
+
+  /**
+   * True once a keep-everything buffer received more than `hardLimitBytes`.
+   * It then stops retaining: what it holds is incomplete and further data is only counted as dropped.
+   */
+  get overflowed(): boolean {
+    return this.overflowedLimit;
+  }
 
   append(data: string): void {
     const dataBytes = Buffer.byteLength(data);
     if (dataBytes === 0) return;
+    if (this.overflowedLimit) {
+      this.droppedBytes += dataBytes;
+      return;
+    }
+    if (this.maxBytes > this.hardLimitBytes && this.bytes + dataBytes > this.hardLimitBytes) {
+      this.overflowedLimit = true;
+      this.droppedBytes += dataBytes;
+      return;
+    }
     if (this.maxBytes === 0) {
       this.droppedBytes += dataBytes;
       return;
@@ -134,6 +185,17 @@ class RetainedOutputBuffer {
 }
 
 /**
+ * Thrown by {@link ProcessHandle.closeStdin} when the sandbox provider has no
+ * way to close a running process's stdin.
+ *
+ * `handle.writer.end()` treats this error as a successful finish, so piping to
+ * a process stays safe on providers without stdin close support.
+ */
+export class UnsupportedStdinCloseError extends Error {
+  readonly name = 'UnsupportedStdinCloseError';
+}
+
+/**
  * Handle to a spawned process.
  *
  * Subclasses implement the platform-specific primitives (kill, sendStdin,
@@ -190,35 +252,60 @@ export abstract class ProcessHandle {
   abstract sendStdin(data: string): Promise<void>;
 
   /**
+   * Close the process's stdin, signaling EOF.
+   *
+   * Providers that cannot close stdin throw {@link UnsupportedStdinCloseError}.
+   * The default implementation is the unsupported case, so providers only
+   * override this when their transport exposes a stdin close primitive.
+   */
+  async closeStdin(): Promise<void> {
+    throw new UnsupportedStdinCloseError(`${this.constructor.name} does not support closing stdin`);
+  }
+
+  /**
    * Wait for the process to finish and return the result.
    *
    * Optionally pass `onStdout`/`onStderr` callbacks to stream output chunks
    * while waiting. The callbacks are automatically removed when `wait()`
    * resolves, so there's no cleanup needed by the caller.
    *
-   * Subclasses implement `wait()` with platform-specific logic — the base
+   * Optionally pass an `abortSignal` to couple the blocking wait to a caller
+   * lifetime: on abort the process is killed (mirroring the spawn-time
+   * `abortSignal` convention in {@link CommandOptions}), which lets the wait
+   * settle with the killed process's result instead of blocking forever.
+   *
+   * Subclasses implement `wait()` with platform-specific logic; the base
    * constructor wraps it to handle the optional streaming callbacks.
    */
   async wait(_options?: {
     onStdout?: (data: string) => void;
     onStderr?: (data: string) => void;
+    abortSignal?: AbortSignal;
   }): Promise<CommandResult> {
     throw new Error(`${this.constructor.name} must implement wait()`);
   }
 
   private _stdout: RetainedOutputBuffer;
   private _stderr: RetainedOutputBuffer;
+  private _outputLimitError?: ProcessOutputLimitError;
+  private _killedByAbort = false;
+  private _abortKill?: Promise<void>;
   private _stdoutListeners = new Set<(data: string) => void>();
   private _stderrListeners = new Set<(data: string) => void>();
   private _reader?: Readable;
   private _writer?: Writable;
 
-  constructor(options?: Pick<SpawnProcessOptions, 'maxRetainedBytes' | 'onStdout' | 'onStderr'>) {
+  constructor(
+    options?: Pick<SpawnProcessOptions, 'maxRetainedBytes' | 'onStdout' | 'onStderr'> & {
+      /** @internal Lets tests reach the retention limit without producing 256 MiB of output. */
+      retainedOutputHardLimitBytes?: number;
+    },
+  ) {
     const maxRetainedBytes = validateMaxRetainedProcessOutputBytes(
       options?.maxRetainedBytes ?? DEFAULT_MAX_RETAINED_PROCESS_OUTPUT_BYTES,
     );
-    this._stdout = new RetainedOutputBuffer(maxRetainedBytes);
-    this._stderr = new RetainedOutputBuffer(maxRetainedBytes);
+    this._stdout = new RetainedOutputBuffer(maxRetainedBytes, options?.retainedOutputHardLimitBytes);
+    this._stderr = new RetainedOutputBuffer(maxRetainedBytes, options?.retainedOutputHardLimitBytes);
 
     // Spawn-time callbacks are permanent listeners
     if (options?.onStdout) this._stdoutListeners.add(options.onStdout);
@@ -228,11 +315,31 @@ export abstract class ProcessHandle {
     // with a wrapper that handles optional streaming callbacks.
     const implWait = this.wait.bind(this);
 
-    this.wait = async (waitOptions?: { onStdout?: (data: string) => void; onStderr?: (data: string) => void }) => {
+    this.wait = async (waitOptions?: {
+      onStdout?: (data: string) => void;
+      onStderr?: (data: string) => void;
+      abortSignal?: AbortSignal;
+    }) => {
       if (waitOptions?.onStdout) this._stdoutListeners.add(waitOptions.onStdout);
       if (waitOptions?.onStderr) this._stderrListeners.add(waitOptions.onStderr);
+      // Abort kills the process (same convention as spawn-time `abortSignal`
+      // in the process manager) so the wait settles via the normal exit path
+      // instead of blocking past the caller's lifetime.
+      const abortSignal = waitOptions?.abortSignal;
+      const onAbort = () => {
+        void this.killForAbort().catch(() => {});
+      };
+      if (abortSignal?.aborted) onAbort();
+      else abortSignal?.addEventListener('abort', onAbort, { once: true });
       try {
-        const result = await implWait();
+        let result: CommandResult;
+        try {
+          result = await implWait();
+        } catch (error) {
+          // Killing for the output limit can make the provider's wait reject; report why.
+          throw this._outputLimitError ?? error;
+        }
+        if (this._outputLimitError) throw this._outputLimitError;
         return {
           ...result,
           stdoutTruncated: this.stdoutTruncated,
@@ -241,10 +348,42 @@ export abstract class ProcessHandle {
           stderrDroppedBytes: this.stderrDroppedBytes,
         };
       } finally {
+        abortSignal?.removeEventListener('abort', onAbort);
         if (waitOptions?.onStdout) this._stdoutListeners.delete(waitOptions.onStdout);
         if (waitOptions?.onStderr) this._stderrListeners.delete(waitOptions.onStderr);
       }
     };
+  }
+
+  /**
+   * @internal Whether the process was killed because an `abortSignal` passed to spawn or
+   * `wait()` fired while it was still running. A direct `kill()` does not set it.
+   */
+  get killedByAbort(): boolean {
+    return this._killedByAbort;
+  }
+
+  /** @internal Kill the process for a fired abort signal and record it in {@link killedByAbort}. */
+  async killForAbort(): Promise<void> {
+    if (this.exitCode !== undefined) return;
+    // Spawn and wait() can both listen to the same signal; share one kill so a
+    // second kill() reporting "already gone" can't clear the first one's flag.
+    return (this._abortKill ??= this.runAbortKill());
+  }
+
+  private async runAbortKill(): Promise<void> {
+    this._killedByAbort = true;
+    try {
+      // `false` means the process exited on its own before the kill landed.
+      if (!(await this.kill())) {
+        this._killedByAbort = false;
+        this._abortKill = undefined;
+      }
+    } catch (error) {
+      this._killedByAbort = false;
+      this._abortKill = undefined;
+      throw error;
+    }
   }
 
   /** Retained stdout so far */
@@ -283,6 +422,7 @@ export abstract class ProcessHandle {
    */
   emitStdout(data: string): void {
     this._stdout.append(data);
+    if (this._stdout.overflowed) this.failForOutputLimit('stdout', this._stdout.hardLimitBytes);
     for (const listener of this._stdoutListeners) listener(data);
     this._reader?.push(data);
   }
@@ -293,7 +433,15 @@ export abstract class ProcessHandle {
    */
   emitStderr(data: string): void {
     this._stderr.append(data);
+    if (this._stderr.overflowed) this.failForOutputLimit('stderr', this._stderr.hardLimitBytes);
     for (const listener of this._stderrListeners) listener(data);
+  }
+
+  private failForOutputLimit(stream: 'stdout' | 'stderr', limitBytes: number): void {
+    if (this._outputLimitError) return;
+    this._outputLimitError = new ProcessOutputLimitError(stream, limitBytes);
+    // Called from the transport's data handler: nothing can catch a throw or rejection here.
+    void this.kill().catch(() => {});
   }
 
   /** Readable stream of stdout (for use with StreamMessageReader, pipes, etc.) */
@@ -314,6 +462,12 @@ export abstract class ProcessHandle {
       this._writer = new Writable({
         write: (chunk, _encoding, cb) => {
           this.sendStdin(chunk.toString()).then(() => cb(), cb);
+        },
+        final: cb => {
+          this.closeStdin().then(
+            () => cb(),
+            (err: unknown) => cb(err instanceof UnsupportedStdinCloseError ? null : (err as Error)),
+          );
         },
       });
     }

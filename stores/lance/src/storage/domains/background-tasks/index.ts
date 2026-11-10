@@ -1,10 +1,11 @@
-import type { Connection } from '@lancedb/lancedb';
+import type { Connection, IntoSql } from '@lancedb/lancedb';
 import type {
   BackgroundTask,
   BackgroundTaskStatus,
   TaskFilter,
   TaskListResult,
   UpdateBackgroundTask,
+  UpdateBackgroundTaskOptions,
 } from '@mastra/core/background-tasks';
 import { BackgroundTasksStorage, TABLE_BACKGROUND_TASKS, TABLE_SCHEMAS } from '@mastra/core/storage';
 import { LanceDB, resolveLanceConfig } from '../../db';
@@ -36,6 +37,10 @@ function toRecord(task: BackgroundTask): Record<string, any> {
     startedAt: task.startedAt ?? new Date(0),
     suspendedAt: task.suspendedAt ?? new Date(0),
     completedAt: task.completedAt ?? new Date(0),
+    ownerId: task.ownerId ?? null,
+    leaseExpiresAt: task.leaseExpiresAt ?? null,
+    expiresAt: task.expiresAt ?? null,
+    metadata: serializeJson(task.metadata) ?? null,
   };
 }
 
@@ -57,6 +62,13 @@ function fromRecord(row: Record<string, any>): BackgroundTask {
     row.suspendedAt instanceof Date ? row.suspendedAt : row.suspendedAt ? new Date(row.suspendedAt) : undefined;
   const completedAt =
     row.completedAt instanceof Date ? row.completedAt : row.completedAt ? new Date(row.completedAt) : undefined;
+  const leaseExpiresAt =
+    row.leaseExpiresAt instanceof Date
+      ? row.leaseExpiresAt
+      : row.leaseExpiresAt
+        ? new Date(row.leaseExpiresAt)
+        : undefined;
+  const expiresAt = row.expiresAt instanceof Date ? row.expiresAt : row.expiresAt ? new Date(row.expiresAt) : undefined;
 
   return {
     id: String(row.id),
@@ -78,6 +90,10 @@ function fromRecord(row: Record<string, any>): BackgroundTask {
     startedAt: startedAt && startedAt.getTime() > 0 ? startedAt : undefined,
     suspendedAt: suspendedAt && suspendedAt.getTime() > 0 ? suspendedAt : undefined,
     completedAt: completedAt && completedAt.getTime() > 0 ? completedAt : undefined,
+    ownerId: row.ownerId != null && row.ownerId !== '' ? String(row.ownerId) : undefined,
+    leaseExpiresAt,
+    expiresAt,
+    metadata: parseJson(row.metadata),
   };
 }
 
@@ -86,6 +102,7 @@ function escapeStr(val: string): string {
 }
 
 export class StoreBackgroundTasksLance extends BackgroundTasksStorage {
+  override readonly supportsTaskExpiry = true;
   private client: Connection;
   #db: LanceDB;
 
@@ -104,7 +121,7 @@ export class StoreBackgroundTasksLance extends BackgroundTasksStorage {
     await this.#db.alterTable({
       tableName: TABLE_BACKGROUND_TASKS,
       schema: TABLE_SCHEMAS[TABLE_BACKGROUND_TASKS],
-      ifNotExists: ['suspend_payload', 'suspendedAt'],
+      ifNotExists: ['suspend_payload', 'suspendedAt', 'ownerId', 'leaseExpiresAt', 'expiresAt', 'metadata'],
     });
   }
 
@@ -117,27 +134,53 @@ export class StoreBackgroundTasksLance extends BackgroundTasksStorage {
     await table.add([toRecord(task)], { mode: 'append' });
   }
 
-  async updateTask(taskId: string, update: UpdateBackgroundTask): Promise<void> {
-    const existing = await this.getTask(taskId);
-    if (!existing) return;
+  async updateTask(
+    taskId: string,
+    update: UpdateBackgroundTask,
+    options?: UpdateBackgroundTaskOptions,
+  ): Promise<boolean> {
+    const values: Record<string, IntoSql> = {};
+    if ('status' in update) values.status = update.status!;
+    if ('result' in update) values.result = serializeJson(update.result) ?? null;
+    if ('error' in update) values.error = serializeJson(update.error) ?? null;
+    if ('suspendPayload' in update) values.suspend_payload = serializeJson(update.suspendPayload) ?? null;
+    if ('retryCount' in update) values.retry_count = update.retryCount!;
+    if ('startedAt' in update) values.startedAt = update.startedAt?.getTime() ?? 0;
+    if ('suspendedAt' in update) values.suspendedAt = update.suspendedAt?.getTime() ?? 0;
+    if ('completedAt' in update) values.completedAt = update.completedAt?.getTime() ?? 0;
+    if ('ownerId' in update) values.ownerId = update.ownerId ?? null;
+    if ('leaseExpiresAt' in update) values.leaseExpiresAt = update.leaseExpiresAt?.getTime() ?? null;
+    if ('expiresAt' in update) values.expiresAt = update.expiresAt?.getTime() ?? null;
+    if ('metadata' in update) values.metadata = serializeJson(update.metadata) ?? null;
+    if (Object.keys(values).length === 0) return false;
 
-    const merged = { ...existing };
-    if ('status' in update) merged.status = update.status!;
-    // Keep `result`/`error`/`suspendPayload` raw — `toRecord(merged)` below
-    // serializes once. Serializing twice would double-encode (e.g.
-    // `"\"value\""`).
-    if ('result' in update) merged.result = update.result;
-    if ('error' in update) merged.error = update.error;
-    if ('suspendPayload' in update) merged.suspendPayload = update.suspendPayload;
-    if ('retryCount' in update) merged.retryCount = update.retryCount!;
-    if ('startedAt' in update) merged.startedAt = update.startedAt;
-    if ('suspendedAt' in update) merged.suspendedAt = update.suspendedAt;
-    if ('completedAt' in update) merged.completedAt = update.completedAt;
+    const conditions = [`id = '${escapeStr(taskId)}'`];
+    if (options?.expectedStatus) conditions.push(`status = '${escapeStr(options.expectedStatus)}'`);
+    if (options?.expectedOwnerId !== undefined) {
+      conditions.push(
+        options.expectedOwnerId === null ? 'ownerId IS NULL' : `ownerId = '${escapeStr(options.expectedOwnerId)}'`,
+      );
+    }
+    if (options?.expectedLeaseExpiresAt !== undefined) {
+      conditions.push(
+        options.expectedLeaseExpiresAt === null
+          ? 'leaseExpiresAt IS NULL'
+          : `leaseExpiresAt = ${options.expectedLeaseExpiresAt.getTime()}`,
+      );
+    }
+    if (options?.expectedSuspendedAt !== undefined) {
+      // Unlike the lease, an unset `suspendedAt` is stored as 0 (see `toRecord`),
+      // but rows from before that convention may hold NULL.
+      conditions.push(
+        options.expectedSuspendedAt === null
+          ? '(suspendedAt IS NULL OR suspendedAt = 0)'
+          : `suspendedAt = ${options.expectedSuspendedAt.getTime()}`,
+      );
+    }
 
-    // LanceDB doesn't have a native partial update — delete and re-add
     const table = await this.client.openTable(TABLE_BACKGROUND_TASKS);
-    await table.delete(`id = '${escapeStr(taskId)}'`);
-    await table.add([toRecord(merged)], { mode: 'append' });
+    const result = await table.update({ where: conditions.join(' AND '), values });
+    return result.rowsUpdated > 0;
   }
 
   async getTask(taskId: string): Promise<BackgroundTask | null> {
@@ -179,6 +222,10 @@ export class StoreBackgroundTasksLance extends BackgroundTasksStorage {
 
       const records = await query.toArray();
       let tasks = records.map(fromRecord);
+
+      if (filter.hasExpiresAt !== undefined) {
+        tasks = tasks.filter(t => (t.expiresAt != null) === filter.hasExpiresAt);
+      }
 
       // Date range filters — apply in-memory since Lance doesn't support timestamp comparisons well in WHERE
       const dateCol = filter.dateFilterBy ?? 'createdAt';

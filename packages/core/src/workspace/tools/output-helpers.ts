@@ -1,4 +1,7 @@
-import { estimateTokenCount, sliceByTokens } from 'tokenx';
+import { estimateTokenCount } from 'tokenx';
+
+import { isValidationError } from '../../tools/validation';
+import { sliceByTokensSafe } from '../../utils/slice-by-tokens';
 
 /** Default number of lines to return (tail). */
 export const DEFAULT_TAIL_LINES = 200;
@@ -31,10 +34,23 @@ export function stripAnsi(text: string): string {
  *
  * Returns `{ type: 'text', value: '...' }` to match the AI SDK's
  * expected tool-result output format.
+ *
+ * Mastra validation-error envelopes (e.g. from output-schema validation
+ * failures) are tagged as `{ type: 'error-json', value }` so providers
+ * receive a valid tool-result output instead of an untagged object.
+ *
+ * `{ error: string }` results (e.g. substituted by a blocking `beforeToolCall`
+ * hook) are tagged as `{ type: 'error-text', value }` so the model sees the reason.
  */
 export function sandboxToModelOutput(output: unknown): unknown {
   if (typeof output === 'string') {
     return { type: 'text', value: stripAnsi(output) };
+  }
+  if (isValidationError(output)) {
+    return { type: 'error-json', value: output };
+  }
+  if (typeof output === 'object' && output !== null && typeof (output as { error?: unknown }).error === 'string') {
+    return { type: 'error-text', value: (output as { error: string }).error };
   }
   return output;
 }
@@ -51,8 +67,8 @@ export function sandboxToModelOutput(output: unknown): unknown {
  */
 export function applyTail(output: string, tail: number | null | undefined): string {
   if (!output) return output;
-  const n = Math.abs(tail ?? DEFAULT_TAIL_LINES);
-  if (n === 0) return output; // 0 = no limit
+  const n = Math.floor(Math.abs(tail ?? DEFAULT_TAIL_LINES));
+  if (n === 0) return output; // 0 = no limit (also covers |tail| < 1)
   // Strip trailing newline before splitting so it doesn't count as a line
   const trailingNewline = output.endsWith('\n');
   const lines = (trailingNewline ? output.slice(0, -1) : output).split('\n');
@@ -87,7 +103,7 @@ export async function applyTokenLimit(
   const totalTokens = estimateTokenCount(output);
   if (totalTokens <= limit) return output;
 
-  const kept = from === 'start' ? sliceByTokens(output, -limit) : sliceByTokens(output, 0, limit);
+  const kept = from === 'start' ? sliceByTokensSafe(output, -limit) : sliceByTokensSafe(output, 0, limit);
 
   const position = from === 'start' ? 'last' : 'first';
   return from === 'start'
@@ -116,11 +132,25 @@ export async function applyTokenLimitSandwich(
   const headBudget = Math.floor(limit * headRatio);
   const tailBudget = limit - headBudget;
 
-  const head = headBudget > 0 ? sliceByTokens(output, 0, headBudget) : '';
-  const tail = tailBudget > 0 ? sliceByTokens(output, -tailBudget) : '';
+  const head = headBudget > 0 ? sliceByTokensSafe(output, 0, headBudget) : '';
+  const tail = tailBudget > 0 ? sliceByTokensSafe(output, -tailBudget) : '';
 
   const notice = `[...output truncated — showing first ~${headBudget} + last ~${tailBudget} of ~${totalTokens} tokens...]`;
   return [head, notice, tail].filter(Boolean).join('\n');
+}
+
+/**
+ * Tell the model when the sandbox dropped the start of a stream (retention limit),
+ * so it doesn't read the newest output as all of it.
+ */
+export function noteDroppedOutput(
+  output: string,
+  droppedBytes: number | undefined,
+  stream: 'stdout' | 'stderr',
+): string {
+  if (!droppedBytes) return output;
+  const note = `[${stream}: the first ${droppedBytes} bytes were dropped; only the newest output was kept. Redirect output to a file to read all of it.]`;
+  return output ? `${note}\n${output}` : note;
 }
 
 /**

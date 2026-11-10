@@ -7,18 +7,25 @@ import type { CoreMessage } from '@mastra/core/llm';
 import type { TracingContext } from '@mastra/core/observability';
 import { EntityType, SpanType } from '@mastra/core/observability';
 import type { Processor, ProcessorStepOutput, ProcessorStepInputSchema, OutputResult } from '@mastra/core/processors';
-import { ProcessorRunner, ProcessorStepOutputSchema, ProcessorStepSchema } from '@mastra/core/processors';
-import type { InferPublicSchema, PublicSchema, StandardSchemaWithJSON } from '@mastra/core/schema';
+import {
+  ProcessorRunner,
+  ProcessorState,
+  ProcessorStepOutputSchema,
+  ProcessorStepSchema,
+} from '@mastra/core/processors';
+import type { InferPublicSchema, PublicSchema } from '@mastra/core/schema';
 import { toStandardSchema } from '@mastra/core/schema';
 import type { ChunkType, LanguageModelUsage } from '@mastra/core/stream';
 import type { ToolExecutionContext } from '@mastra/core/tools';
 import { Tool, createTool } from '@mastra/core/tools';
 import type { DynamicArgument } from '@mastra/core/types';
 import type { Step, AgentStepOptions, StepParams, ToolStep, StepMetadata } from '@mastra/core/workflows';
-import { Workflow } from '@mastra/core/workflows';
-import { PUBSUB_SYMBOL, STREAM_FORMAT_SYMBOL } from '@mastra/core/workflows/_constants';
+import {
+  Workflow,
+  createStepFromAgent as coreCreateStepFromAgent,
+  createStepFromTool as coreCreateStepFromTool,
+} from '@mastra/core/workflows';
 import type { Inngest } from 'inngest';
-import { z } from 'zod';
 import type { InngestEngineType, InngestWorkflowConfig } from './types';
 import { InngestWorkflow } from './workflow';
 
@@ -143,7 +150,7 @@ export function createStep<
 export function createStep<TStepId extends string, TStepOutput>(
   agent: InngestSubAgent<TStepId> | Agent<TStepId, any>,
   agentOptions: AgentStepOptions<TStepOutput> & {
-    structuredOutput: { schema: StandardSchemaWithJSON<TStepOutput> };
+    structuredOutput: { schema: PublicSchema<TStepOutput> };
     retries?: number;
     scorers?: DynamicArgument<MastraScorers>;
     metadata?: StepMetadata;
@@ -187,7 +194,13 @@ export function createStep<
  * Creates a step from a Processor - wraps a Processor as a workflow step
  * Note: We require at least one processor method to distinguish from StepParams
  */
-export function createStep<TProcessorId extends string>(
+export function createStep<
+  TProcessorId extends string,
+  // Inferred from the previous step when chained, so a processor step accepts another processor step's output.
+  TInput extends
+    | InferPublicSchema<typeof ProcessorStepInputSchema>
+    | InferPublicSchema<typeof ProcessorStepOutputSchema> = InferPublicSchema<typeof ProcessorStepInputSchema>,
+>(
   processor:
     | (Processor<TProcessorId> & { processInput: Function })
     | (Processor<TProcessorId> & { processInputStream: Function })
@@ -198,7 +211,7 @@ export function createStep<TProcessorId extends string>(
 ): Step<
   `processor:${TProcessorId}`,
   unknown,
-  InferPublicSchema<typeof ProcessorStepInputSchema>,
+  TInput,
   InferPublicSchema<typeof ProcessorStepOutputSchema>,
   unknown,
   unknown,
@@ -316,213 +329,37 @@ function createStepFromAgent<TStepId extends string, TStepOutput>(
   params: InngestSubAgent<TStepId> | Agent<TStepId, any>,
   agentOrToolOptions?: Record<string, unknown>,
 ): Step<TStepId, any, any, TStepOutput, unknown, unknown, InngestEngineType> {
-  const options = (agentOrToolOptions ?? {}) as
-    | (AgentStepOptions<TStepOutput> & {
-        retries?: number;
-        scorers?: DynamicArgument<MastraScorers>;
-        metadata?: StepMetadata;
-      })
-    | undefined;
-  // Determine output schema based on structuredOutput option
-  const outputSchema = (options?.structuredOutput?.schema ??
-    z.object({ text: z.string() })) as unknown as PublicSchema<TStepOutput>;
-  const { retries, scorers, metadata, ...agentOptions } =
-    options ??
-    ({} as AgentStepOptions<TStepOutput> & {
-      retries?: number;
-      scorers?: DynamicArgument<MastraScorers>;
-      metadata?: StepMetadata;
-    });
-
-  return {
-    id: params.id,
-    description: params.getDescription(),
-    inputSchema: toStandardSchema(
-      z.object({
-        prompt: z.string(),
-      }),
-    ),
-    outputSchema: toStandardSchema(outputSchema),
-    retries,
-    scorers,
-    metadata,
-    execute: async ({
-      inputData,
-      runId,
-      [PUBSUB_SYMBOL]: pubsub,
-      [STREAM_FORMAT_SYMBOL]: streamFormat,
-      requestContext,
-      tracingContext,
-      abortSignal,
-      abort,
-      writer,
-    }) => {
-      let streamPromise = {} as {
-        promise: Promise<string>;
-        resolve: (value: string) => void;
-        reject: (reason?: any) => void;
-      };
-
-      streamPromise.promise = new Promise((resolve, reject) => {
-        streamPromise.resolve = resolve;
-        streamPromise.reject = reject;
-      });
-
-      // Track structured output result
-      let structuredResult: any = null;
-
-      const toolData = {
-        name: params.name ?? params.id,
-        args: inputData,
-      };
-
-      let stream: ReadableStream<any>;
-
-      if ((await params.getModel()).specificationVersion === 'v1') {
-        if (typeof params.streamLegacy !== 'function') {
-          throw new Error(`Agent step ${params.id} returned a v1 model but does not implement streamLegacy`);
-        }
-        const modelOutput = await params.streamLegacy((inputData as { prompt: string }).prompt, {
-          ...(agentOptions ?? {}),
-          requestContext,
-          tracingContext,
-          onFinish: (result: any) => {
-            // Capture structured output if available
-            const resultWithObject = result as typeof result & { object?: unknown };
-            if (agentOptions?.structuredOutput?.schema && resultWithObject.object) {
-              structuredResult = resultWithObject.object;
-            }
-            streamPromise.resolve(result.text);
-            void agentOptions?.onFinish?.(result);
-          },
-          abortSignal,
-        });
-        if ('text' in modelOutput) {
-          void (modelOutput as { text: Promise<string> }).text.then(streamPromise.resolve, streamPromise.reject);
-        }
-        stream = modelOutput.fullStream as any;
-      } else {
-        const { structuredOutput, ...restAgentOptions } = agentOptions ?? {};
-        const baseOptions = {
-          ...restAgentOptions,
-          requestContext,
-          tracingContext,
-          onFinish: (result: any) => {
-            // Capture structured output if available
-            const resultWithObject = result as typeof result & { object?: unknown };
-            if (structuredOutput?.schema && resultWithObject.object) {
-              structuredResult = resultWithObject.object;
-            }
-            streamPromise.resolve(result.text);
-            void agentOptions?.onFinish?.(result);
-          },
-          abortSignal,
-        };
-
-        const modelOutput = structuredOutput
-          ? await params.stream((inputData as { prompt: string }).prompt, {
-              ...baseOptions,
-              structuredOutput,
-            } as any)
-          : await params.stream((inputData as { prompt: string }).prompt, baseOptions as any);
-
-        stream = modelOutput.fullStream as ReadableStream<any>;
-        void (modelOutput as { text: Promise<string> }).text.then(streamPromise.resolve, streamPromise.reject);
-      }
-
-      if (streamFormat === 'legacy') {
-        await pubsub.publish(`workflow.events.v2.${runId}`, {
-          type: 'watch',
-          runId,
-          data: { type: 'tool-call-streaming-start', ...(toolData ?? {}) },
-        });
-        for await (const chunk of stream) {
-          if (chunk.type === 'text-delta') {
-            await pubsub.publish(`workflow.events.v2.${runId}`, {
-              type: 'watch',
-              runId,
-              data: { type: 'tool-call-delta', ...(toolData ?? {}), argsTextDelta: chunk.textDelta },
-            });
-          }
-        }
-        await pubsub.publish(`workflow.events.v2.${runId}`, {
-          type: 'watch',
-          runId,
-          data: { type: 'tool-call-streaming-finish', ...(toolData ?? {}) },
-        });
-      } else {
-        for await (const chunk of stream) {
-          await writer.write(chunk as any);
-        }
-      }
-
-      if (abortSignal.aborted) {
-        return abort() as TStepOutput;
-      }
-
-      // Return structured output if available, otherwise default text
-      if (structuredResult !== null) {
-        return structuredResult;
-      }
-      return {
-        text: await streamPromise.promise,
-      } as TStepOutput;
-    },
-    component: 'AGENT',
-  };
+  // Delegates to core's factory: the run logic lives in the shared entry
+  // executors (`runAgentEntry`), which is also what the inherited
+  // `DefaultExecutionEngine.executeAgent` runs for declarative graph entries.
+  // The engine generic is phantom (executors never read `ctx.engine`), so the
+  // cast only re-brands the step for Inngest consumers.
+  return coreCreateStepFromAgent(params as any, agentOrToolOptions as any) as unknown as Step<
+    TStepId,
+    any,
+    any,
+    TStepOutput,
+    unknown,
+    unknown,
+    InngestEngineType
+  >;
 }
 
 function createStepFromTool<TStepInput, TSuspend, TResume, TStepOutput>(
   params: ToolStep<TStepInput, TSuspend, TResume, TStepOutput, any>,
   agentOrToolOptions?: Record<string, unknown>,
 ): Step<string, any, TStepInput, TStepOutput, TResume, TSuspend, InngestEngineType> {
-  const toolOpts = agentOrToolOptions as
-    | { retries?: number; scorers?: DynamicArgument<MastraScorers>; metadata?: StepMetadata }
-    | undefined;
-  if (!params.inputSchema || !params.outputSchema) {
-    throw new Error('Tool must have input and output schemas defined');
-  }
-
-  return {
-    id: params.id,
-    description: params.description,
-    inputSchema: params.inputSchema,
-    outputSchema: params.outputSchema,
-    resumeSchema: params.resumeSchema,
-    suspendSchema: params.suspendSchema,
-    retries: toolOpts?.retries,
-    scorers: toolOpts?.scorers,
-    metadata: toolOpts?.metadata,
-    execute: async ({
-      inputData,
-      mastra,
-      requestContext,
-      tracingContext,
-      suspend,
-      resumeData,
-      runId,
-      workflowId,
-      state,
-      setState,
-    }) => {
-      // BREAKING CHANGE v1.0: Pass raw input as first arg, context as second
-      const toolContext = {
-        mastra,
-        requestContext,
-        tracingContext,
-        workflow: {
-          runId,
-          resumeData,
-          suspend,
-          workflowId,
-          state,
-          setState,
-        },
-      };
-      return params.execute(inputData, toolContext) as TStepOutput;
-    },
-    component: 'TOOL',
-  };
+  // Delegates to core's factory (shared `runToolEntry` executor); see
+  // `createStepFromAgent` above for why the engine re-brand cast is safe.
+  return coreCreateStepFromTool(params as any, agentOrToolOptions as any) as unknown as Step<
+    string,
+    any,
+    TStepInput,
+    TStepOutput,
+    TResume,
+    TSuspend,
+    InngestEngineType
+  >;
 }
 
 function createStepFromProcessor<TProcessorId extends string>(
@@ -590,7 +427,7 @@ function createStepFromProcessor<TProcessorId extends string>(
       // Cast to output type for easier property access - the discriminated union
       // ensures type safety at the schema level, but inside the execute function
       // we need access to all possible properties
-      const input = inputData as ProcessorStepOutput;
+      const input = inputData as ProcessorStepOutput & { processorStates?: Map<string, ProcessorState> };
       const {
         phase,
         messages,
@@ -599,7 +436,7 @@ function createStepFromProcessor<TProcessorId extends string>(
         systemMessages,
         part,
         streamParts,
-        state,
+        processorStates,
         result,
         finishReason,
         toolCalls,
@@ -663,6 +500,19 @@ function createStepFromProcessor<TProcessorId extends string>(
         ? { currentSpan: processorSpan }
         : tracingContext;
 
+      // Resolve this processor's persistent state from the shared processorStates map.
+      // Each processor's state lives in the map keyed by processor id, so mutations
+      // persist across phases and across chained processor steps.
+      let processorState: Record<string, unknown> = {};
+      if (processorStates) {
+        let ps = processorStates.get(processor.id);
+        if (!ps) {
+          ps = new ProcessorState(processor.id);
+          processorStates.set(processor.id, ps);
+        }
+        processorState = ps.customState;
+      }
+
       // Base context for all processor methods - includes requestContext for memory processors
       // and tracingContext for proper span nesting when processors call internal agents
       const baseContext = {
@@ -688,7 +538,8 @@ function createStepFromProcessor<TProcessorId extends string>(
         stepNumber,
         systemMessages,
         streamParts,
-        state,
+        state: processorState,
+        processorStates,
         result,
         finishReason,
         toolCalls,
@@ -746,7 +597,7 @@ function createStepFromProcessor<TProcessorId extends string>(
                 messages: messages as MastraDBMessage[],
                 messageList: passThrough.messageList,
                 systemMessages: (systemMessages ?? []) as CoreMessage[],
-                state: {},
+                state: processorState,
               });
 
               if (result instanceof MessageList) {
@@ -826,7 +677,7 @@ function createStepFromProcessor<TProcessorId extends string>(
                 modelSettings,
                 structuredOutput,
                 steps: steps ?? [],
-                state: {},
+                state: processorState,
               });
 
               const validatedResult = await ProcessorRunner.validateAndFormatProcessInputStepResult(result, {
@@ -865,7 +716,7 @@ function createStepFromProcessor<TProcessorId extends string>(
               // Manage per-processor span lifecycle across stream chunks
               // Use unique key to store span on shared state object
               const spanKey = `__outputStreamSpan_${processor.id}`;
-              const mutableState = (state ?? {}) as Record<string, unknown>;
+              const mutableState = processorState;
               let processorSpan = mutableState[spanKey] as
                 | ReturnType<NonNullable<typeof parentSpan>['createChildSpan']>
                 | undefined;
@@ -961,7 +812,7 @@ function createStepFromProcessor<TProcessorId extends string>(
                 ...baseContext,
                 messages: messages as MastraDBMessage[],
                 messageList: passThrough.messageList,
-                state: passThrough.state ?? {},
+                state: processorState,
                 result: outputResult,
               });
 
@@ -1043,7 +894,7 @@ function createStepFromProcessor<TProcessorId extends string>(
                 usage: (usage as LanguageModelUsage) ?? defaultUsage,
                 systemMessages: (systemMessages ?? []) as CoreMessage[],
                 steps: steps ?? [],
-                state: {},
+                state: processorState,
               });
 
               if (result instanceof MessageList) {
@@ -1119,7 +970,19 @@ export function init<TRequestContext = unknown>(inngest: Inngest) {
         any,
         InngestEngineType
       >[],
-    >(params: InngestWorkflowConfig<TWorkflowId, TState, TInput, TOutput, TSteps, TRequestContext>) {
+      TParsedInput = TInput,
+    >(
+      // A schema with `.default()`/`.coerce` has two faces: callers provide the schema's
+      // input type (`TInput`), while the first step receives the parsed output type
+      // (`TParsedInput`) because `Run._validateInput` replaces the input with the
+      // parser's return value. Re-matching `inputSchema` against the two-parameter
+      // `PublicSchema<Output, Input>` captures both faces so `.then(step)` compares
+      // the first step's input against the parsed type, while `run.start`, cron, and
+      // configured `inputData` keep accepting the raw caller input.
+      params: InngestWorkflowConfig<TWorkflowId, TState, TInput, TOutput, TSteps, TRequestContext> & {
+        inputSchema: PublicSchema<TParsedInput, TInput>;
+      },
+    ) {
       return new InngestWorkflow<
         InngestEngineType,
         TSteps,
@@ -1127,7 +990,7 @@ export function init<TRequestContext = unknown>(inngest: Inngest) {
         TState,
         TInput,
         TOutput,
-        TInput,
+        TParsedInput,
         TRequestContext
       >(params, inngest);
     },

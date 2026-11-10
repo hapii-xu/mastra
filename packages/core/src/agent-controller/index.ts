@@ -6,7 +6,21 @@
  * `@mastra/core/harness` for backwards compatibility.
  */
 export { AgentController } from './agent-controller';
-export { Session } from './session';
+export {
+  getSuspensionAddressKey,
+  Session,
+  MODEL_PERSISTENCE_VERSION,
+  MODEL_PERSISTENCE_VERSION_KEY,
+  migratePersistedModelSelection,
+} from './session';
+export {
+  SessionNotStartedError,
+  SessionStartupCancelledError,
+  isSessionNotStartedError,
+  isSessionStartupCancelledError,
+} from './errors';
+export type { ReservedThreadMetadataKey, SessionBeforeAgentEndListener, SuspensionAddress } from './session';
+export type { MessageAuthor } from './message-author';
 export {
   askUserTool,
   assignTaskIds,
@@ -35,14 +49,18 @@ export type {
   AgentControllerRequestState,
   AgentControllerRequestStateUpdater,
   AgentControllerRequestStateUpdateResult,
+  AgentControllerSessionDeletedListener,
   AgentControllerStateSchema,
   AgentControllerSubagent,
   AgentControllerSubagentHistoryEntry,
   AgentControllerThread,
+  AgentControllerThinkingLevel,
   IntervalHandler,
   ModelAuthStatus,
   ModelUseCountProvider,
   ModelUseCountTracker,
+  OMModel,
+  ResolveAutoOMModelArgs,
   OMBufferedStatus,
   OMProgressState,
   OMStatus,
@@ -52,4 +70,10 @@ export type {
   BuiltinToolId,
   TokenUsage,
 } from './types';
+export type {
+  AgentControllerWireEvent,
+  ErrorCarryingAgentControllerEvent,
+  JsonReadyAgentControllerEvent,
+  WireDisplayState,
+} from './wire';
 export type { MastraDBMessage, MastraMessageContentV2, MastraMessagePart } from '../agent/message-list/state/types';

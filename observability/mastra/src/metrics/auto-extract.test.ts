@@ -14,8 +14,8 @@ import { CardinalityFilter } from './cardinality';
 import * as estimatorModule from './estimator';
 import { PricingRegistry } from './pricing-registry';
 
-const fixturePath = path.join(import.meta.dirname, '__fixtures__', 'pricing-data-test.jsonl');
-const pricingRegistry = PricingRegistry.fromText(fs.readFileSync(fixturePath, 'utf-8'));
+const fixturePath = path.join(import.meta.dirname, '__fixtures__', 'pricing-data-test.json');
+const pricingRegistry = PricingRegistry.fromModelsDev(JSON.parse(fs.readFileSync(fixturePath, 'utf-8')));
 
 function createMockSpan(overrides: Partial<AnySpan> = {}): AnySpan {
   return {
@@ -107,6 +107,58 @@ describe('AutoExtractedMetrics', () => {
     });
   });
 
+  // Processor duration is keyed off the entity type rather than PROCESSOR_RUN
+  // alone, because a processor may declare a domain span type. These pin the
+  // boundary of that rule.
+  describe('processor duration', () => {
+    it('emits for a plain PROCESSOR_RUN span', () => {
+      setup();
+      const span = createMockSpan({
+        type: SpanType.PROCESSOR_RUN,
+        entityType: EntityType.INPUT_STEP_PROCESSOR,
+        entityName: 'moderation',
+        attributes: { processorExecutor: 'legacy', processorIndex: 0 },
+        endTime: new Date('2026-01-01T00:00:00.020Z'),
+      } as Partial<AnySpan>);
+
+      emitAutoExtractedMetrics(span, createMetricsContext(span));
+
+      expect(emittedMetrics.map(m => m.metric.name)).toContain('mastra_processor_duration_ms');
+    });
+
+    it('emits for a processor that declared a domain span type', () => {
+      setup();
+      const span = createMockSpan({
+        type: SpanType.SKILL_ACTION,
+        entityType: EntityType.INPUT_STEP_PROCESSOR,
+        entityName: 'Skills Processor',
+        attributes: { operation: 'inject', processorExecutor: 'legacy', processorIndex: 2 },
+        endTime: new Date('2026-01-01T00:00:00.020Z'),
+      } as Partial<AnySpan>);
+
+      emitAutoExtractedMetrics(span, createMetricsContext(span));
+
+      expect(emittedMetrics.map(m => m.metric.name)).toContain('mastra_processor_duration_ms');
+    });
+
+    it('does not emit for a span that only borrows a processor entity type', () => {
+      // Observational memory used to wrap its model passes in a GENERIC span
+      // tagged OUTPUT_STEP_PROCESSOR. Counting those model-call durations as
+      // processor overhead would swamp the metric.
+      setup();
+      const span = createMockSpan({
+        type: SpanType.GENERIC,
+        entityType: EntityType.OUTPUT_STEP_PROCESSOR,
+        entityName: 'Observer',
+        endTime: new Date('2026-01-01T00:00:04Z'),
+      } as Partial<AnySpan>);
+
+      emitAutoExtractedMetrics(span, createMetricsContext(span));
+
+      expect(emittedMetrics.map(m => m.metric.name)).not.toContain('mastra_processor_duration_ms');
+    });
+  });
+
   it('should emit duration metric for tool spans', () => {
     setup();
     const span = createMockSpan({
@@ -121,6 +173,23 @@ describe('AutoExtractedMetrics', () => {
     expect(emittedMetrics).toHaveLength(1);
     expect(emittedMetrics[0]!.metric.name).toBe('mastra_tool_duration_ms');
     expect(emittedMetrics[0]!.metric.value).toBe(200);
+  });
+
+  it('should not emit duration metric for event spans', () => {
+    setup();
+    const startTime = new Date('2026-01-01T00:00:00.000Z');
+    const span = createMockSpan({
+      type: SpanType.TOOL_CALL,
+      entityType: EntityType.TOOL,
+      entityName: 'my-tool',
+      isEvent: true,
+      startTime,
+      endTime: startTime,
+    });
+
+    emitAutoExtractedMetrics(span, createMetricsContext(span));
+
+    expect(emittedMetrics).toHaveLength(0);
   });
 
   it('should emit duration metric for workflow spans', () => {
@@ -154,13 +223,14 @@ describe('AutoExtractedMetrics', () => {
     expect(emittedMetrics[0]!.metric.labels.status).toBe('error');
   });
 
-  it('should extract token usage metrics for model generation', () => {
+  it('should use the configured model when the response model is blank', () => {
     setup();
     const span = createMockSpan({
       type: SpanType.MODEL_GENERATION,
       endTime: new Date('2026-01-01T00:00:02Z'),
       attributes: {
         model: 'gpt-4',
+        responseModel: '   ',
         provider: 'openai',
         usage: {
           inputTokens: 100,
@@ -202,6 +272,63 @@ describe('AutoExtractedMetrics', () => {
     });
     const outputTokens = emittedMetrics.find(m => m.metric.name === 'mastra_model_total_output_tokens');
     expect(outputTokens!.metric.value).toBe(50);
+  });
+
+  it('marks observed token metrics when the run aggregate is incomplete', () => {
+    setup();
+    const span = createMockSpan({
+      type: SpanType.MODEL_GENERATION,
+      endTime: new Date('2026-01-01T00:00:01Z'),
+      attributes: {
+        model: 'gpt-4o-mini',
+        provider: 'openai',
+        usageIncomplete: true,
+        usage: {
+          inputTokens: 10,
+          outputTokens: 25,
+        },
+      },
+    });
+
+    vi.spyOn(PricingRegistry, 'getGlobal').mockReturnValue(pricingRegistry);
+
+    emitAutoExtractedMetrics(span, createMetricsContext(span));
+
+    const inputTokens = emittedMetrics.find(m => m.metric.name === 'mastra_model_total_input_tokens');
+    const outputTokens = emittedMetrics.find(m => m.metric.name === 'mastra_model_total_output_tokens');
+    expect(inputTokens?.metric).toMatchObject({ value: 10, labels: { usageIncomplete: 'true' } });
+    expect(outputTokens?.metric).toMatchObject({ value: 25, labels: { usageIncomplete: 'true' } });
+  });
+
+  it('stamps one usageId on every token row of a usage observation', () => {
+    setup();
+    vi.spyOn(PricingRegistry, 'getGlobal').mockReturnValue(pricingRegistry);
+    const span = createMockSpan({
+      type: SpanType.MODEL_GENERATION,
+      endTime: new Date('2026-01-01T00:00:01Z'),
+      attributes: {
+        model: 'gpt-4o-mini',
+        provider: 'openai',
+        usage: { inputTokens: 10, outputTokens: 25, inputDetails: { cacheRead: 4 }, outputDetails: { reasoning: 5 } },
+      },
+    });
+
+    emitAutoExtractedMetrics(span, createMetricsContext(span));
+    emitAutoExtractedMetrics(span, createMetricsContext(span));
+
+    const tokenRows = emittedMetrics.filter(m => m.metric.name.endsWith('_tokens'));
+    const first = tokenRows.slice(0, tokenRows.length / 2);
+    const second = tokenRows.slice(tokenRows.length / 2);
+    expect(first.length).toBeGreaterThanOrEqual(4);
+    expect(first.some(m => m.metric.costContext?.estimatedCost != null)).toBe(true);
+    expect(new Set(first.map(m => m.metric.usageId)).size).toBe(1);
+    expect(new Set(second.map(m => m.metric.usageId)).size).toBe(1);
+    expect(first[0]!.metric.usageId).toEqual(expect.any(String));
+    expect(first[0]!.metric.usageId).not.toBe(second[0]!.metric.usageId);
+    expect(new Set(tokenRows.map(m => m.metric.metricId)).size).toBe(tokenRows.length);
+
+    const duration = emittedMetrics.find(m => !m.metric.name.endsWith('_tokens'));
+    expect(duration?.metric.usageId).toBeUndefined();
   });
 
   it('should extract all InputTokenDetails and OutputTokenDetails', () => {
@@ -250,13 +377,13 @@ describe('AutoExtractedMetrics', () => {
     expect(byName('mastra_model_output_image_tokens')!.metric.value).toBe(10);
     expect(byName('mastra_model_total_input_tokens')!.metric.costContext?.estimatedCost).toBeCloseTo(0.00006375);
     expect(byName('mastra_model_total_input_tokens')!.metric.costContext?.costMetadata).toEqual({
-      pricing_id: 'openai-gpt-4o-mini',
+      pricing_id: 'openai/gpt-4o-mini',
       tier_index: 0,
       error: 'partial_cost',
     });
-    expect(byName('mastra_model_total_output_tokens')!.metric.costContext?.estimatedCost).toBeCloseTo(0.00009);
+    expect(byName('mastra_model_total_output_tokens')!.metric.costContext?.estimatedCost).toBeCloseTo(0.000108, 10);
     expect(byName('mastra_model_total_output_tokens')!.metric.costContext?.costMetadata).toEqual({
-      pricing_id: 'openai-gpt-4o-mini',
+      pricing_id: 'openai/gpt-4o-mini',
       tier_index: 0,
       error: 'partial_cost',
     });
@@ -265,7 +392,7 @@ describe('AutoExtractedMetrics', () => {
       model: 'gpt-4o-mini',
       costUnit: 'USD',
       costMetadata: {
-        pricing_id: 'openai-gpt-4o-mini',
+        pricing_id: 'openai/gpt-4o-mini',
         tier_index: 0,
       },
     });
@@ -275,7 +402,7 @@ describe('AutoExtractedMetrics', () => {
       model: 'gpt-4o-mini',
       costUnit: 'USD',
       costMetadata: {
-        pricing_id: 'openai-gpt-4o-mini',
+        pricing_id: 'openai/gpt-4o-mini',
         tier_index: 0,
       },
     });
@@ -285,19 +412,15 @@ describe('AutoExtractedMetrics', () => {
       model: 'gpt-4o-mini',
       costUnit: 'USD',
       costMetadata: {
-        pricing_id: 'openai-gpt-4o-mini',
+        pricing_id: 'openai/gpt-4o-mini',
         tier_index: 0,
       },
     });
     expect(byName('mastra_model_output_text_tokens')!.metric.costContext?.estimatedCost).toBeCloseTo(0.00009);
-    expect(byName('mastra_model_output_reasoning_tokens')!.metric.costContext).toEqual({
-      provider: 'openai',
-      model: 'gpt-4o-mini',
-      costMetadata: {
-        pricing_id: 'openai-gpt-4o-mini',
-        tier_index: 0,
-        error: 'no_pricing_for_usage_type',
-      },
+    expect(byName('mastra_model_output_reasoning_tokens')!.metric.costContext?.estimatedCost).toBeCloseTo(0.000018, 10);
+    expect(byName('mastra_model_output_reasoning_tokens')!.metric.costContext?.costMetadata).toEqual({
+      pricing_id: 'openai/gpt-4o-mini',
+      tier_index: 0,
     });
   });
 
@@ -487,7 +610,7 @@ describe('AutoExtractedMetrics', () => {
     expect(byName('mastra_model_input_cache_write_tokens')!.metric.costContext?.estimatedCost).toBeUndefined();
   });
 
-  it('should keep total output cost only when no output detail row has a successful cost', () => {
+  it('should price reasoning tokens at the output rate when the model has no reasoning rate', () => {
     setup();
     const span = createMockSpan({
       type: SpanType.MODEL_GENERATION,
@@ -516,22 +639,13 @@ describe('AutoExtractedMetrics', () => {
     const byName = (name: string) => emittedMetrics.find(m => m.metric.name === name);
     expect(byName('mastra_model_total_input_tokens')!.metric.costContext?.estimatedCost).toBeCloseTo(0.000015);
     expect(byName('mastra_model_input_text_tokens')!.metric.costContext?.estimatedCost).toBeCloseTo(0.000015);
-    expect(byName('mastra_model_total_output_tokens')!.metric.costContext?.estimatedCost).toBeCloseTo(0.00003);
+    expect(byName('mastra_model_total_output_tokens')!.metric.costContext?.estimatedCost).toBeCloseTo(0.000048, 10);
     expect(byName('mastra_model_total_output_tokens')!.metric.costContext?.costMetadata).toEqual({
-      pricing_id: 'openai-gpt-4o-mini',
+      pricing_id: 'openai/gpt-4o-mini',
       tier_index: 0,
-      error: 'partial_cost',
     });
     expect(byName('mastra_model_output_text_tokens')!.metric.costContext?.estimatedCost).toBeCloseTo(0.00003);
-    expect(byName('mastra_model_output_reasoning_tokens')!.metric.costContext).toEqual({
-      provider: 'openai',
-      model: 'gpt-4o-mini',
-      costMetadata: {
-        pricing_id: 'openai-gpt-4o-mini',
-        tier_index: 0,
-        error: 'no_pricing_for_usage_type',
-      },
-    });
+    expect(byName('mastra_model_output_reasoning_tokens')!.metric.costContext?.estimatedCost).toBeCloseTo(0.000018, 10);
   });
 
   it('should use detail costs for both modes when all non-zero detail meters are priced', () => {
@@ -566,6 +680,34 @@ describe('AutoExtractedMetrics', () => {
     expect(byName('mastra_model_input_text_tokens')!.metric.costContext?.estimatedCost).toBeCloseTo(0.00036);
     expect(byName('mastra_model_input_cache_read_tokens')!.metric.costContext?.estimatedCost).toBeCloseTo(0.000012);
     expect(byName('mastra_model_output_text_tokens')!.metric.costContext?.estimatedCost).toBeCloseTo(0.0006);
+  });
+
+  it('should emit token and cost metrics for classifier evaluation spans', () => {
+    setup();
+    const span = createMockSpan({
+      type: SpanType.CLASSIFIER_EVALUATION,
+      endTime: new Date('2026-01-01T00:00:01Z'),
+      attributes: {
+        classifierId: 'router',
+        provider: 'openai',
+        modelId: 'gpt-4o-mini',
+        usage: { inputTokens: 100, outputTokens: 20 },
+      },
+    });
+
+    vi.spyOn(PricingRegistry, 'getGlobal').mockReturnValue(pricingRegistry);
+
+    emitAutoExtractedMetrics(span, createMetricsContext(span));
+
+    const byName = (name: string) => emittedMetrics.find(m => m.metric.name === name);
+    expect(byName('mastra_model_total_input_tokens')!.metric.value).toBe(100);
+    expect(byName('mastra_model_total_output_tokens')!.metric.value).toBe(20);
+    expect(byName('mastra_model_total_input_tokens')!.metric.costContext).toMatchObject({
+      provider: 'openai',
+      model: 'gpt-4o-mini',
+    });
+    expect(byName('mastra_model_total_input_tokens')!.metric.costContext?.estimatedCost).toBeCloseTo(0.000015, 10);
+    expect(byName('mastra_model_total_output_tokens')!.metric.costContext?.estimatedCost).toBeCloseTo(0.000012, 10);
   });
 
   it('should NOT emit metrics for unsupported span types', () => {
@@ -639,10 +781,7 @@ describe('AutoExtractedMetrics', () => {
 
     const inputTokens = emittedMetrics.find(m => m.metric.name === 'mastra_model_total_input_tokens');
     expect(inputTokens!.metric.costContext?.costMetadata).not.toHaveProperty('error', 'no_matching_model');
-    expect(inputTokens!.metric.costContext?.costMetadata).toHaveProperty(
-      'pricing_id',
-      'openrouter-anthropic-claude-sonnet-4-6',
-    );
+    expect(inputTokens!.metric.costContext?.costMetadata).toHaveProperty('pricing_id', 'openrouter/claude-sonnet-4-6');
   });
 
   it('should estimate costs for Vercel AI Gateway model ids', () => {
@@ -665,7 +804,7 @@ describe('AutoExtractedMetrics', () => {
     expect(inputTokens!.metric.costContext).toMatchObject({
       provider: 'vercel',
       model: 'claude-haiku-4-5',
-      costMetadata: { pricing_id: 'vercel-claude-haiku-4-5' },
+      costMetadata: { pricing_id: 'vercel/claude-haiku-4-5' },
     });
     expect(inputTokens!.metric.costContext?.estimatedCost).toBeCloseTo(0.0001);
   });
@@ -697,7 +836,7 @@ describe('AutoExtractedMetrics', () => {
     expect(costContexts).toEqual(
       expect.arrayContaining([
         expect.objectContaining({
-          costMetadata: expect.objectContaining({ pricing_id: 'amazon-bedrock-claude-sonnet-4-6' }),
+          costMetadata: expect.objectContaining({ pricing_id: 'amazon-bedrock/claude-sonnet-4-6' }),
         }),
       ]),
     );

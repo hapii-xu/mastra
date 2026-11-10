@@ -95,6 +95,18 @@ export function shouldSkipDotenvLoading(): boolean {
 }
 
 /**
+ * Node flags that make stack traces resolve through the bundle's source maps.
+ * Skipped when NODE_OPTIONS already sets either form of the flag, since a CLI
+ * flag would override a `--no-enable-source-maps` there. Callers place these
+ * before user-supplied args so `--no-enable-source-maps` in those still wins.
+ */
+export function getSourceMapNodeArgs(sourcemapEnabled: boolean, nodeOptions: string | undefined): string[] {
+  // Node accepts underscores in option names, e.g. `--no-enable_source_maps`.
+  const setInNodeOptions = nodeOptions?.replaceAll('_', '-').includes('enable-source-maps');
+  return sourcemapEnabled && !setInNodeOptions ? ['--enable-source-maps'] : [];
+}
+
+/**
  * Get the version tag (e.g., 'beta', 'latest') for the currently running mastra CLI.
  * Create passes its known version to avoid resolving package metadata from an installed layout.
  * Init omits it and preserves the existing best-effort undefined fallback.
@@ -142,40 +154,16 @@ export async function isGitInitialized({ cwd }: { cwd: string }): Promise<boolea
  * Initialize a git repository in the specified directory.
  */
 export async function gitInit({ cwd }: { cwd: string }) {
-  const isolatedConfigDirectory = await fs.mkdtemp(path.join(os.tmpdir(), 'mastra-git-config-'));
-  const emptyHooksDirectory = path.join(isolatedConfigDirectory, 'hooks');
-  const emptyGlobalConfig = path.join(isolatedConfigDirectory, 'global.gitconfig');
-  await fs.mkdir(emptyHooksDirectory);
-  await fs.writeFile(emptyGlobalConfig, '');
-  const env = {
-    GIT_CONFIG_NOSYSTEM: '1',
-    GIT_CONFIG_GLOBAL: emptyGlobalConfig,
-    GIT_CONFIG_COUNT: '0',
-  };
-
-  try {
-    await execa('git', ['init'], { cwd, stdio: 'ignore', env });
-    await fs.appendFile(path.join(cwd, '.git', 'info', 'exclude'), '\n.env\n.env.*\n!.env.example\n!.env.*.example\n');
-    await execa('git', ['add', '-A'], { cwd, stdio: 'ignore', env });
-    await execa(
-      'git',
-      [
-        '-c',
-        'user.name=Mastra',
-        '-c',
-        'user.email=noreply@mastra.ai',
-        '-c',
-        'commit.gpgSign=false',
-        '-c',
-        `core.hooksPath=${emptyHooksDirectory}`,
-        'commit',
-        '--no-verify',
-        '-m',
-        'Initial commit from Mastra',
-      ],
-      { cwd, stdio: 'ignore', env },
-    );
-  } finally {
-    await fs.rm(isolatedConfigDirectory, { recursive: true, force: true });
-  }
+  await execa('git', ['init'], { cwd, stdio: 'ignore' });
+  await execa('git', ['add', '-A'], { cwd, stdio: 'ignore' });
+  await execa(
+    'git',
+    [
+      'commit',
+      '-m',
+      'Initial commit from Mastra',
+      '--author="dane-ai-mastra[bot] <dane-ai-mastra[bot]@users.noreply.github.com>"',
+    ],
+    { cwd, stdio: 'ignore' },
+  );
 }

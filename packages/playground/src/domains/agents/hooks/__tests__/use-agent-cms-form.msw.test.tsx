@@ -1,19 +1,45 @@
+import { MastraClient } from '@mastra/client-js';
 import type { AgentEditorConfig } from '@mastra/core/agent';
 import { MastraReactProvider } from '@mastra/react';
+import { useAgentVersions } from '@mastra/react/hooks/agents';
 import { QueryClient, QueryClientProvider } from '@tanstack/react-query';
 import { act, cleanup, renderHook, waitFor } from '@testing-library/react';
 import { http, HttpResponse } from 'msw';
 import type { ReactNode } from 'react';
-import { afterEach, describe, expect, it } from 'vitest';
+import { afterEach, describe, expect, it, vi } from 'vitest';
 
-import { createInstructionBlock } from '../../components/agent-edit-page/utils/form-validation';
+const { toastError } = vi.hoisted(() => ({ toastError: vi.fn() }));
+
+vi.mock('@mastra/playground-ui/utils/toast', () => ({
+  toast: { error: toastError, success: vi.fn() },
+}));
+
+import { promptBlock } from '../../components/__tests__/fixtures/prompt-blocks';
+import {
+  createInstructionBlock,
+  createRefInstructionBlock,
+} from '../../components/agent-edit-page/utils/form-validation';
+import { isCodeBackedAgent } from '../../utils/agent-source';
+import { mapAgentResponseToDataSource } from '../../utils/compute-agent-initial-values';
 import type { AgentDataSource } from '../../utils/compute-agent-initial-values';
 import { useAgentCmsForm } from '../use-agent-cms-form';
-import { createdCodeAgent } from './fixtures/use-agent-cms-form';
+import {
+  createdCodeAgent,
+  fsAgent,
+  fsAgentOverride,
+  modelOwnedRuntimeAgent,
+  noAgentVersions,
+  oneUnpublishedAgentVersion,
+  savedModelList,
+  storedAgentWithMemoryRef,
+} from './fixtures/use-agent-cms-form';
 import { server } from '@/test/msw-server';
 
 const BASE_URL = 'http://localhost:4111';
 const AGENT_ID = 'code-override-editable';
+
+const isRecord = (value: unknown): value is Record<string, unknown> =>
+  typeof value === 'object' && value !== null && !Array.isArray(value);
 
 const makeWrapper = () => {
   const queryClient = new QueryClient({
@@ -38,12 +64,17 @@ const dataSource: AgentDataSource = {
 const captureCreateBody = (sink: { body: Record<string, unknown> | null }) =>
   server.use(
     http.post(`${BASE_URL}/api/stored/agents`, async ({ request }) => {
-      sink.body = (await request.json()) as Record<string, unknown>;
+      const body: unknown = await request.json();
+      if (!isRecord(body)) throw new Error('Expected create-stored-agent request body to be an object');
+      sink.body = body;
       return HttpResponse.json(createdCodeAgent);
     }),
   );
 
-afterEach(() => cleanup());
+afterEach(() => {
+  cleanup();
+  toastError.mockReset();
+});
 
 // Regression coverage: saving a code-defined agent must persist the edited
 // instructions instead of sending an empty array that wipes the prompt.
@@ -153,6 +184,269 @@ describe('useAgentCmsForm — code agent instruction ownership', () => {
   });
 });
 
+describe('useAgentCmsForm — blocksWouldPreventSave guard', () => {
+  describe('when a referenced block is draft-only', () => {
+    it('blocks save and names the unpublished block', async () => {
+      const sink: { body: Record<string, unknown> | null } = { body: null };
+      captureCreateBody(sink);
+
+      server.use(
+        http.get(`${BASE_URL}/api/stored/prompt-blocks/draft-block`, () =>
+          HttpResponse.json(promptBlock({ id: 'draft-block', name: 'Draft Block', status: 'draft' })),
+        ),
+      );
+
+      const { result } = renderHook(
+        () =>
+          useAgentCmsForm({
+            mode: 'edit',
+            agentId: AGENT_ID,
+            dataSource,
+            isCodeAgentOverride: true,
+            hasStoredOverride: false,
+            editorConfig: undefined,
+            onSuccess: () => {},
+          }),
+        { wrapper: makeWrapper() },
+      );
+
+      act(() => {
+        result.current.form.setValue('instructionBlocks', [createRefInstructionBlock('draft-block')], {
+          shouldDirty: true,
+        });
+      });
+
+      await act(async () => {
+        await result.current.handleSaveDraft();
+      });
+
+      // The save was blocked — no create request was sent
+      expect(sink.body).toBeNull();
+      expect(toastError).toHaveBeenCalledWith(
+        'Unable to use unpublished referenced prompt block: draft-block. Publish these prompt blocks and try again.',
+      );
+    });
+  });
+
+  describe('when a draft reference has inline content beside it', () => {
+    it('blocks save and names the unpublished block', async () => {
+      const sink: { body: Record<string, unknown> | null } = { body: null };
+      captureCreateBody(sink);
+
+      server.use(
+        http.get(`${BASE_URL}/api/stored/prompt-blocks/draft-block`, () =>
+          HttpResponse.json(promptBlock({ id: 'draft-block', name: 'Draft Block', status: 'draft' })),
+        ),
+      );
+
+      const { result } = renderHook(
+        () =>
+          useAgentCmsForm({
+            mode: 'edit',
+            agentId: AGENT_ID,
+            dataSource,
+            isCodeAgentOverride: true,
+            hasStoredOverride: false,
+            editorConfig: undefined,
+            onSuccess: () => {},
+          }),
+        { wrapper: makeWrapper() },
+      );
+
+      act(() => {
+        result.current.form.setValue(
+          'instructionBlocks',
+          [createRefInstructionBlock('draft-block'), createInstructionBlock('Inline guidance.')],
+          { shouldDirty: true },
+        );
+      });
+
+      await act(async () => {
+        await result.current.handleSaveDraft();
+      });
+
+      expect(sink.body).toBeNull();
+      expect(toastError).toHaveBeenCalledWith(
+        'Unable to use unpublished referenced prompt block: draft-block. Publish these prompt blocks and try again.',
+      );
+    });
+  });
+
+  describe('when all referenced blocks are published', () => {
+    it('allows save', async () => {
+      const sink: { body: Record<string, unknown> | null } = { body: null };
+      captureCreateBody(sink);
+
+      server.use(
+        http.get(`${BASE_URL}/api/stored/prompt-blocks/published-block`, () =>
+          HttpResponse.json(
+            promptBlock({ id: 'published-block', name: 'Published Block', status: 'published', activeVersionId: 'v1' }),
+          ),
+        ),
+      );
+
+      const { result } = renderHook(
+        () =>
+          useAgentCmsForm({
+            mode: 'edit',
+            agentId: AGENT_ID,
+            dataSource,
+            isCodeAgentOverride: true,
+            hasStoredOverride: false,
+            editorConfig: undefined,
+            onSuccess: () => {},
+          }),
+        { wrapper: makeWrapper() },
+      );
+
+      act(() => {
+        result.current.form.setValue(
+          'instructionBlocks',
+          [createRefInstructionBlock('published-block'), createInstructionBlock('Inline guidance.')],
+          {
+            shouldDirty: true,
+          },
+        );
+      });
+
+      await act(async () => {
+        await result.current.handleSaveDraft();
+      });
+
+      await waitFor(() => expect(sink.body).not.toBeNull());
+      expect(sink.body!.instructions).toBeDefined();
+    });
+  });
+
+  describe('when a referenced block returns 404', () => {
+    it('blocks save and names the missing block', async () => {
+      const sink: { body: Record<string, unknown> | null } = { body: null };
+      captureCreateBody(sink);
+
+      server.use(
+        http.get(`${BASE_URL}/api/stored/prompt-blocks/missing-block`, () => HttpResponse.json(null, { status: 404 })),
+      );
+
+      const { result } = renderHook(
+        () =>
+          useAgentCmsForm({
+            mode: 'edit',
+            agentId: AGENT_ID,
+            dataSource,
+            isCodeAgentOverride: true,
+            hasStoredOverride: false,
+            editorConfig: undefined,
+            onSuccess: () => {},
+          }),
+        { wrapper: makeWrapper() },
+      );
+
+      act(() => {
+        result.current.form.setValue('instructionBlocks', [createRefInstructionBlock('missing-block')], {
+          shouldDirty: true,
+        });
+      });
+
+      await act(async () => {
+        await result.current.handleSaveDraft();
+      });
+
+      // The save was blocked — no create request was sent
+      expect(sink.body).toBeNull();
+      expect(toastError).toHaveBeenCalledWith(
+        'Unable to verify referenced prompt block: missing-block. Resolve these references or try again before continuing.',
+      );
+    });
+  });
+
+  describe('when a referenced block returns 500', () => {
+    it('blocks save', async () => {
+      const sink: { body: Record<string, unknown> | null } = { body: null };
+      captureCreateBody(sink);
+
+      server.use(
+        http.get(`${BASE_URL}/api/stored/prompt-blocks/error-block`, () => HttpResponse.json(null, { status: 500 })),
+      );
+
+      const { result } = renderHook(
+        () =>
+          useAgentCmsForm({
+            mode: 'edit',
+            agentId: AGENT_ID,
+            dataSource,
+            isCodeAgentOverride: true,
+            hasStoredOverride: false,
+            editorConfig: undefined,
+            onSuccess: () => {},
+          }),
+        { wrapper: makeWrapper() },
+      );
+
+      act(() => {
+        result.current.form.setValue('instructionBlocks', [createRefInstructionBlock('error-block')], {
+          shouldDirty: true,
+        });
+      });
+
+      await act(async () => {
+        await result.current.handleSaveDraft();
+      });
+
+      // The save was blocked — no create request was sent — and the failure
+      // was reported as an unresolved reference.
+      expect(sink.body).toBeNull();
+      expect(toastError).toHaveBeenCalledWith(
+        'Unable to verify referenced prompt block: error-block. Resolve these references or try again before continuing.',
+      );
+    });
+  });
+
+  describe('when publishing a specific version', () => {
+    it('does not block publish for a draft reference', async () => {
+      const sink: { body: Record<string, unknown> | null } = { body: null };
+      captureCreateBody(sink);
+
+      let activationRequested = false;
+      server.use(
+        http.post(`${BASE_URL}/api/stored/agents/${AGENT_ID}/versions/v1/activate`, () => {
+          activationRequested = true;
+          return HttpResponse.json({ success: true, message: 'Version activated', activeVersionId: 'v1' });
+        }),
+      );
+
+      const { result } = renderHook(
+        () =>
+          useAgentCmsForm({
+            mode: 'edit',
+            agentId: AGENT_ID,
+            dataSource,
+            isCodeAgentOverride: true,
+            hasStoredOverride: true,
+            editorConfig: undefined,
+            onSuccess: () => {},
+          }),
+        { wrapper: makeWrapper() },
+      );
+
+      act(() => {
+        result.current.form.setValue('instructionBlocks', [createRefInstructionBlock('draft-block')], {
+          shouldDirty: true,
+        });
+      });
+
+      await act(async () => {
+        await result.current.handlePublish('v1');
+      });
+
+      // Publishing a specific version bypasses the guard: the activation request
+      // was sent, no create request happened, and no guard toast fired.
+      await waitFor(() => expect(activationRequested).toBe(true));
+      expect(sink.body).toBeNull();
+      expect(toastError).not.toHaveBeenCalled();
+    });
+  });
+});
+
 const EDITED_TOOL = { 'get-weather': { description: 'Get the current weather for a city' } };
 
 /** Render the hook for a code-agent override with the given editor config, set a tool edit, save. */
@@ -231,5 +525,501 @@ describe('useAgentCmsForm — code agent tool ownership', () => {
     expect(body.tools).toBeUndefined();
     expect(body.integrationTools).toBeUndefined();
     expect(body.mcpClients).toBeUndefined();
+  });
+});
+
+describe('useAgentCmsForm — model ownership', () => {
+  describe('when an Editor-owned model list is saved', () => {
+    it('persists the complete pending model list in one draft request', async () => {
+      const sink: { body: Record<string, unknown> | null } = { body: null };
+      captureCreateBody(sink);
+      const modelDataSource: AgentDataSource = {
+        ...dataSource,
+        modelList: [
+          {
+            id: 'primary',
+            enabled: true,
+            maxRetries: 0,
+            model: { provider: 'openai', modelId: '__AI_SDK_OPENAI_MODEL_BASE__', modelVersion: '' },
+          },
+          {
+            id: 'fallback',
+            enabled: true,
+            maxRetries: 2,
+            model: { provider: 'openai', modelId: '__AI_SDK_OPENAI_MODEL_BASE__', modelVersion: '' },
+          },
+        ],
+      };
+
+      const { result } = renderHook(
+        () =>
+          useAgentCmsForm({
+            mode: 'edit',
+            agentId: AGENT_ID,
+            dataSource: modelDataSource,
+            isCodeAgentOverride: true,
+            hasStoredOverride: false,
+            editorConfig: { model: true },
+            onSuccess: () => {},
+          }),
+        { wrapper: makeWrapper() },
+      );
+
+      act(() => {
+        result.current.form.setValue(
+          'modelList',
+          [
+            {
+              id: 'fallback',
+              enabled: true,
+              maxRetries: 2,
+              model: { provider: 'openai', modelId: '__AI_SDK_OPENAI_MODEL_BASE__', modelVersion: '' },
+            },
+            {
+              id: 'primary',
+              enabled: false,
+              maxRetries: 0,
+              model: { provider: 'openai', modelId: '__AI_SDK_OPENAI_MODEL_BASE__', modelVersion: '' },
+            },
+          ],
+          { shouldDirty: true },
+        );
+      });
+
+      await act(async () => {
+        await result.current.handleSaveDraft();
+      });
+
+      await waitFor(() => expect(sink.body).not.toBeNull());
+      expect(sink.body!.modelList).toEqual([
+        {
+          id: 'fallback',
+          provider: 'openai',
+          modelId: '__AI_SDK_OPENAI_MODEL_BASE__',
+          enabled: true,
+          maxRetries: 2,
+        },
+        {
+          id: 'primary',
+          provider: 'openai',
+          modelId: '__AI_SDK_OPENAI_MODEL_BASE__',
+          enabled: false,
+          maxRetries: 0,
+        },
+      ]);
+    });
+
+    it('reloads the saved draft and publishes the complete model list to runtime', async () => {
+      const client = new MastraClient({ baseUrl: BASE_URL });
+      let draftModelList = modelOwnedRuntimeAgent.modelList ?? [];
+      let publishedModelList = [...draftModelList].reverse();
+      let activeVersionId = 'published-version';
+      let savedVersionId = '';
+
+      server.use(
+        http.post(`${BASE_URL}/api/stored/agents`, async ({ request }) => {
+          const body: unknown = await request.json();
+          if (!isRecord(body) || !Array.isArray(body.modelList)) {
+            throw new Error('Expected modelList in create-stored-agent request');
+          }
+
+          draftModelList = body.modelList.map(entry => {
+            if (!isRecord(entry)) throw new Error('Expected model-list entry to be an object');
+            return {
+              id: String(entry.id),
+              model: {
+                provider: String(entry.provider),
+                modelId: String(entry.modelId),
+                modelVersion: 'v2',
+              },
+              enabled: Boolean(entry.enabled),
+              maxRetries: Number(entry.maxRetries),
+            };
+          });
+          savedVersionId = 'draft-version';
+
+          return HttpResponse.json({
+            ...createdCodeAgent,
+            modelList: body.modelList,
+            activeVersionId,
+          });
+        }),
+        http.get(`${BASE_URL}/api/agents/${AGENT_ID}`, ({ request }) => {
+          const status = new URL(request.url).searchParams.get('status');
+          return HttpResponse.json({
+            ...modelOwnedRuntimeAgent,
+            modelList: status === 'draft' ? draftModelList : publishedModelList,
+          });
+        }),
+        http.get(`${BASE_URL}/api/stored/agents/${AGENT_ID}`, () =>
+          HttpResponse.json({ ...createdCodeAgent, activeVersionId }),
+        ),
+        http.get(`${BASE_URL}/api/stored/agents/${AGENT_ID}/versions`, () =>
+          HttpResponse.json({
+            ...oneUnpublishedAgentVersion,
+            versions: [{ ...oneUnpublishedAgentVersion.versions[0], id: savedVersionId }],
+          }),
+        ),
+        http.post(`${BASE_URL}/api/stored/agents/${AGENT_ID}/versions/:versionId/activate`, ({ params }) => {
+          activeVersionId = String(params.versionId);
+          publishedModelList = draftModelList;
+          return HttpResponse.json({ success: true, message: 'Version activated', activeVersionId });
+        }),
+      );
+
+      const modelDataSource: AgentDataSource = {
+        ...dataSource,
+        modelList: [...savedModelList].reverse(),
+      };
+      const { result } = renderHook(
+        () =>
+          useAgentCmsForm({
+            mode: 'edit',
+            agentId: AGENT_ID,
+            dataSource: modelDataSource,
+            isCodeAgentOverride: true,
+            hasStoredOverride: false,
+            editorConfig: { model: true },
+            onSuccess: () => {},
+          }),
+        { wrapper: makeWrapper() },
+      );
+
+      act(() => {
+        result.current.form.setValue('modelList', savedModelList, { shouldDirty: true });
+      });
+      await act(async () => {
+        await result.current.handleSaveDraft();
+      });
+
+      const reloadedDraft = await client.getAgent(AGENT_ID, { status: 'draft' }).details();
+      expect(reloadedDraft.modelList).toEqual(savedModelList);
+      expect((await client.getAgent(AGENT_ID).details()).modelList).toEqual([...savedModelList].reverse());
+
+      await act(async () => {
+        await result.current.handlePublish();
+      });
+
+      expect((await client.getAgent(AGENT_ID).details()).modelList).toEqual(savedModelList);
+      expect(activeVersionId).toBe('draft-version');
+    });
+  });
+});
+
+describe('useAgentCmsForm', () => {
+  // Regression coverage: the version list backs the version dropdown and the
+  // published/unpublished badges. Skipping its invalidation for code-agent
+  // overrides left Studio showing stale publication state after a save.
+  describe('when a code-agent override is saved', () => {
+    it('refetches the agent version list once the save completes', async () => {
+      const sink: { body: Record<string, unknown> | null } = { body: null };
+      captureCreateBody(sink);
+
+      let versionRequests = 0;
+      server.use(
+        http.get(`${BASE_URL}/api/stored/agents/${AGENT_ID}/versions`, () => {
+          versionRequests += 1;
+          return HttpResponse.json(versionRequests === 1 ? noAgentVersions : oneUnpublishedAgentVersion);
+        }),
+      );
+
+      const { result } = renderHook(
+        () => ({
+          cmsForm: useAgentCmsForm({
+            mode: 'edit',
+            agentId: AGENT_ID,
+            dataSource,
+            isCodeAgentOverride: true,
+            hasStoredOverride: false,
+            onSuccess: () => {},
+          }),
+          versions: useAgentVersions({
+            agentId: AGENT_ID,
+            params: { orderBy: { direction: 'DESC' } },
+            queryOptions: { enabled: Boolean(AGENT_ID) },
+          }),
+        }),
+        { wrapper: makeWrapper() },
+      );
+
+      await waitFor(() => expect(result.current.versions.data).toEqual(noAgentVersions));
+
+      act(() => {
+        result.current.cmsForm.form.setValue('instructionBlocks', [createInstructionBlock('User edited prompt')], {
+          shouldDirty: true,
+        });
+      });
+
+      await act(async () => {
+        await result.current.cmsForm.handleSaveDraft();
+      });
+
+      // The saved version shows up in the dropdown without a manual reload.
+      await waitFor(() => expect(result.current.versions.data).toEqual(oneUnpublishedAgentVersion));
+    });
+  });
+
+  // The first save for a code-defined agent creates the stored override. Publishing it
+  // there would put the override live before the user asked, silently replacing the code
+  // definition that was already serving traffic.
+  describe('when the first code-agent override is saved', () => {
+    it('asks the server not to publish the override so it stays a draft until the user publishes', async () => {
+      const sink: { body: Record<string, unknown> | null } = { body: null };
+      captureCreateBody(sink);
+
+      const { result } = renderHook(
+        () =>
+          useAgentCmsForm({
+            mode: 'edit',
+            agentId: AGENT_ID,
+            dataSource,
+            isCodeAgentOverride: true,
+            hasStoredOverride: false,
+            onSuccess: () => {},
+          }),
+        { wrapper: makeWrapper() },
+      );
+
+      act(() => {
+        result.current.form.setValue('instructionBlocks', [createInstructionBlock('User edited prompt')], {
+          shouldDirty: true,
+        });
+      });
+
+      await act(async () => {
+        await result.current.handleSaveDraft();
+      });
+
+      await waitFor(() => expect(sink.body).not.toBeNull());
+      expect(sink.body?.autoPublish).toBe(false);
+    });
+  });
+});
+
+// A stored agent can point its memory at a Memory instance registered on the Mastra
+// instance. Studio can't edit that instance, so saving must keep the reference instead
+// of rebuilding an inline config from the (empty) memory form fields.
+describe('useAgentCmsForm — registered memory reference', () => {
+  describe('when a stored agent that references registered memory is saved', () => {
+    it('sends the memory reference unchanged', async () => {
+      const sink: { body: Record<string, unknown> | null } = { body: null };
+      server.use(
+        http.patch(`${BASE_URL}/api/stored/agents/${storedAgentWithMemoryRef.id}`, async ({ request }) => {
+          const body: unknown = await request.json();
+          if (!isRecord(body)) throw new Error('Expected update-stored-agent request body to be an object');
+          sink.body = body;
+          return HttpResponse.json(storedAgentWithMemoryRef);
+        }),
+      );
+
+      const { result } = renderHook(
+        () =>
+          useAgentCmsForm({
+            mode: 'edit',
+            agentId: storedAgentWithMemoryRef.id,
+            dataSource: storedAgentWithMemoryRef,
+            hasStoredOverride: true,
+            onSuccess: () => {},
+          }),
+        { wrapper: makeWrapper() },
+      );
+
+      act(() => {
+        result.current.form.setValue('instructionBlocks', [createInstructionBlock('Help customers kindly.')], {
+          shouldDirty: true,
+        });
+      });
+
+      await act(async () => {
+        await result.current.handleSaveDraft();
+      });
+
+      await waitFor(() => expect(sink.body).not.toBeNull());
+      expect(sink.body?.memory).toEqual({ type: 'id', memoryId: 'support-memory' });
+    });
+  });
+});
+
+// Regression coverage for https://github.com/mastra-ai/mastra/issues/26274 — a file-based
+// (`source: 'fs'`) agent is code-backed. Its first Studio save must create the stored override
+// instead of PATCHing a record that does not exist yet, and later saves update that override.
+describe('useAgentCmsForm — file-based agent', () => {
+  const fsDataSource = mapAgentResponseToDataSource(fsAgent);
+
+  const captureFsAgentSaves = () => {
+    const saves: Array<{ method: string; body: Record<string, unknown> }> = [];
+    const record = async (request: Request) => {
+      const body: unknown = await request.json();
+      if (!isRecord(body)) throw new Error('Expected stored-agent request body to be an object');
+      saves.push({ method: request.method, body });
+      return HttpResponse.json(fsAgentOverride);
+    };
+    server.use(
+      http.post(`${BASE_URL}/api/stored/agents`, ({ request }) => record(request)),
+      http.patch(`${BASE_URL}/api/stored/agents/${fsAgent.id}`, ({ request }) => record(request)),
+      http.get(`${BASE_URL}/api/stored/agents/${fsAgent.id}/versions`, () => HttpResponse.json(noAgentVersions)),
+    );
+    return saves;
+  };
+
+  const editInstructions = (form: ReturnType<typeof useAgentCmsForm>['form'], text: string) => {
+    act(() => {
+      form.setValue('instructionBlocks', [createInstructionBlock(text)], { shouldDirty: true });
+    });
+  };
+
+  describe('when the first override is saved', () => {
+    it('creates the stored override', async () => {
+      const saves = captureFsAgentSaves();
+
+      const { result } = renderHook(
+        () =>
+          useAgentCmsForm({
+            mode: 'edit',
+            agentId: fsAgent.id,
+            dataSource: fsDataSource,
+            isCodeAgentOverride: isCodeBackedAgent(fsAgent),
+            hasStoredOverride: false,
+            editorConfig: fsAgent.editor,
+            onSuccess: () => {},
+          }),
+        { wrapper: makeWrapper() },
+      );
+
+      editInstructions(result.current.form, 'First Studio draft');
+      await act(async () => {
+        await result.current.handleSaveDraft();
+      });
+      await waitFor(() => expect(saves).toHaveLength(1));
+      expect(saves[0]).toMatchObject({
+        method: 'POST',
+        body: {
+          id: fsAgent.id,
+          autoPublish: false,
+          instructions: [{ type: 'prompt_block', content: 'First Studio draft' }],
+        },
+      });
+    });
+
+    it('updates the override on the next save', async () => {
+      const saves = captureFsAgentSaves();
+
+      const { result } = renderHook(
+        () =>
+          useAgentCmsForm({
+            mode: 'edit',
+            agentId: fsAgent.id,
+            dataSource: fsDataSource,
+            isCodeAgentOverride: isCodeBackedAgent(fsAgent),
+            hasStoredOverride: false,
+            editorConfig: fsAgent.editor,
+            onSuccess: () => {},
+          }),
+        { wrapper: makeWrapper() },
+      );
+
+      editInstructions(result.current.form, 'First Studio draft');
+      await act(async () => {
+        await result.current.handleSaveDraft();
+      });
+      editInstructions(result.current.form, 'Second Studio draft');
+      await act(async () => {
+        await result.current.handleSaveDraft();
+      });
+
+      await waitFor(() => expect(saves).toHaveLength(2));
+      expect(saves[1]).toMatchObject({
+        method: 'PATCH',
+        body: { instructions: [{ type: 'prompt_block', content: 'Second Studio draft' }] },
+      });
+    });
+  });
+
+  describe('when the page reloads with a saved draft', () => {
+    it('loads the saved draft instructions', async () => {
+      captureFsAgentSaves();
+
+      const { result } = renderHook(
+        () =>
+          useAgentCmsForm({
+            mode: 'edit',
+            agentId: fsAgent.id,
+            dataSource: fsAgentOverride,
+            isCodeAgentOverride: isCodeBackedAgent(fsAgent),
+            hasStoredOverride: true,
+            editorConfig: fsAgent.editor,
+            onSuccess: () => {},
+          }),
+        { wrapper: makeWrapper() },
+      );
+
+      await waitFor(() =>
+        expect(result.current.form.getValues('instructionBlocks')).toMatchObject([
+          { content: 'Saved draft instructions.' },
+        ]),
+      );
+    });
+
+    it('updates the existing override after reload', async () => {
+      const saves = captureFsAgentSaves();
+
+      const { result } = renderHook(
+        () =>
+          useAgentCmsForm({
+            mode: 'edit',
+            agentId: fsAgent.id,
+            dataSource: fsAgentOverride,
+            isCodeAgentOverride: isCodeBackedAgent(fsAgent),
+            hasStoredOverride: true,
+            editorConfig: fsAgent.editor,
+            onSuccess: () => {},
+          }),
+        { wrapper: makeWrapper() },
+      );
+
+      editInstructions(result.current.form, 'Edited after reload');
+      await act(async () => {
+        await result.current.handleSaveDraft();
+      });
+
+      await waitFor(() => expect(saves).toHaveLength(1));
+      expect(saves[0]?.method).toBe('PATCH');
+    });
+  });
+
+  describe('when the agent folder keeps instructions and tools in code', () => {
+    it('does not send the code-owned fields', async () => {
+      const saves = captureFsAgentSaves();
+      const lockedFsAgent = { ...fsAgent, editor: { instructions: false, tools: { description: true } } };
+
+      const { result } = renderHook(
+        () =>
+          useAgentCmsForm({
+            mode: 'edit',
+            agentId: lockedFsAgent.id,
+            dataSource: fsDataSource,
+            isCodeAgentOverride: isCodeBackedAgent(lockedFsAgent),
+            hasStoredOverride: false,
+            editorConfig: lockedFsAgent.editor,
+            onSuccess: () => {},
+          }),
+        { wrapper: makeWrapper() },
+      );
+
+      act(() => {
+        result.current.form.setValue('instructionBlocks', [createInstructionBlock('Ignored prompt edit')], {
+          shouldDirty: true,
+        });
+        result.current.form.setValue('tools', EDITED_TOOL, { shouldDirty: true });
+      });
+      await act(async () => {
+        await result.current.handleSaveDraft();
+      });
+
+      await waitFor(() => expect(saves).toHaveLength(1));
+      // Instructions stay owned by the agent folder; only tool descriptions are overridable.
+      expect(saves[0]?.body.instructions).toEqual([]);
+      expect(saves[0]?.body.tools).toEqual(EDITED_TOOL);
+    });
   });
 });

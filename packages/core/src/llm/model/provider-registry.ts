@@ -7,18 +7,22 @@ import fs from 'node:fs';
 import { createRequire } from 'node:module';
 import os from 'node:os';
 import path from 'node:path';
+import type { Provider, ModelForProvider, ModelRouterModelId } from '../index.js';
 import { getCapabilityFileName } from './capability-file.js';
-import type { ProviderConfig, MastraModelGatewayInterface } from './gateways/base.js';
+import type { ProviderCapabilityFile } from './capability-file.js';
+import type { ModelReasoningOption, ProviderConfig, MastraModelGatewayInterface } from './gateways/base.js';
 import { getGatewayId, shouldEnableGateway } from './gateways/gateway-helpers.js';
 import { MastraGateway } from './gateways/mastra.js';
 import { ModelsDevGateway } from './gateways/models-dev.js';
 import { NetlifyGateway } from './gateways/netlify.js';
 import staticRegistryJson from './provider-registry.json';
-import type { Provider, ModelForProvider, ModelRouterModelId, ProviderModels } from './provider-types.generated.js';
+// Sourced from the package entry point so that `ProviderModelsMap` augmentations
+// declared against `@mastra/core/llm` flow into these derived types.
+import type { ProviderModels } from './provider-types.generated.js';
 
 // Re-export types for convenience
 export type { Provider, ModelForProvider, ModelRouterModelId, ProviderModels };
-export type { AttachmentCapabilities } from './gateways/base.js';
+export type { AttachmentCapabilities, ModelReasoningOption } from './gateways/base.js';
 
 interface RegistryData {
   providers: Record<string, ProviderConfig>;
@@ -254,13 +258,15 @@ function loadRegistry(useDynamicLoading: boolean, customGateways: MastraModelGat
     return sanitizeRegistryDataForRuntime(staticRegistry, enabledGatewayIds);
   }
 
-  // Dynamic loading mode: sync global cache to local before loading
-  syncGlobalCacheToLocal();
-
-  // Dynamic loading mode: check in-memory cache first
+  // Dynamic loading mode: check in-memory cache first. The registry proxy calls this on every
+  // property access, so the disk sync below must only run when the data actually gets (re)loaded.
+  // In-process refreshes reset registryData, so they still sync and reload.
   if (registryData) {
     return registryData;
   }
+
+  // Dynamic loading mode: sync global cache to local before loading
+  syncGlobalCacheToLocal();
 
   // Dynamic loading mode: load from file system for live updates
   const packageRoot = getPackageRoot();
@@ -438,13 +444,7 @@ export function getRegisteredProviders(): string[] {
 // Provider capabilities (per-model attachment / modality metadata)
 // ---------------------------------------------------------------------------
 
-interface ProviderCapabilityFile {
-  attachment?: string[];
-  temperature?: string[];
-  structuredOutput?: string[];
-}
-
-type CapabilityDimension = keyof ProviderCapabilityFile;
+type CapabilityDimension = 'attachment' | 'temperature' | 'structuredOutput';
 
 const providerCapCaches: Record<CapabilityDimension, Map<string, string[] | null>> = {
   attachment: new Map(),
@@ -458,7 +458,66 @@ const capabilityOverrides: Partial<Record<CapabilityDimension, Record<string, bo
   structuredOutput: {
     'deepseek/deepseek-v4-pro': false,
   },
+  temperature: {
+    // Bedrock-hosted grok-4.6 rejects `temperature` (HTTP 400 "This model doesn't
+    // support the temperature field"), even though direct xai (`xai/grok-4.6`) accepts
+    // it. Bedrock diverges from the underlying vendor here, so the vendor fallback below
+    // is not enough — pin it explicitly. See mastra-ai/mastra#23319.
+    'aws-bedrock/grok-4.6': false,
+  },
 };
+
+/**
+ * AI SDK provider ids that differ from this registry's provider keys. Provider instances
+ * (e.g. `@ai-sdk/amazon-bedrock`) expose their own `provider` string, which we map onto
+ * the capability-file provider key before resolving.
+ */
+const PROVIDER_ALIASES: Record<string, string> = {
+  'amazon-bedrock': 'aws-bedrock',
+};
+
+/** Bedrock model-id region prefixes (cross-region inference profiles). */
+const BEDROCK_REGION_PREFIX = /^(global|us-gov|us|eu|apac|jp|au|in)\./;
+
+/** Underlying vendor segment carried by fully-qualified Bedrock model ids. */
+const BEDROCK_VENDOR_SEGMENT =
+  /^(?!openai\.gpt-oss-)(anthropic|xai|meta|amazon|cohere|mistral|ai21|deepseek|openai)\.(.+)$/;
+
+/** Fallback vendor lookup for short Bedrock ids (`claude-sonnet-5`) that omit the vendor. */
+const BEDROCK_VENDOR_BY_PREFIX: Array<[RegExp, string]> = [
+  [/^claude/, 'anthropic'],
+  [/^grok/, 'xai'],
+  [/^llama/, 'meta'],
+  [/^(nova|titan)/, 'amazon'],
+  [/^command/, 'cohere'],
+  [/^(mistral|mixtral|pixtral)/, 'mistral'],
+  [/^jamba/, 'ai21'],
+  [/^deepseek/, 'deepseek'],
+];
+
+/**
+ * Resolve a Bedrock model id to its underlying vendor and short model id.
+ *
+ * Bedrock ids arrive in several shapes: a router short id (`claude-sonnet-5`), or a
+ * provider-instance id with a region prefix and vendor segment
+ * (`us.anthropic.claude-sonnet-5`, `us.xai.grok-4.6`). We strip the region prefix, peel
+ * off the vendor segment when present, and otherwise infer the vendor from the model-name
+ * prefix so the capability data of the underlying provider can be consulted.
+ */
+function resolveBedrockVendorModel(modelId: string): { vendor: string | null; shortId: string } {
+  const withoutRegion = modelId.replace(BEDROCK_REGION_PREFIX, '');
+
+  const segmentMatch = withoutRegion.match(BEDROCK_VENDOR_SEGMENT);
+  if (segmentMatch) {
+    return { vendor: segmentMatch[1]!, shortId: segmentMatch[2]! };
+  }
+
+  for (const [pattern, vendor] of BEDROCK_VENDOR_BY_PREFIX) {
+    if (pattern.test(withoutRegion)) return { vendor, shortId: withoutRegion };
+  }
+
+  return { vendor: null, shortId: withoutRegion };
+}
 
 function isDirectory(dir: string): boolean {
   try {
@@ -548,11 +607,35 @@ function getProviderCapabilitySupport(
   return models.includes(modelId);
 }
 
+/**
+ * Whether the provider's model list enumerates this model. Capability arrays only
+ * hold models with the capability set, so a model that supports nothing would be
+ * absent from all of them — the registry's model list is the real membership signal.
+ */
+function providerListsModel(provider: string, modelId: string): boolean {
+  return GatewayRegistry.getInstance().getModels()[provider]?.includes(modelId) ?? false;
+}
+
 function modelSupportsCapability(modelRouterId: string, dimension: CapabilityDimension): boolean | undefined {
-  const override = capabilityOverrides[dimension]?.[modelRouterId];
+  const parsed = parseModelString(modelRouterId);
+  const provider = parsed.provider ? (PROVIDER_ALIASES[parsed.provider] ?? parsed.provider) : parsed.provider;
+  let modelId = parsed.modelId;
+
+  // Bedrock provider instances carry region/vendor-qualified ids
+  // (`us.anthropic.claude-sonnet-5`); reduce to the short id the registry uses so both
+  // the override map and the capability files resolve consistently with router ids.
+  let bedrockVendor: string | null = null;
+  if (provider === 'aws-bedrock') {
+    const resolved = resolveBedrockVendorModel(modelId);
+    bedrockVendor = resolved.vendor;
+    modelId = resolved.shortId;
+  }
+
+  const canonicalRouterId = provider ? `${provider}/${modelId}` : modelId;
+  const override =
+    capabilityOverrides[dimension]?.[canonicalRouterId] ?? capabilityOverrides[dimension]?.[modelRouterId];
   if (override !== undefined) return override;
 
-  const { provider, modelId } = parseModelString(modelRouterId);
   if (!provider) return undefined;
 
   const registry = GatewayRegistry.getInstance();
@@ -562,12 +645,19 @@ function modelSupportsCapability(modelRouterId: string, dimension: CapabilityDim
   // Positive direct match wins immediately.
   if (directSupport === true) return true;
 
-  // For nested model IDs (e.g. `openrouter/anthropic/claude-sonnet-4-6`), the
-  // outer gateway's capability list may not enumerate every nested model. Fall
-  // back to the underlying provider's authoritative capability file before
-  // trusting a `false` from the gateway.
+  // The provider actually serving the request is authoritative. If it publishes
+  // capability data for this dimension and lists the model, its `false` stands —
+  // a gateway can lack capabilities the upstream provider offers directly
+  // (OpenRouter has no image-capable endpoint for `deepseek/deepseek-v4-flash`
+  // even though DeepSeek's own API does).
+  //
+  // Fall back to the underlying provider's capability file when the gateway
+  // never answered: either it has no data for this dimension at all (Netlify and
+  // custom gateways only implement `fetchProviders()`), or it doesn't enumerate
+  // the nested model (e.g. `openrouter/anthropic/claude-sonnet-4-6`).
+  const gatewayAnswered = directSupport !== undefined && providerListsModel(provider, modelId);
   const nestedProviderDelimiter = modelId.indexOf('/');
-  if (nestedProviderDelimiter !== -1) {
+  if (nestedProviderDelimiter !== -1 && !gatewayAnswered) {
     const nestedProvider = modelId.substring(0, nestedProviderDelimiter);
     const nestedModelId = modelId.substring(nestedProviderDelimiter + 1);
     if (nestedProvider && nestedModelId) {
@@ -576,7 +666,64 @@ function modelSupportsCapability(modelRouterId: string, dimension: CapabilityDim
     }
   }
 
+  // Bedrock has no capability file of its own. When the direct lookup is inconclusive,
+  // fall back to the underlying vendor's authoritative file (Claude → anthropic,
+  // grok → xai) so Bedrock-hosted models inherit the vendor's sampling-param facts.
+  if (provider === 'aws-bedrock' && directSupport === undefined && bedrockVendor) {
+    const vendorSupport = getProviderCapabilitySupport(bedrockVendor, modelId, dimension, useDynamicLoading);
+    if (vendorSupport !== undefined) return vendorSupport;
+  }
+
   return directSupport;
+}
+
+function loadReasoningByModel(provider: string): Record<string, ModelReasoningOption[]> | undefined {
+  const useDynamicLoading = GatewayRegistry.getInstance()['useDynamicLoading'];
+  return loadProviderCapabilityFile(provider, useDynamicLoading)?.reasoning;
+}
+
+type ReasoningSource = { provider: string; modelId: string };
+
+function splitNestedModelId(modelId: string): ReasoningSource | undefined {
+  const delimiter = modelId.indexOf('/');
+  if (delimiter <= 0 || delimiter === modelId.length - 1) return undefined;
+  return { provider: modelId.substring(0, delimiter), modelId: modelId.substring(delimiter + 1) };
+}
+
+function reasoningSourcesInPrecedence(provider: string, modelId: string): ReasoningSource[] {
+  if (provider === 'aws-bedrock') {
+    const { vendor, shortId } = resolveBedrockVendorModel(modelId);
+    return [
+      { provider, modelId },
+      { provider, modelId: shortId },
+      ...(vendor ? [{ provider: vendor, modelId: shortId }] : []),
+    ];
+  }
+  const nested = splitNestedModelId(modelId);
+  if (!nested) return [{ provider, modelId }];
+  return [{ provider, modelId }, { provider: `${provider}/${nested.provider}`, modelId: nested.modelId }, nested];
+}
+
+function sourceAnswersForModel({ provider, modelId }: ReasoningSource): boolean {
+  const reasoningByModel = loadReasoningByModel(provider);
+  if (!reasoningByModel) return false;
+  return Object.hasOwn(reasoningByModel, modelId) || providerListsModel(provider, modelId);
+}
+
+/**
+ * The reasoning controls a model accepts: effort values, a token budget, or an on/off toggle.
+ * Returns `[]` when the provider data lists the model without reasoning controls, and `undefined`
+ * when no provider data describes the model. The first source that publishes reasoning data and
+ * lists the model answers for it: the provider itself, then a gateway's per-provider data, then
+ * the nested or Bedrock vendor's data.
+ */
+export function getModelReasoningOptions(modelRouterId: string): ModelReasoningOption[] | undefined {
+  const parsed = parseModelString(modelRouterId);
+  if (!parsed.provider) return undefined;
+  const provider = PROVIDER_ALIASES[parsed.provider] ?? parsed.provider;
+  const answeringSource = reasoningSourcesInPrecedence(provider, parsed.modelId).find(sourceAnswersForModel);
+  if (!answeringSource) return undefined;
+  return loadReasoningByModel(answeringSource.provider)?.[answeringSource.modelId] ?? [];
 }
 
 /** @internal Reset capability caches. For testing only. */
@@ -729,6 +876,7 @@ export class GatewayRegistry {
         attachmentCapabilities,
         temperatureCapabilities,
         structuredOutputCapabilities,
+        reasoningCapabilities,
         failedGateways,
       } = await fetchProvidersFromGateways(gateways);
 
@@ -755,6 +903,7 @@ export class GatewayRegistry {
           attachmentCapabilities,
           temperatureCapabilities,
           structuredOutputCapabilities,
+          reasoningCapabilities,
         );
         // console.debug(`[GatewayRegistry] ✅ Updated global cache at ${CACHE_DIR()}`);
       } catch (error) {
@@ -773,6 +922,7 @@ export class GatewayRegistry {
         attachmentCapabilities,
         temperatureCapabilities,
         structuredOutputCapabilities,
+        reasoningCapabilities,
       );
       // console.debug(`[GatewayRegistry] ✅ Updated registry files in dist/`);
 

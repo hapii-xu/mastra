@@ -1,10 +1,10 @@
-import { Container } from '@earendil-works/pi-tui';
+import { Container, Text } from '@earendil-works/pi-tui';
 import stripAnsi from 'strip-ansi';
 import { describe, expect, it, vi } from 'vitest';
 
 import { isChatBoundarySpacer } from '../../components/chat-boundary-spacer.js';
 import type { TUIState } from '../../state.js';
-import { handleOMActivation, handleOMBufferingStart } from '../om.js';
+import { handleOMActivation, handleOMBufferingStart, handleOMObservationEnd, handleOMObservationStart } from '../om.js';
 import type { EventHandlerContext } from '../types.js';
 
 function createCtx() {
@@ -19,18 +19,29 @@ function createCtx() {
 }
 
 describe('OM event handlers', () => {
-  it('removes an existing buffering marker when quiet mode suppresses buffering start', () => {
+  it('starts a new buffering cycle without adding a chat marker', () => {
     const { ctx, state } = createCtx();
-    state.quietMode = true;
-    const marker = new Container();
-    state.chatContainer.addChild(marker);
-    state.activeBufferingMarker = marker as any;
+    state.activeActivationMarker = new Container() as any;
+    state.activeActivationData = {} as any;
 
-    handleOMBufferingStart(ctx, 'observation', 100);
+    handleOMBufferingStart(ctx);
 
-    expect(state.activeBufferingMarker).toBeUndefined();
-    expect(state.chatContainer.children).not.toContain(marker);
+    expect(state.activeActivationMarker).toBeUndefined();
+    expect(state.activeActivationData).toBeUndefined();
+    expect(state.chatContainer.children).toHaveLength(0);
     expect(state.ui.requestRender).toHaveBeenCalled();
+  });
+
+  it('preserves completed text caches when replacing an observation marker', () => {
+    const { ctx, state } = createCtx();
+    const completed = new Text('completed history', 0, 0);
+    state.chatContainer.addChild(completed);
+    const cachedLines = completed.render(80);
+
+    handleOMObservationStart(ctx, 'cycle-1', 100);
+    handleOMObservationEnd(ctx, 'cycle-1', 25, 100, 20, 'observed');
+
+    expect(completed.render(80)).toBe(cachedLines);
   });
 });
 

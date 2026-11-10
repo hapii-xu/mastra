@@ -75,17 +75,32 @@ export abstract class SandboxProcessManager<TSandbox extends MastraSandbox = Mas
         validateMaxRetainedProcessOutputBytes(args[1].maxRetainedBytes);
       }
       await this.sandbox.ensureRunning();
+
+      // Merge the sandbox's runtime env into the spawn options.
+      // Read per spawn (never captured at construction) so values installed
+      // via setEnv() after construction reach every subsequent process.
+      // Per-call env wins over the sandbox env. When the sandbox env is
+      // empty, leave the args untouched — provider spawn implementations
+      // branch on `options.env !== undefined` and must not observe a new
+      // empty object. The optional call tolerates hand-rolled sandbox
+      // stubs (common in provider tests) that don't extend MastraSandbox.
+      const sandboxEnv = this.sandbox.getEnv?.();
+      if (sandboxEnv && Object.keys(sandboxEnv).length > 0) {
+        args[1] = { ...args[1], env: { ...sandboxEnv, ...args[1]?.env } };
+      }
+
       const handle = await impl.spawn(...args);
+      this._dismissed.delete(handle.pid);
       handle.command = args[0];
 
       // Wire abort signal to handle.kill() so all providers get abort support automatically.
       const abortSignal = args[1]?.abortSignal;
       if (abortSignal) {
         const onAbort = () => {
-          handle.kill().catch(() => {});
+          handle.killForAbort().catch(() => {});
         };
         if (abortSignal.aborted) {
-          handle.kill().catch(() => {});
+          onAbort();
         } else {
           abortSignal.addEventListener('abort', onAbort, { once: true });
           // Clean up listener when process exits
@@ -111,8 +126,9 @@ export abstract class SandboxProcessManager<TSandbox extends MastraSandbox = Mas
       const handle = await impl.get(...args);
       // Prune exited processes when their output is read — this is the
       // only automatic cleanup path. Keeps output available until the
-      // consumer has seen it at least once.
-      if (handle?.exitCode !== undefined) {
+      // consumer has seen it at least once. `release: false` lets an
+      // observer (such as a UI) read without taking it from the agent.
+      if (handle?.exitCode !== undefined && args[1]?.release !== false) {
         this._tracked.delete(handle.pid);
         this._dismissed.add(handle.pid);
       }
@@ -131,9 +147,22 @@ export abstract class SandboxProcessManager<TSandbox extends MastraSandbox = Mas
     throw new Error(`${this.constructor.name} must implement list()`);
   }
 
-  /** Get a handle to a process by PID. Subclasses can override for fallback behavior. */
-  async get(pid: string): Promise<ProcessHandle | undefined> {
+  /**
+   * Get a handle to a process by PID. Subclasses can override for fallback behavior.
+   *
+   * Reading an exited process releases it by default: later calls return
+   * `undefined`. Pass `{ release: false }` to read it and leave it available,
+   * for example to show its output without taking it from the agent.
+   */
+  // eslint-disable-next-line @typescript-eslint/no-unused-vars
+  async get(pid: string, options?: { release?: boolean }): Promise<ProcessHandle | undefined> {
     return this._tracked.get(pid);
+  }
+
+  /** Release a completed process handle and its retained output. */
+  release(pid: string): void {
+    this._tracked.delete(pid);
+    this._dismissed.add(pid);
   }
 
   /** Kill a process by PID. Returns true if killed, false if not found. */
@@ -147,8 +176,7 @@ export abstract class SandboxProcessManager<TSandbox extends MastraSandbox = Mas
       await handle.wait().catch(() => {});
     }
     // Release tracked handle to free accumulated output buffers.
-    this._tracked.delete(handle.pid);
-    this._dismissed.add(handle.pid);
+    this.release(handle.pid);
     return killed;
   }
 }

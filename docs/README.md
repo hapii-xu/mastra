@@ -18,7 +18,15 @@ Here's a quick start to run the docs locally
   pnpm run dev
   ```
 
-## Optional: Linting
+## Linting
+
+Run every docs check (formatting, frontmatter, sidebars, structure, links, remark, Vale, and redirects) with one command:
+
+```bash
+pnpm run check
+```
+
+Add `--fix` to apply safe fixes or `--format json` for machine-readable output. See [`styleguides/CHECKS.md`](./styleguides/CHECKS.md) for every rule ID. The individual linters below still work on their own.
 
 ### Remark
 
@@ -36,12 +44,6 @@ Vale is a syntax-aware linter for prose that can help enforce style and grammar 
 
    ```bash
    pnpm run vale:download
-   ```
-
-1. Install `mdx2vast` globally, which is a dependency for Vale to lint MDX files:
-
-   ```bash
-   npm install -g mdx2vast
    ```
 
 1. Then you can run the Vale linter:

@@ -27,7 +27,7 @@ import type { BaseExporterConfig } from '@mastra/observability';
 import tracer from 'dd-trace';
 import { isModelInferenceEnabled } from './features';
 import { formatUsageMetrics } from './metrics';
-import { ensureTracer, kindFor, toDate, formatInput, formatOutput } from './utils';
+import { ensureTracer, kindFor, toDate, formatInput, formatOutput, toDatadogLinks } from './utils';
 import type { DatadogSpanKind } from './utils';
 
 /**
@@ -44,6 +44,8 @@ interface LLMObsSpanOptions {
   modelName?: string;
   modelProvider?: string;
   startTime?: Date;
+  /** Links to spans in other traces, forwarded by llmobs.trace() to the APM span. */
+  links?: { context: any }[];
 }
 
 /**
@@ -133,6 +135,16 @@ export interface DatadogExporterConfig extends BaseExporterConfig {
   integrationsEnabled?: boolean;
 
   /**
+   * How long `flush()` waits, in milliseconds, after handing data to dd-trace.
+   * dd-trace sends LLM Observability spans and evaluations from a background
+   * writer and offers no way to await that request, so the wait keeps a process
+   * that exits right after `flush()` from cutting the send off. The wait only
+   * happens when something was sent since the last flush. Set to 0 to disable.
+   * Defaults to 2000.
+   */
+  flushGraceMs?: number;
+
+  /**
    * Keys from the request context (set via `requestContextKeys` in the Mastra
    * Observability config) that should be promoted to flat Datadog LLM Observability
    * tags instead of being nested inside `annotations.metadata`.
@@ -163,9 +175,15 @@ export class DatadogExporter extends BaseExporter {
   private config: Required<Pick<DatadogExporterConfig, 'mlApp' | 'site'>> & DatadogExporterConfig;
   private traceContext = new Map<string, TraceContext>();
   private traceState = new Map<string, TraceState>();
+  private flushGraceMs: number;
+  /** True when spans or evaluations were handed to dd-trace since the last flush() */
+  private pendingSend = false;
+  /** Grace wait in progress, shared by flush() calls that overlap it */
+  private graceWait: Promise<void> | null = null;
 
   constructor(config: DatadogExporterConfig = {}) {
     super(config);
+    this.flushGraceMs = config.flushGraceMs ?? 2000;
 
     // Resolve configuration from config object and environment variables
     const mlApp = config.mlApp ?? process.env.DD_LLMOBS_ML_APP;
@@ -176,7 +194,7 @@ export class DatadogExporter extends BaseExporter {
     // Default to agentless mode (true) for consistency with other Mastra exporters
     // Only disable if explicitly set to false via config or env var
     const envAgentless = process.env.DD_LLMOBS_AGENTLESS_ENABLED?.toLowerCase();
-    const agentless = config.agentless ?? (envAgentless === 'false' || envAgentless === '0' ? false : true);
+    const agentless = config.agentless ?? !(envAgentless === 'false' || envAgentless === '0');
 
     // Validate required configuration
     if (!mlApp) {
@@ -231,7 +249,7 @@ export class DatadogExporter extends BaseExporter {
       switch (event.type) {
         case 'span_started':
           this.captureTraceContext(span);
-          return;
+          break;
 
         case 'span_updated':
           // No-op: completion-only pattern ignores mid-span updates
@@ -239,7 +257,7 @@ export class DatadogExporter extends BaseExporter {
 
         case 'span_ended':
           this.enqueueSpan(span);
-          return;
+          break;
       }
     } catch (error) {
       this.logger.error('Datadog exporter error', {
@@ -455,6 +473,7 @@ export class DatadogExporter extends BaseExporter {
     }
 
     try {
+      this.pendingSend = true;
       tracer.llmobs.submitEvaluation(
         { traceId: exported.traceId, spanId: exported.spanId },
         {
@@ -494,6 +513,27 @@ export class DatadogExporter extends BaseExporter {
         this.logger.error('Error flushing llmobs', { error: e });
       }
     }
+
+    await this.waitForBackgroundSend();
+  }
+
+  /**
+   * `llmobs.flush()` returns before the background writer's HTTP request
+   * completes and dd-trace gives nothing to await, so wait a bounded time
+   * instead. Starts one wait per batch of new data, so the repeated flushes
+   * during shutdown don't stack. A flush that overlaps a running wait joins
+   * it, so no caller resolves before the data it produced had its wait.
+   */
+  private async waitForBackgroundSend(): Promise<void> {
+    if (!(this.flushGraceMs > 0) || !Number.isFinite(this.flushGraceMs)) return;
+    if (this.pendingSend) {
+      this.pendingSend = false;
+      const wait: Promise<void> = new Promise<void>(resolve => setTimeout(resolve, this.flushGraceMs)).finally(() => {
+        if (this.graceWait === wait) this.graceWait = null;
+      });
+      this.graceWait = wait;
+    }
+    await this.graceWait;
   }
 
   /**
@@ -616,22 +656,39 @@ export class DatadogExporter extends BaseExporter {
       state.buffer.clear();
       state.treeEmitted = true;
     } else {
-      // Tree already emitted - handle late-arriving spans individually
-      // Use the old parent-first emission pattern for these
-      let emitted = false;
-      do {
+      // Tree already emitted - handle late-arriving spans (e.g. fire-and-forget
+      // work like memory title generation that outlives the root span).
+      // dd-trace derives LLMObs parent linkage only from an enclosing
+      // llmobs.trace() callback - scope().activate() does not link LLMObs
+      // parents - so emitting these spans one at a time flattens every chain
+      // into disconnected root spans. Emit each chain as a nested sub-tree
+      // instead, once the chain's local root can be resolved.
+      let emitted = true;
+      while (emitted) {
         emitted = false;
-        for (const [spanId, span] of state.buffer) {
+        for (const span of state.buffer.values()) {
+          // Will be emitted as part of the buffered parent's sub-tree
+          if (span.parentSpanId && state.buffer.has(span.parentSpanId)) {
+            continue;
+          }
+
           const parentCtx = span.parentSpanId ? state.contexts.get(span.parentSpanId) : undefined;
           if (span.parentSpanId && !parentCtx) {
             continue;
           }
 
-          this.emitSingleSpan(span, state, parentCtx?.ddSpan);
-          state.buffer.delete(spanId);
+          const subTree = this.takeSubTree(span, state.buffer);
+          if (parentCtx) {
+            // Activating the parent keeps APM trace continuity even though
+            // LLMObs cannot re-parent onto an already-emitted span
+            tracer.scope().activate(parentCtx.ddSpan, () => this.emitSpanTree(subTree, state));
+          } else {
+            this.emitSpanTree(subTree, state);
+          }
           emitted = true;
+          break;
         }
-      } while (emitted);
+      }
     }
 
     // Schedule cleanup if root has ended and buffer is empty
@@ -708,6 +765,33 @@ export class DatadogExporter extends BaseExporter {
   }
 
   /**
+   * Builds a sub-tree rooted at the given span from its buffered descendants,
+   * removing every collected span from the buffer. Used for late-arriving span
+   * chains emitted after the main tree.
+   */
+  private takeSubTree(rootSpan: AnyExportedSpan, buffer: Map<string, AnyExportedSpan>): SpanNode {
+    buffer.delete(rootSpan.id);
+
+    const children: SpanNode[] = [];
+    for (const candidate of [...buffer.values()]) {
+      if (candidate.parentSpanId === rootSpan.id) {
+        children.push(this.takeSubTree(candidate, buffer));
+      }
+    }
+
+    // Sort children by start time for consistent ordering
+    children.sort((a, b) => {
+      const aTime =
+        a.span.startTime instanceof Date ? a.span.startTime.getTime() : new Date(a.span.startTime).getTime();
+      const bTime =
+        b.span.startTime instanceof Date ? b.span.startTime.getTime() : new Date(b.span.startTime).getTime();
+      return aTime - bTime;
+    });
+
+    return { span: rootSpan, children };
+  }
+
+  /**
    * Builds LLMObs span options from a Mastra span.
    * Handles trace context, timestamps, and conditional model information for LLM spans.
    */
@@ -729,6 +813,7 @@ export class DatadogExporter extends BaseExporter {
     };
 
     const startTime = toDate(span.startTime);
+    const links = toDatadogLinks(span.links);
     // Event spans are point-in-time markers; use startTime for endTime if not set (zero duration)
     // Regular spans fall back to current time if endTime is not set
     const endTime = span.endTime ? toDate(span.endTime) : span.isEvent ? startTime : new Date();
@@ -742,6 +827,7 @@ export class DatadogExporter extends BaseExporter {
         startTime,
         ...(kind === 'llm' && attrs?.model ? { modelName: attrs.model } : {}),
         ...(kind === 'llm' && attrs?.provider ? { modelProvider: attrs.provider } : {}),
+        ...(links.length > 0 ? { links } : {}),
       },
       // endTime as milliseconds for ddSpan.finish() — dd-trace's llmobs.trace() does not
       // honor endTime in options, so we must call finish(ms) explicitly on the span.
@@ -774,6 +860,7 @@ export class DatadogExporter extends BaseExporter {
 
     // Use nested llmobs.trace() calls - children are emitted INSIDE the parent's callback
     // This ensures the Datadog SDK automatically establishes parent-child relationships
+    this.pendingSend = true;
     tracer.llmobs.trace(traceOptions as any, (ddSpan: any) => {
       // Annotate this span (must happen before finish — annotate throws on finished spans)
       const annotations = this.buildAnnotations(span);
@@ -804,40 +891,5 @@ export class DatadogExporter extends BaseExporter {
         ddSpan.finish(endTimeMs);
       }
     });
-  }
-
-  /**
-   * Emit a single span with the proper Datadog parent context.
-   * Used for late-arriving spans after the main tree has been emitted.
-   */
-  private emitSingleSpan(span: AnyExportedSpan, state: TraceState, parent?: any) {
-    const { traceOptions, endTimeMs } = this.buildSpanOptions(span);
-
-    const runTrace = () =>
-      tracer.llmobs.trace(traceOptions as any, (ddSpan: any) => {
-        const annotations = this.buildAnnotations(span);
-        if (Object.keys(annotations).length > 0) {
-          tracer.llmobs.annotate(ddSpan, annotations);
-        }
-
-        // Set native Datadog error tags for proper Error Tracking UI
-        if (span.errorInfo) {
-          this.setErrorTags(ddSpan, span.errorInfo);
-        }
-
-        const exported = tracer.llmobs.exportSpan ? tracer.llmobs.exportSpan(ddSpan) : undefined;
-        state.contexts.set(span.id, { ddSpan, exported });
-
-        // Explicitly finish with the correct end time (see emitSpanTree for details)
-        if (typeof ddSpan.finish === 'function') {
-          ddSpan.finish(endTimeMs);
-        }
-      });
-
-    if (parent) {
-      tracer.scope().activate(parent, runTrace);
-    } else {
-      runTrace();
-    }
   }
 }

@@ -10,6 +10,46 @@ import type {
 import { BaseSpan } from './base';
 import { deepClean } from './serialization';
 
+/** Every AI SDK `APICallError` (v4, v5 and v6) carries this shared marker symbol. */
+const API_CALL_ERROR_MARKER = Symbol.for('vercel.ai.error.AI_APICallError');
+
+interface ApiCallErrorLike {
+  statusCode?: number;
+  url?: string;
+  isRetryable?: boolean;
+  responseBody?: string;
+}
+
+function isApiCallError(value: unknown): value is ApiCallErrorLike {
+  return (
+    typeof value === 'object' && value !== null && (value as Record<symbol, unknown>)[API_CALL_ERROR_MARKER] === true
+  );
+}
+
+/**
+ * HTTP facts of a provider call failure, read from an AI SDK `APICallError` or
+ * from the one a wrapper (MastraError, durable transport) carries as `cause`.
+ * Without them a span only says "Service Unavailable", with no status or URL.
+ */
+function apiCallErrorDetails(error: Error): Record<string, unknown> | undefined {
+  const apiError = isApiCallError(error) ? error : isApiCallError(error.cause) ? error.cause : undefined;
+  if (!apiError) return undefined;
+  const details: Record<string, unknown> = {};
+  if (apiError.statusCode !== undefined) details.statusCode = apiError.statusCode;
+  // Keep only origin and path: a custom baseURL may carry a credential in the query string.
+  if (apiError.url !== undefined) details.url = apiError.url.split('?')[0];
+  if (apiError.isRetryable !== undefined) details.isRetryable = apiError.isRetryable;
+  if (apiError.responseBody !== undefined) {
+    // Providers usually answer with JSON; keep it as an object so its keys stay readable and filterable.
+    try {
+      details.responseBody = JSON.parse(apiError.responseBody);
+    } catch {
+      details.responseBody = apiError.responseBody;
+    }
+  }
+  return details;
+}
+
 export class DefaultSpan<TType extends SpanType> extends BaseSpan<TType> {
   public id: string;
   public traceId: string;
@@ -24,17 +64,24 @@ export class DefaultSpan<TType extends SpanType> extends BaseSpan<TType> {
       if (options.parentSpanId) {
         this.parentSpanId = options.parentSpanId;
       }
+      if (options.externalParentSpanId) {
+        this.externalParentSpanId = options.externalParentSpanId;
+      }
       return;
     }
 
     // If bridge and not internal span, use bridge to init span
     const bridge = observabilityInstance.getBridge();
-    if (bridge && !this.isInternal) {
+    if (bridge && !this.isInternal && !this.isExcluded) {
       const bridgeIds = bridge.createSpan(options);
       if (bridgeIds) {
         this.id = bridgeIds.spanId;
         this.traceId = bridgeIds.traceId;
-        this.parentSpanId = bridgeIds.parentSpanId;
+        // Caller-supplied links win over bridge parentage. Per the SpanIds
+        // contract, bridges report a Mastra parent (in storage) as
+        // parentSpanId and an ambient parent as externalParentSpanId.
+        this.parentSpanId = options.parentSpanId ?? bridgeIds.parentSpanId;
+        this.externalParentSpanId = options.externalParentSpanId ?? bridgeIds.externalParentSpanId;
         return;
       }
     }
@@ -59,47 +106,78 @@ export class DefaultSpan<TType extends SpanType> extends BaseSpan<TType> {
         );
       }
     }
+    if (options.externalParentSpanId) {
+      if (isValidSpanId(options.externalParentSpanId)) {
+        this.externalParentSpanId = options.externalParentSpanId;
+      } else {
+        console.error(
+          `[Mastra Tracing] Invalid externalParentSpanId: must be 1-16 hexadecimal characters, got "${options.externalParentSpanId}". Ignoring.`,
+        );
+      }
+    }
   }
 
   end(options?: EndSpanOptions<TType>): void {
     if (this.isEvent) {
       return;
     }
+    if (this.endTime) {
+      return;
+    }
+    if (options?.endTree) {
+      // Close affected descendants first so
+      // exporters that wait for the root still see it end last.
+      this.endOpenDescendants(options);
+    }
+    if (options) this.applyOutcome(options);
+    if (this.outcome === null) this.outcome = 'unknown';
     this.endTime = new Date();
+    this.detachFromParent();
     // Metadata is always updated (read by correlation/logger/metrics contexts).
     if (options?.metadata) {
-      this.metadata = { ...this.metadata, ...deepClean(options.metadata, this.deepCleanOptions) };
+      this.metadata = {
+        ...this.metadata,
+        ...deepClean(this.prepareSpanMetadata(options.metadata), this.deepCleanOptions),
+      };
     }
     if (this.isExcluded) {
       // Span is filtered before export; skip attaching heavy fields.
       return;
     }
     if (options?.output !== undefined) {
-      this.output = deepClean(options.output, this.deepCleanOptions);
+      this.output = deepClean(this.prepareSpanOutput(options.output), this.deepCleanOptions);
     }
     if (options?.attributes) {
-      this.attributes = { ...this.attributes, ...deepClean(options.attributes, this.deepCleanOptions) };
+      this.attributes = {
+        ...this.attributes,
+        ...deepClean(options.attributes, this.deepCleanOptions),
+      };
     }
     // Tracing events automatically handled by base class
   }
 
   error(options: ErrorSpanOptions<TType>): void {
-    if (this.isEvent) {
+    if (this.isEvent || this.endTime) {
       return;
     }
 
-    const { error, endSpan = true, attributes, metadata } = options;
+    const { error, endSpan = true, endTree, attributes, metadata } = options;
+    this.applyOutcome(options);
 
     if (metadata) {
-      this.metadata = { ...this.metadata, ...deepClean(metadata, this.deepCleanOptions) };
+      this.metadata = {
+        ...this.metadata,
+        ...deepClean(this.prepareSpanMetadata(metadata), this.deepCleanOptions),
+      };
     }
 
     if (!this.isExcluded) {
+      const apiDetails = apiCallErrorDetails(error);
       this.errorInfo = deepClean(
         error instanceof MastraError
           ? {
               id: error.id,
-              details: error.details,
+              details: apiDetails ? { ...error.details, ...apiDetails } : error.details,
               category: error.category,
               domain: error.domain,
               message: error.message,
@@ -113,16 +191,22 @@ export class DefaultSpan<TType extends SpanType> extends BaseSpan<TType> {
               message: error.message,
               name: error.name,
               stack: error.stack,
+              ...(apiDetails && { details: apiDetails }),
             },
         this.deepCleanOptions,
       );
 
       if (attributes) {
-        this.attributes = { ...this.attributes, ...deepClean(attributes, this.deepCleanOptions) };
+        this.attributes = {
+          ...this.attributes,
+          ...deepClean(attributes, this.deepCleanOptions),
+        };
       }
     }
 
-    if (endSpan) {
+    if (endTree) {
+      this.end({ endTree: true });
+    } else if (endSpan) {
       this.end();
     } else {
       // Trigger span update event when not ending the span
@@ -135,12 +219,17 @@ export class DefaultSpan<TType extends SpanType> extends BaseSpan<TType> {
       return;
     }
 
+    this.applyOutcome(options);
+
     if (options.name !== undefined) {
       this.name = options.name;
     }
     // Metadata is always updated (read by correlation/logger/metrics contexts).
     if (options.metadata) {
-      this.metadata = { ...this.metadata, ...deepClean(options.metadata, this.deepCleanOptions) };
+      this.metadata = {
+        ...this.metadata,
+        ...deepClean(this.prepareSpanMetadata(options.metadata), this.deepCleanOptions),
+      };
     }
     if (this.isExcluded) {
       return;
@@ -149,10 +238,13 @@ export class DefaultSpan<TType extends SpanType> extends BaseSpan<TType> {
       this.input = deepClean(options.input, this.deepCleanOptions);
     }
     if (options.output !== undefined) {
-      this.output = deepClean(options.output, this.deepCleanOptions);
+      this.output = deepClean(this.prepareSpanOutput(options.output), this.deepCleanOptions);
     }
     if (options.attributes) {
-      this.attributes = { ...this.attributes, ...deepClean(options.attributes, this.deepCleanOptions) };
+      this.attributes = {
+        ...this.attributes,
+        ...deepClean(options.attributes, this.deepCleanOptions),
+      };
     }
     // Tracing events automatically handled by base class
   }
@@ -176,7 +268,7 @@ export class DefaultSpan<TType extends SpanType> extends BaseSpan<TType> {
 /**
  * Generate OpenTelemetry-compatible span ID (64-bit, 16 hex chars)
  */
-function fillRandomBytes(bytes: Uint8Array): void {
+function fillRandomBytes(bytes: Uint8Array<ArrayBuffer>): void {
   try {
     // Use Web Crypto API with proper this binding
     const webCrypto = globalThis.crypto;
@@ -225,11 +317,10 @@ function getOrCreateTraceId(options: CreateSpanOptions<SpanType>): string {
   if (options.traceId) {
     if (isValidTraceId(options.traceId)) {
       return options.traceId;
-    } else {
-      console.error(
-        `[Mastra Tracing] Invalid traceId: must be 1-32 hexadecimal characters, got "${options.traceId}". Generating new trace ID.`,
-      );
     }
+    console.error(
+      `[Mastra Tracing] Invalid traceId: must be 1-32 hexadecimal characters, got "${options.traceId}". Generating new trace ID.`,
+    );
   }
   return generateTraceId();
 }

@@ -36,9 +36,17 @@ export interface ReflectorResult extends BaseReflectorResult {
  * - Preserving ALL important information (reflections become the ENTIRE memory)
  *
  * @param instruction - Optional custom instructions to append to the prompt
+ * @param extractors - Active extractors, used to decide which sections the prompt describes
  */
-export function buildReflectorSystemPrompt(instruction?: string, extractors: readonly Extractor<any>[] = []): string {
+export function buildReflectorSystemPrompt(instruction?: string, extractors?: readonly Extractor<any>[]): string {
   const outputFormat = buildObserverOutputFormat(extractors);
+  const customInstructions = instruction ? `\n\n=== CUSTOM INSTRUCTIONS ===\n\n${instruction}` : '';
+  // Runtime callers always pass the composed extractor list; `undefined` only occurs through
+  // the exported no-arg default (REFLECTOR_SYSTEM_PROMPT), which keeps both built-in sections.
+  const currentTaskEnabled =
+    extractors === undefined || extractors.some(extractor => extractor.slug === 'current-task');
+  const suggestedResponseEnabled =
+    extractors === undefined || extractors.some(extractor => extractor.slug === 'suggested-response');
   return `You are the memory consciousness of an AI assistant. Your memory observation reflections will be the ONLY information the assistant has about past interactions with this user.
 
 The following instructions were given to another part of your psyche (the observer) to create memories.
@@ -65,13 +73,18 @@ Take the existing observations and rewrite them to make it easier to continue in
 
 IMPORTANT: your reflections are THE ENTIRETY of the assistants memory. Any information you do not add to your reflections will be immediately forgotten. Make sure you do not leave out anything. Your reflections must assume the assistant knows nothing - your reflections are the ENTIRE memory system.
 
+The assistant relies on this memory to answer precise questions about what the user said, when they said it, and how things changed over time.
+
 When consolidating observations:
-- Preserve and include dates/times when present (temporal context is critical)
-- Retain the most relevant timestamps (start times, completion times, significant events)
+- Keep every concrete fact: names, places, dates, numbers, amounts, durations, titles, versions, and who said what. Merge duplicates, but never drop specifics
+- Keep every dated statement with its date, and retain the timestamps that matter (start times, completion times, significant events)
+- When the user changed their mind or a fact was updated, keep both the old and new values with their dates and say which is current
+- Keep what the user explicitly said they have never done, do not know, or refused, and keep every stated preference, rule, and instruction with its meaning intact
+- Prefer many short factual lines over prose summaries. Do not replace facts with generalities like "discussed travel plans"
 - Combine related items where it makes sense (e.g., "agent called view tool 5 times on file x")
 - Preserve ✅ completion markers — they are memory signals that tell the assistant what is already resolved and help prevent repeated work
 - Preserve the concrete resolved outcome captured by ✅ markers so the assistant knows what exactly is done
-- Condense older observations more aggressively, retain more detail for recent ones
+- Condense the wording of older observations more than recent ones, but keep their facts
 
 CRITICAL: USER ASSERTIONS vs QUESTIONS
 - "User stated: X" = authoritative assertion (user told us something about themselves)
@@ -115,7 +128,15 @@ Date: Dec 4, 2025
 
 ${outputFormat}
 
-User messages are extremely important. If the user asks a question or gives a new task, make it clear in <current-task> that this is the priority. If the assistant needs to respond to the user, indicate in <suggested-response> that it should pause for user reply before continuing other tasks.${instruction ? `\n\n=== CUSTOM INSTRUCTIONS ===\n\n${instruction}` : ''}`;
+User messages are extremely important.${
+    currentTaskEnabled
+      ? ' If the user asks a question or gives a new task, make it clear in <current-task> that this is the priority.'
+      : ''
+  }${
+    suggestedResponseEnabled
+      ? ' If the assistant needs to respond to the user, indicate in <suggested-response> that it should pause for user reply before continuing other tasks.'
+      : ''
+  }${customInstructions}`;
 }
 
 /**
@@ -289,8 +310,10 @@ export function parseReflectorOutput(
   sourceObservations?: string,
   extractors: readonly Extractor<any>[] = [],
 ): ReflectorResult {
-  // Check for degenerate repetition before parsing
-  if (detectDegenerateRepetition(output)) {
+  // Check for degenerate repetition before parsing. Like the observer, giant
+  // lines are truncated rather than rejected, so repetition is judged on the
+  // line-length-sanitized output.
+  if (detectDegenerateRepetition(sanitizeObservationLines(output))) {
     return {
       observations: '',
       degenerate: true,

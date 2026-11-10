@@ -1,6 +1,6 @@
 ---
 title: "Reference: Agent.listTools() | Agents"
-description: "Documentation for the `Agent.listTools()` method in Mastra agents, which retrieves the tools that the agent can use."
+description: "The .listTools() method retrieves the tools configured for an agent, resolving them if they're a function."
 packages:
   - "@mastra/core"
 ---
@@ -49,9 +49,8 @@ await agent.listTools()
   content={[
   {
     name: 'tools',
-    type: 'TTools | Promise<TTools>',
-    description:
-      'The tools configured for the agent, either as a direct object or a promise that resolves to the tools.',
+    type: 'Promise<TTools>',
+    description: 'A promise that resolves to the tools configured for the agent.',
   },
 ]}
 />
@@ -66,5 +65,5 @@ await agent.listTools({
 
 ## Related
 
-- [Using tools with agents](/docs/agents/using-tools)
-- [Creating tools](/docs/mcp/overview)
+- [Using tools with agents](/docs/agents/tools)
+- [Creating tools](/docs/connections/mcp)

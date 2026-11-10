@@ -9,6 +9,8 @@ import type {
   VoiceTurnCompleteHook,
   VoiceTurnUsage,
 } from './bridge';
+import { VOICE_TEXT_FLUSH } from './turn-metrics';
+import type { VoiceReplyChunk } from './turn-metrics';
 
 const DEFAULT_API_PREFIX = '/api';
 /** Connect + first-token budget when not overridden. Plugin mode passes `connOptions.timeoutMs`. */
@@ -213,13 +215,17 @@ export function createRemoteAgentReplyGenerator(options: RemoteAgentReplyGenerat
       // The server schema requires a resource when memory is present; default it to the thread id,
       // matching the worker's own thread bootstrap.
       memory: ctx.memory
-        ? { thread: ctx.memory.thread, resource: ctx.memory.resource ?? ctx.memory.thread }
+        ? {
+            thread: ctx.memory.thread,
+            resource: ctx.memory.resource ?? ctx.memory.thread,
+            ...(ctx.memory.options ? { options: ctx.memory.options } : {}),
+          }
         : undefined,
       requestContext: serializeRequestContext(ctx.requestContext),
       ...extraBody,
     };
 
-    return new ReadableStream<string>({
+    return new ReadableStream<VoiceReplyChunk>({
       start: async controller => {
         // `retryable` is the LiveKit contract flag: true only before the first chunk is emitted, so a
         // voice turn is never replayed half-heard. It also gates the standalone connect-retry.
@@ -292,6 +298,13 @@ export function createRemoteAgentReplyGenerator(options: RemoteAgentReplyGenerat
                     }
                     break;
                   }
+                  case 'text-end':
+                  case 'step-finish':
+                    controller.enqueue(VOICE_TEXT_FLUSH);
+                    break;
+                  case 'tool-result':
+                    if (typeof payload.toolCallId === 'string') ctx.metrics?.toolEnd(payload.toolCallId);
+                    break;
                   case 'tool-call': {
                     // A tool call is first-token progress too — the model committed to a tool run,
                     // which may legitimately outlast the connect budget before any text streams.
@@ -302,6 +315,8 @@ export function createRemoteAgentReplyGenerator(options: RemoteAgentReplyGenerat
                       args: payload.args,
                     };
                     toolCalls.push(toolCall);
+                    ctx.metrics?.toolStart({ toolCallId: toolCall.toolCallId, toolName: toolCall.toolName });
+                    controller.enqueue(VOICE_TEXT_FLUSH);
                     // Observer hooks are customer code: a throw must not tear down an otherwise
                     // healthy reply stream (same isolation as onTurnComplete).
                     try {
@@ -316,7 +331,10 @@ export function createRemoteAgentReplyGenerator(options: RemoteAgentReplyGenerat
                       } catch (error) {
                         console.warn('@mastra/livekit: toolFeedback hook threw', error);
                       }
-                      if (filler) controller.enqueue(filler.endsWith(' ') ? filler : `${filler} `);
+                      if (filler) {
+                        controller.enqueue(filler.endsWith(' ') ? filler : `${filler} `);
+                        controller.enqueue(VOICE_TEXT_FLUSH);
+                      }
                     }
                     break;
                   }

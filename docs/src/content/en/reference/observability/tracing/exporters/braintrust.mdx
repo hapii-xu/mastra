@@ -1,6 +1,6 @@
 ---
 title: "Reference: BraintrustExporter | Observability"
-description: Braintrust exporter for Tracing
+description: "Configure BraintrustExporter to send Mastra trace data to Braintrust for AI observability, evaluations, logging, and project-level analysis."
 packages:
   - "@mastra/braintrust"
 ---
@@ -13,7 +13,7 @@ Sends Tracing data to Braintrust for eval and observability.
 
 ## Constructor
 
-```typescript prettier:false
+```typescript oxfmt:false
 new BraintrustExporter(config: BraintrustExporterConfig)
 ```
 
@@ -87,7 +87,7 @@ Extends `BaseExporterConfig`, which includes:
 
 ### `exportTracingEvent`
 
-```typescript prettier:false
+```typescript oxfmt:false
 async exportTracingEvent(event: TracingEvent): Promise<void>
 ```
 
@@ -95,7 +95,7 @@ Exports a tracing event to Braintrust.
 
 ### export
 
-```typescript prettier:false
+```typescript oxfmt:false
 async export(spans: ReadOnlySpan[]): Promise<void>
 ```
 
@@ -103,7 +103,7 @@ Batch exports spans to Braintrust.
 
 ### flush
 
-```typescript prettier:false
+```typescript oxfmt:false
 async flush(): Promise<void>
 ```
 
@@ -111,7 +111,7 @@ Force flushes any buffered spans to Braintrust without shutting down the exporte
 
 ### shutdown
 
-```typescript prettier:false
+```typescript oxfmt:false
 async shutdown(): Promise<void>
 ```
 
@@ -151,3 +151,13 @@ const exporter = new BraintrustExporter({
 | `WORKFLOW_CONDITIONAL_EVAL` | `function` |
 | `WORKFLOW_WAIT_EVENT` | `function` |
 | All others | `task` |
+
+## Cost tracking
+
+Braintrust uses a span's `metrics.estimated_cost` as its cost when the field is set, and estimates the cost from token metrics and its own model prices when it isn't. The exporter sets `metrics.estimated_cost` on a model generation span only when the generation's cost metadata meets every condition:
+
+- `costContext.costMetadata.source` is `'provider_reported'`, meaning the model provider returned the cost, as OpenRouter and Vercel AI Gateway do.
+- `costContext.costUnit` is `'USD'`.
+- `costContext.estimatedCost` is a finite number greater than `0`.
+
+Mastra's own cost estimates aren't exported, so Braintrust prices those spans with its model prices. A reported cost of `0` is skipped as well. Vercel AI Gateway reports `0` for bring-your-own-key requests, which your model provider still bills, and Braintrust's estimate is closer to that charge. The span metadata keeps the full `costContext` in every case.

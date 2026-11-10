@@ -11,8 +11,8 @@
  * - **org-scoped** rows (`userId` absent): shared API keys set by an org
  *   admin, inherited by every member.
  *
- * Resolution order at model-call time is user > org (the caller layers server
- * env vars underneath as a final fallback).
+ * Model calls resolve exactly one scope: user or org. Deployed tenant stores
+ * never fall back to the other scope or implicitly borrow server environment keys.
  *
  * Secrets posture: credentials are stored server-side only and never returned
  * to the client (same as `linear_connections.access_token`). Encryption at
@@ -26,6 +26,8 @@
 import type { AuthCredential, OAuthCredential } from '@mastra/code-sdk/auth/types';
 import { FactoryStorageDomain, UniqueViolationError } from '@mastra/core/storage';
 import type { CollectionSchema, CollectionWhere, FactoryStorageOps } from '@mastra/core/storage';
+import { createPlaintextFactorySecretEncryption } from '../../../secret-encryption.js';
+import type { FactorySecretEncryption } from '../../../secret-encryption.js';
 
 /** Owning tenant of a credential row. `userId` absent = org-scoped row. */
 export interface CredentialTenant {
@@ -42,6 +44,8 @@ export interface CredentialRecord {
   scope: CredentialScope;
   credential: AuthCredential;
   updatedAt: Date;
+  /** When the last OAuth token refresh failed; cleared by the next successful refresh or a new sign-in. */
+  refreshFailedAt?: Date;
 }
 
 /** Result of per-caller resolution: the winning credential and its scope. */
@@ -54,6 +58,9 @@ export interface ResolvedCredential {
 /** Kind of pending web login flow a session row tracks. */
 export type LoginSessionKind = 'paste-code' | 'device-code';
 
+/** Scope the completed credential should be written to. */
+export type LoginCredentialScope = 'user' | 'org';
+
 /** One pending OAuth login flow, persisted so any replica can continue it. */
 export interface LoginSessionRow {
   sessionId: string;
@@ -61,6 +68,8 @@ export interface LoginSessionRow {
   userId: string;
   provider: string;
   kind: LoginSessionKind;
+  /** Where the completed credential lands; absent rows default to `'user'`. */
+  credentialScope?: LoginCredentialScope;
   /** Serialized flow state (PKCE verifier, device-code pending state, ...). */
   pending: Record<string, unknown>;
   expiresAt: Date;
@@ -75,6 +84,7 @@ export interface CreateLoginSessionInput {
   userId: string;
   provider: string;
   kind: LoginSessionKind;
+  credentialScope?: LoginCredentialScope;
   pending: Record<string, unknown>;
   expiresAt: Date;
   nextPollAt?: Date | null;
@@ -83,13 +93,6 @@ export interface CreateLoginSessionInput {
 /** Mirror of `AuthStorage.getApiKey()`'s expiry check. */
 export function isOAuthCredentialExpired(credential: OAuthCredential, now = Date.now()): boolean {
   return now >= credential.expires;
-}
-
-/** OAuth plan credentials are personal and must always have an owning user. */
-export function assertCredentialScope(tenant: CredentialTenant, credential: AuthCredential): void {
-  if (credential.type === 'oauth' && !tenant.userId) {
-    throw new Error('OAuth credentials must be user-scoped');
-  }
 }
 
 export const MODEL_CREDENTIALS_SCHEMA: CollectionSchema = {
@@ -103,6 +106,7 @@ export const MODEL_CREDENTIALS_SCHEMA: CollectionSchema = {
     data: { type: 'json' },
     created_at: { type: 'timestamp' },
     updated_at: { type: 'timestamp' },
+    refresh_failed_at: { type: 'timestamp', nullable: true },
   },
   uniqueIndexes: [
     // Scope is encoded in `user_id` nullability (NULL = org-scoped shared
@@ -124,6 +128,7 @@ export const OAUTH_LOGIN_SESSIONS_SCHEMA: CollectionSchema = {
     user_id: { type: 'text' },
     provider: { type: 'text' },
     kind: { type: 'text' },
+    credential_scope: { type: 'text', nullable: true },
     pending: { type: 'json' },
     expires_at: { type: 'timestamp' },
     next_poll_at: { type: 'timestamp', nullable: true },
@@ -136,8 +141,9 @@ interface CredentialDbRow extends Record<string, unknown> {
   id: string;
   provider: string;
   user_id: string | null;
-  data: AuthCredential;
+  data: unknown;
   updated_at: Date;
+  refresh_failed_at: Date | null;
 }
 
 /** Column shape of one `oauth_login_sessions` row as returned by ops. */
@@ -147,6 +153,7 @@ interface LoginSessionDbRow extends Record<string, unknown> {
   user_id: string;
   provider: string;
   kind: LoginSessionKind;
+  credential_scope: LoginCredentialScope | null;
   pending: Record<string, unknown>;
   expires_at: Date;
   next_poll_at: Date | null;
@@ -160,6 +167,7 @@ function toSessionRow(db: LoginSessionDbRow): LoginSessionRow {
     userId: db.user_id,
     provider: db.provider,
     kind: db.kind,
+    ...(db.credential_scope ? { credentialScope: db.credential_scope } : {}),
     pending: db.pending,
     expiresAt: db.expires_at,
     nextPollAt: db.next_poll_at,
@@ -179,12 +187,14 @@ function tenantWhere(tenant: CredentialTenant, provider: string): CollectionWher
  * invalidating each other's rotating tokens / double-claiming a flow.
  */
 export class ModelCredentialsStorage extends FactoryStorageDomain {
-  constructor() {
+  constructor(private readonly encryption: FactorySecretEncryption = createPlaintextFactorySecretEncryption()) {
     super('model-credentials');
   }
 
   async init(): Promise<void> {
     await this.ensureCollections([MODEL_CREDENTIALS_SCHEMA, OAUTH_LOGIN_SESSIONS_SCHEMA]);
+    const rows = await this.ops.findMany<CredentialDbRow>('model_provider_credentials', {});
+    await Promise.all(rows.map(row => this.#migrateCredential(row.id)));
   }
 
   async dangerouslyClearAll(): Promise<void> {
@@ -196,21 +206,44 @@ export class ModelCredentialsStorage extends FactoryStorageDomain {
     return this.ops;
   }
 
+  async #decryptCredential(value: unknown): Promise<AuthCredential> {
+    return (await this.encryption.decrypt<AuthCredential>(value)).value;
+  }
+
+  async #toRecord(row: CredentialDbRow, scope: CredentialScope): Promise<CredentialRecord> {
+    return {
+      provider: row.provider,
+      scope,
+      credential: await this.#decryptCredential(row.data),
+      updatedAt: row.updated_at,
+      refreshFailedAt: row.refresh_failed_at ?? undefined,
+    };
+  }
+
+  async #migrateCredential(id: string): Promise<void> {
+    await this.#db.updateAtomic<CredentialDbRow>('model_provider_credentials', { id }, async row => {
+      const decrypted = await this.encryption.decrypt<AuthCredential>(row.data);
+      if (!decrypted.needsReencryption) return null;
+      return { data: await this.encryption.encrypt(decrypted.value) };
+    });
+  }
+
   /** Read the tenant's credential for a provider at exactly that scope. */
   async getCredential(tenant: CredentialTenant, provider: string): Promise<AuthCredential | undefined> {
     const row = await this.#db.findOne<CredentialDbRow>('model_provider_credentials', tenantWhere(tenant, provider));
-    return row?.data;
+    return row ? this.#decryptCredential(row.data) : undefined;
   }
 
   /** Upsert the tenant's credential (`created_at` is preserved on update). */
   async setCredential(tenant: CredentialTenant, provider: string, credential: AuthCredential): Promise<void> {
-    assertCredentialScope(tenant, credential);
     const where = tenantWhere(tenant, provider);
+    const encrypted = await this.encryption.encrypt(credential);
     const update = async () =>
       this.#db.updateMany('model_provider_credentials', where, {
         type: credential.type,
-        data: credential,
+        data: encrypted,
         updated_at: new Date(),
+        refresh_failed_at: null,
       });
 
     let lastError: unknown;
@@ -224,7 +257,7 @@ export class ModelCredentialsStorage extends FactoryStorageDomain {
           user_id: tenant.userId ?? null,
           provider,
           type: credential.type,
-          data: credential,
+          data: encrypted,
           created_at: now,
           updated_at: now,
         });
@@ -250,40 +283,22 @@ export class ModelCredentialsStorage extends FactoryStorageDomain {
       this.#db.findMany<CredentialDbRow>('model_provider_credentials', { org_id: orgId, user_id: userId }),
       this.#db.findMany<CredentialDbRow>('model_provider_credentials', { org_id: orgId, user_id: null }),
     ]);
-    return [
-      ...userRows.map(row => ({
-        provider: row.provider,
-        scope: 'user' as const,
-        credential: row.data,
-        updatedAt: row.updated_at,
-      })),
-      ...orgRows.map(row => ({
-        provider: row.provider,
-        scope: 'org' as const,
-        credential: row.data,
-        updatedAt: row.updated_at,
-      })),
-    ];
+    return Promise.all([
+      ...userRows.map(row => this.#toRecord(row, 'user')),
+      ...orgRows.map(row => this.#toRecord(row, 'org')),
+    ]);
   }
 
-  /**
-   * Resolve the credential a caller should use for a provider: the user's own
-   * row wins over the org's shared row.
-   */
-  async resolveCredential(orgId: string, userId: string, provider: string): Promise<ResolvedCredential | undefined> {
-    const userRow = await this.#db.findOne<CredentialDbRow>('model_provider_credentials', {
-      org_id: orgId,
-      provider,
-      user_id: userId,
-    });
-    if (userRow) return { provider: userRow.provider, scope: 'user', credential: userRow.data };
-    const orgRow = await this.#db.findOne<CredentialDbRow>('model_provider_credentials', {
-      org_id: orgId,
-      provider,
-      user_id: null,
-    });
-    if (orgRow) return { provider: orgRow.provider, scope: 'org', credential: orgRow.data };
-    return undefined;
+  /** Resolve a provider credential from exactly one tenancy scope. */
+  async resolveCredential(
+    orgId: string,
+    userId: string,
+    provider: string,
+    scope: CredentialScope,
+  ): Promise<ResolvedCredential | undefined> {
+    const tenant = scope === 'org' ? { orgId } : { orgId, userId };
+    const row = await this.#db.findOne<CredentialDbRow>('model_provider_credentials', tenantWhere(tenant, provider));
+    return row ? { provider: row.provider, scope, credential: await this.#decryptCredential(row.data) } : undefined;
   }
 
   /**
@@ -292,30 +307,42 @@ export class ModelCredentialsStorage extends FactoryStorageDomain {
    * rotating refresh tokens. The expiry is re-checked under the lock —
    * another replica may have refreshed already, in which case `refreshFn` is
    * skipped and the fresh credential is returned. Returns `undefined` when no
-   * OAuth row exists for the tenant.
+   * OAuth row exists for the tenant. A failed `refreshFn` is recorded on the
+   * row (surfaced as `CredentialRecord.refreshFailedAt`) and rethrown.
+   *
+   * `needsRefresh` replaces the expiry check, e.g. to replace an access token
+   * the provider rejected before its recorded expiry.
    */
   async refreshOAuth(
     tenant: CredentialTenant,
     provider: string,
     refreshFn: (current: OAuthCredential) => Promise<OAuthCredential>,
+    needsRefresh: (current: OAuthCredential) => boolean = current => isOAuthCredentialExpired(current),
   ): Promise<OAuthCredential | undefined> {
     let result: OAuthCredential | undefined;
+    let failure: { error: unknown } | undefined;
     await this.#db.updateAtomic<CredentialDbRow>(
       'model_provider_credentials',
       tenantWhere(tenant, provider),
       async row => {
-        if (row.data.type !== 'oauth') return null;
-        const current = row.data;
+        const decrypted = await this.encryption.decrypt<AuthCredential>(row.data);
+        if (decrypted.value.type !== 'oauth') return null;
+        const current = decrypted.value;
         // Re-check under the lock: another replica may have refreshed while we waited.
-        if (!isOAuthCredentialExpired(current)) {
+        if (!needsRefresh(current)) {
           result = current;
-          return null;
+          return decrypted.needsReencryption ? { data: await this.encryption.encrypt(current) } : null;
         }
-        const next = await refreshFn(current);
-        result = next;
-        return { data: next, updated_at: new Date() };
+        try {
+          result = await refreshFn(current);
+        } catch (error) {
+          failure = { error };
+          return { refresh_failed_at: new Date() };
+        }
+        return { data: await this.encryption.encrypt(result), updated_at: new Date(), refresh_failed_at: null };
       },
     );
+    if (failure) throw failure.error;
     return result;
   }
 
@@ -327,6 +354,7 @@ export class ModelCredentialsStorage extends FactoryStorageDomain {
       user_id: input.userId,
       provider: input.provider,
       kind: input.kind,
+      credential_scope: input.credentialScope ?? null,
       pending: input.pending,
       expires_at: input.expiresAt,
       next_poll_at: input.nextPollAt ?? null,

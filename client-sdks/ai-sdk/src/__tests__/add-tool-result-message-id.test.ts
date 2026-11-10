@@ -18,10 +18,10 @@
  * instead of appending to the existing one.
  */
 import type { UIMessage } from '@internal/ai-sdk-v5';
+import { convertArrayToReadableStream, MockLanguageModelV2 } from '@internal/ai-sdk-v5/test';
 import { Agent } from '@mastra/core/agent';
 import { Mastra } from '@mastra/core/mastra';
 import { createTool } from '@mastra/core/tools';
-import { convertArrayToReadableStream, MockLanguageModelV2 } from 'ai/test';
 import { describe, expect, it } from 'vitest';
 import { z } from 'zod/v4';
 
@@ -53,7 +53,7 @@ function createClientToolModel() {
               toolCallType: 'function',
               toolCallId: 'call-clipboard-1',
               toolName: 'get_clipboard',
-              args: '{}',
+              input: '{}',
             },
             {
               type: 'finish',
@@ -64,28 +64,27 @@ function createClientToolModel() {
           rawCall: { rawPrompt: [], rawSettings: {} },
           warnings: [],
         };
-      } else {
-        return {
-          stream: convertArrayToReadableStream([
-            { type: 'stream-start', warnings: [] },
-            { type: 'response-metadata', id: 'resp-2', modelId: 'mock', timestamp: new Date() },
-            { type: 'text-start', id: 'text-1' },
-            {
-              type: 'text-delta',
-              id: 'text-1',
-              delta: 'Your clipboard contains: Meeting notes for Monday standup.',
-            },
-            { type: 'text-end', id: 'text-1' },
-            {
-              type: 'finish',
-              finishReason: 'stop',
-              usage: { inputTokens: 20, outputTokens: 15, totalTokens: 35 },
-            },
-          ] as any),
-          rawCall: { rawPrompt: [], rawSettings: {} },
-          warnings: [],
-        };
       }
+      return {
+        stream: convertArrayToReadableStream([
+          { type: 'stream-start', warnings: [] },
+          { type: 'response-metadata', id: 'resp-2', modelId: 'mock', timestamp: new Date() },
+          { type: 'text-start', id: 'text-1' },
+          {
+            type: 'text-delta',
+            id: 'text-1',
+            delta: 'Your clipboard contains: Meeting notes for Monday standup.',
+          },
+          { type: 'text-end', id: 'text-1' },
+          {
+            type: 'finish',
+            finishReason: 'stop',
+            usage: { inputTokens: 20, outputTokens: 15, totalTokens: 35 },
+          },
+        ] as any),
+        rawCall: { rawPrompt: [], rawSettings: {} },
+        warnings: [],
+      };
     },
   });
 }

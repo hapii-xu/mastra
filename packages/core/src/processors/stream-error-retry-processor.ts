@@ -1,5 +1,8 @@
 import { APICallError } from '@internal/ai-sdk-v5';
 
+import { classifyProviderError } from '../error/provider-error';
+import type { ProviderFailureKind } from '../error/provider-error';
+import { clampDelayMs, DEFAULT_MAX_RETRY_AFTER_MS, getRetryAfterMs, waitDelay } from '../utils/retry-after';
 import type { Processor, ProcessAPIErrorArgs, ProcessAPIErrorResult } from './index';
 
 export type StreamErrorRetryMatcher = (error: unknown) => boolean;
@@ -15,6 +18,7 @@ export type StreamErrorRetryMatcherConfig = {
   match: StreamErrorRetryMatcher;
   maxRetries?: number;
   delayMs?: StreamErrorRetryDelayMs;
+  onRetry?: (args: ProcessAPIErrorArgs & { delayMs: number }) => void | Promise<void>;
 };
 
 /** A matcher entry: either a plain predicate or a config object with per-matcher policy. */
@@ -25,7 +29,7 @@ export type StreamErrorRetryProcessorOptions = {
   matchers?: StreamErrorRetryMatcherEntry[];
   /**
    * Retry unknown errors that are not matched by provider metadata, built-in
-   * matchers, or custom matchers. Known authorization failures are excluded.
+   * matchers, or custom matchers. Credential and quota refusals are excluded.
    * Uses the processor-level `maxRetries` and `delayMs`. Defaults to false.
    */
   retryUnknownErrors?: boolean;
@@ -45,24 +49,9 @@ export type StreamErrorRetryProcessorOptions = {
 };
 
 const DEFAULT_MAX_RETRIES = 1;
-const DEFAULT_MAX_RETRY_AFTER_MS = 30_000;
-const RETRYABLE_OPENAI_ERROR_CODES = [
-  'rate_limit',
-  'server_error',
-  'internal_error',
-  'timeout',
-  'temporarily_unavailable',
-  'service_unavailable',
-  'overloaded',
-];
+const RETRYABLE_FAILURE_KINDS = new Set<ProviderFailureKind>(['rate_limited', 'unavailable', 'timeout']);
+const ACCOUNT_REFUSALS = new Set<ProviderFailureKind>(['auth', 'quota']);
 const OPENAI_RETRY_MESSAGE_PATTERN = /you can retry your request/i;
-const TERMINAL_AUTHORIZATION_ERROR_CODES = new Set([
-  'access_denied',
-  'authentication_error',
-  'forbidden',
-  'invalid_api_key',
-  'permission_denied',
-]);
 const DEFAULT_MATCHERS = [isRetryableOpenAIResponsesStreamError];
 
 function isRecord(value: unknown): value is Record<string, unknown> {
@@ -86,53 +75,6 @@ function getObjectCause(error: unknown): unknown {
   return error.cause;
 }
 
-function getRetryAfterHeader(error: unknown): string | undefined {
-  if (!isRecord(error) || !isRecord(error.responseHeaders)) {
-    return undefined;
-  }
-
-  for (const [key, value] of Object.entries(error.responseHeaders)) {
-    if (key.toLowerCase() === 'retry-after' && typeof value === 'string') {
-      return value;
-    }
-  }
-
-  return undefined;
-}
-
-function parseRetryAfterMs(value: string, now: number): number | undefined {
-  const normalizedValue = value.trim();
-  if (/^\d+$/.test(normalizedValue)) {
-    const seconds = Number(normalizedValue);
-    return Number.isFinite(seconds) ? seconds * 1_000 : undefined;
-  }
-
-  const retryAt = Date.parse(normalizedValue);
-  return Number.isFinite(retryAt) && retryAt > now ? retryAt - now : undefined;
-}
-
-function getRetryAfterMs(error: unknown, now = Date.now()): number | undefined {
-  const visited = new WeakSet<object>();
-  let candidate = error;
-
-  while (candidate !== undefined) {
-    if (isRecord(candidate)) {
-      if (visited.has(candidate)) return undefined;
-      visited.add(candidate);
-
-      const retryAfterHeader = getRetryAfterHeader(candidate);
-      if (retryAfterHeader !== undefined) {
-        const retryAfterMs = parseRetryAfterMs(retryAfterHeader, now);
-        if (retryAfterMs !== undefined) return retryAfterMs;
-      }
-    }
-
-    candidate = getObjectCause(candidate);
-  }
-
-  return undefined;
-}
-
 function getOpenAIErrorPayload(error: unknown): Record<string, unknown> | undefined {
   if (!isRecord(error)) {
     return undefined;
@@ -150,16 +92,6 @@ function getOpenAIErrorPayload(error: unknown): Record<string, unknown> | undefi
   return undefined;
 }
 
-function hasRetryableOpenAIErrorCode(payload: Record<string, unknown>): boolean {
-  const code = getStringProperty(payload, 'code') ?? getStringProperty(payload, 'type');
-  if (!code) {
-    return false;
-  }
-
-  const normalizedCode = code.toLowerCase();
-  return RETRYABLE_OPENAI_ERROR_CODES.some(retryableCode => normalizedCode.includes(retryableCode));
-}
-
 function hasExplicitRetryMessage(payload: Record<string, unknown>): boolean {
   const message = getStringProperty(payload, 'message');
   return message !== undefined && OPENAI_RETRY_MESSAGE_PATTERN.test(message);
@@ -171,16 +103,26 @@ export function isRetryableOpenAIResponsesStreamError(error: unknown): boolean {
     return false;
   }
 
-  return hasRetryableOpenAIErrorCode(payload) || hasExplicitRetryMessage(payload);
+  const kind = classifyProviderError(payload);
+  if (ACCOUNT_REFUSALS.has(kind)) return false;
+
+  return RETRYABLE_FAILURE_KINDS.has(kind) || hasExplicitRetryMessage(payload);
 }
 
 /**
  * Matcher for transient HTTP 400 (Bad Request) failures. Providers like OpenAI
  * occasionally return 400 during service degradation that succeeds on retry.
  * Recommended with `maxRetries: 1` since a 400 could also be genuinely invalid.
+ * Credential and quota refusals are never matched: OpenAI stream error frames such as
+ * `invalid_api_key` can surface with a derived `statusCode: 400`, and Anthropic reports
+ * an exhausted credit balance or usage cap as a 400. A rejected model or parameter
+ * (`model_not_found`, unsupported model) is never matched either: the identical
+ * request fails the same way on retry.
  */
 export function isBadRequestError(error: unknown): boolean {
   if (!error || typeof error !== 'object') return false;
+  if (isAccountRefusal(error)) return false;
+  if (classifyProviderError(error) === 'model_rejected') return false;
 
   if ('statusCode' in error && (error as { statusCode?: unknown }).statusCode === 400) return true;
 
@@ -197,37 +139,30 @@ function isRetryableProviderMetadata(error: unknown): boolean {
   return retryable === true;
 }
 
-function isKnownTerminalAuthorizationError(error: unknown): boolean {
+function hasDeniedHttpStatus(error: unknown): boolean {
   const visited = new WeakSet<object>();
 
   function visit(candidate: unknown): boolean {
-    if (!isRecord(candidate)) return false;
-    if (visited.has(candidate)) return false;
+    if (!isRecord(candidate) || visited.has(candidate)) return false;
     visited.add(candidate);
 
-    const statusCode = candidate.statusCode ?? candidate.status;
-    if (statusCode === 401 || statusCode === 403) return true;
+    if (candidate.status === 401 || candidate.status === 403) return true;
 
-    const code = getStringProperty(candidate, 'code') ?? getStringProperty(candidate, 'type');
-    if (code && TERMINAL_AUTHORIZATION_ERROR_CODES.has(code.trim().toLowerCase())) return true;
-
-    const responseBody = getStringProperty(candidate, 'responseBody');
-    let parsedResponseBody: unknown;
-    if (responseBody) {
-      try {
-        parsedResponseBody = JSON.parse(responseBody);
-      } catch {
-        // Ignore non-JSON provider response bodies.
-      }
-    }
-
-    return visit(candidate.error) || visit(candidate.data) || visit(parsedResponseBody) || visit(candidate.cause);
+    return visit(candidate.error) || visit(candidate.data) || visit(candidate.cause);
   }
 
   return visit(error);
 }
 
-type MatchedPolicy = { maxRetries?: number; delayMs?: StreamErrorRetryDelayMs };
+function isAccountRefusal(error: unknown): boolean {
+  return ACCOUNT_REFUSALS.has(classifyProviderError(error)) || hasDeniedHttpStatus(error);
+}
+
+type MatchedPolicy = {
+  maxRetries?: number;
+  delayMs?: StreamErrorRetryDelayMs;
+  onRetry?: StreamErrorRetryMatcherConfig['onRetry'];
+};
 
 function normalizeEntry(entry: StreamErrorRetryMatcherEntry): StreamErrorRetryMatcherConfig {
   return typeof entry === 'function' ? { match: entry } : entry;
@@ -235,9 +170,9 @@ function normalizeEntry(entry: StreamErrorRetryMatcherEntry): StreamErrorRetryMa
 
 /**
  * Walk the error cause chain and return the policy of the first matching
- * entry, or `undefined` when no matcher fires. Provider `isRetryable`
- * metadata is checked first (returns an empty policy so processor-level
- * defaults apply). Among user-supplied matchers, first-match wins.
+ * entry, or `undefined` when no matcher fires. Configured matchers run before
+ * the built-in ones, every matcher before provider `isRetryable` metadata, and
+ * first-match wins.
  */
 function findMatchingPolicy(error: unknown, entries: StreamErrorRetryMatcherConfig[]): MatchedPolicy | undefined {
   const visited = new WeakSet<object>();
@@ -248,14 +183,14 @@ function findMatchingPolicy(error: unknown, entries: StreamErrorRetryMatcherConf
       visited.add(candidate);
     }
 
-    if (isRetryableProviderMetadata(candidate)) {
-      return {};
-    }
-
     for (const entry of entries) {
       if (entry.match(candidate)) {
-        return { maxRetries: entry.maxRetries, delayMs: entry.delayMs };
+        return { maxRetries: entry.maxRetries, delayMs: entry.delayMs, onRetry: entry.onRetry };
       }
+    }
+
+    if (isRetryableProviderMetadata(candidate) && !isAccountRefusal(candidate)) {
+      return {};
     }
 
     const cause = getObjectCause(candidate);
@@ -278,7 +213,7 @@ export class StreamErrorRetryProcessor implements Processor<'stream-error-retry-
   constructor(options: StreamErrorRetryProcessorOptions = {}) {
     this.#maxRetries = options.maxRetries ?? DEFAULT_MAX_RETRIES;
     const defaultEntries: StreamErrorRetryMatcherConfig[] = DEFAULT_MATCHERS.map(m => ({ match: m }));
-    this.#entries = [...defaultEntries, ...(options.matchers ?? []).map(normalizeEntry)];
+    this.#entries = [...(options.matchers ?? []).map(normalizeEntry), ...defaultEntries];
     this.#retryUnknownErrors = options.retryUnknownErrors ?? false;
     this.#delayMs = options.delayMs;
     this.#maxRetryAfterMs = clampDelayMs(options.maxRetryAfterMs ?? DEFAULT_MAX_RETRY_AFTER_MS);
@@ -288,8 +223,7 @@ export class StreamErrorRetryProcessor implements Processor<'stream-error-retry-
     const { error, retryCount, abortSignal } = args;
 
     const matchedPolicy = findMatchingPolicy(error, this.#entries);
-    const policy =
-      matchedPolicy ?? (this.#retryUnknownErrors && !isKnownTerminalAuthorizationError(error) ? {} : undefined);
+    const policy = matchedPolicy ?? (this.#retryUnknownErrors && !isAccountRefusal(error) ? {} : undefined);
     if (!policy) return;
 
     const effectiveMaxRetries = policy.maxRetries ?? this.#maxRetries;
@@ -299,47 +233,15 @@ export class StreamErrorRetryProcessor implements Processor<'stream-error-retry-
     const configuredDelayMs = effectiveDelay === undefined ? 0 : await resolveDelayMs(effectiveDelay, args);
     const retryAfterMs = getRetryAfterMs(error);
     const providerDelayMs = retryAfterMs === undefined ? 0 : Math.min(retryAfterMs, this.#maxRetryAfterMs);
-    await waitDelay(Math.max(configuredDelayMs, providerDelayMs), abortSignal);
+    const delayMs = Math.max(configuredDelayMs, providerDelayMs);
+    await policy.onRetry?.({ ...args, delayMs });
+    await waitDelay(delayMs, abortSignal);
 
     return { retry: true };
   }
 }
 
-function clampDelayMs(value: number): number {
-  return Number.isFinite(value) && value > 0 ? value : 0;
-}
-
 async function resolveDelayMs(delayMs: StreamErrorRetryDelayMs, args: ProcessAPIErrorArgs): Promise<number> {
   const delay = typeof delayMs === 'function' ? await delayMs(args) : delayMs;
   return clampDelayMs(delay);
-}
-
-async function waitDelay(delayMs: number, abortSignal?: AbortSignal): Promise<void> {
-  const ms = clampDelayMs(delayMs);
-  if (ms <= 0) return;
-
-  if (!abortSignal) {
-    await new Promise<void>(resolve => setTimeout(resolve, ms));
-    return;
-  }
-
-  await new Promise<void>(resolve => {
-    let timeout: ReturnType<typeof setTimeout> | undefined;
-    const onAbort = () => {
-      if (timeout) clearTimeout(timeout);
-      abortSignal.removeEventListener('abort', onAbort);
-      resolve();
-    };
-    // Register before checking aborted to close the race window where
-    // abort fires between the check and addEventListener.
-    abortSignal.addEventListener('abort', onAbort, { once: true });
-    if (abortSignal.aborted) {
-      onAbort();
-      return;
-    }
-    timeout = setTimeout(() => {
-      abortSignal.removeEventListener('abort', onAbort);
-      resolve();
-    }, ms);
-  });
 }

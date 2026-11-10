@@ -1,6 +1,6 @@
 ---
 title: "Reference: Agent.network() | Agents"
-description: "Documentation for the `Agent.network()` method in Mastra agents, which enables multi-agent collaboration and routing."
+description: "The .network() method enables multi-agent collaboration and routing. This method accepts messages and optional execution options."
 packages:
   - "@mastra/core"
 ---
@@ -13,7 +13,7 @@ The `.network()` method enables multi-agent collaboration and routing. This meth
 
 :::warning[Deprecated]
 
-The `.network()` primitive has been deprecated and will be removed in a future major release. Use [supervisor agents](/docs/agents/supervisor-agents) with `agent.stream()` or `agent.generate()` instead. See the [migration guide](/guides/migrations/network-to-supervisor) to upgrade.
+The `.network()` primitive has been deprecated and will be removed in a future major release. Use [supervisor agents](/docs/subagents) with `agent.stream()` or `agent.generate()` instead. See the [migration guide](/reference/migrations/network-to-supervisor) to upgrade.
 
 :::
 
@@ -159,6 +159,13 @@ await agent.network(`
                 type: 'TracingOptions',
                 parameters: [
                   {
+                    name: 'rootSpanName',
+                    type: 'string',
+                    isOptional: true,
+                    description:
+                      "Display name for the root span of this trace, replacing the default `workflow run: '<id>'` or `agent run: '<id>'` name. Use it to tell runs apart in trace lists.",
+                  },
+                  {
                     name: 'metadata',
                     type: 'Record<string, any>',
                     isOptional: true,
@@ -203,61 +210,21 @@ await agent.network(`
               {
                 parameters: [
                   {
+                    name: 'nestUnderParent',
+                    type: 'boolean',
+                    isOptional: true,
+                    description:
+                      "Set to `true` together with `parentSpanId` to attach this run as a child of that span inside the existing trace, for example an LLM judge under the run it scores. Exporters then keep the trace's own name, input, output, and tags. Leave unset when `parentSpanId` comes from your own tracing system. Ignored without a valid `traceId` and `parentSpanId`.",
+                  },
+                ],
+              },
+              {
+                parameters: [
+                  {
                     name: 'tags',
                     type: 'string[]',
                     isOptional: true,
                     description: 'Tags to apply to this trace. String labels for categorizing and filtering traces.',
-                  },
-                ],
-              },
-            ],
-          },
-          {
-            name: 'telemetry',
-            type: 'TelemetrySettings',
-            isOptional: true,
-            description: 'Settings for OTLP telemetry collection during streaming (not Tracing).',
-            properties: [
-              {
-                type: 'TelemetrySettings',
-                parameters: [
-                  {
-                    name: 'isEnabled',
-                    type: 'boolean',
-                    isOptional: true,
-                    description: 'Enable or disable telemetry. Disabled by default while experimental.',
-                  },
-                ],
-              },
-              {
-                parameters: [
-                  {
-                    name: 'recordInputs',
-                    type: 'boolean',
-                    isOptional: true,
-                    description:
-                      'Enable or disable input recording. Enabled by default. You might want to disable input recording to avoid recording sensitive information.',
-                  },
-                ],
-              },
-              {
-                parameters: [
-                  {
-                    name: 'recordOutputs',
-                    type: 'boolean',
-                    isOptional: true,
-                    description:
-                      'Enable or disable output recording. Enabled by default. You might want to disable output recording to avoid recording sensitive information.',
-                  },
-                ],
-              },
-              {
-                parameters: [
-                  {
-                    name: 'functionId',
-                    type: 'string',
-                    isOptional: true,
-                    description: 'Identifier for this function. Used to group telemetry data by function.',
                   },
                 ],
               },

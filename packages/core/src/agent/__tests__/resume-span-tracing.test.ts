@@ -201,10 +201,15 @@ describe('resumed AGENT_RUN span input and trace continuity', () => {
       parent: parentSpan,
 
       end: vi.fn(),
+      endTree: vi.fn(),
       error: vi.fn(),
       update: vi.fn(),
       exportSpan: vi.fn(),
+      snapshot: vi.fn(),
       getParentSpanId: vi.fn(() => parentSpan?.id),
+      // isInternal is false above, so this mock stands in for an exportable span
+      // and resolves to its own id, matching BaseSpan.getExportedSpanId().
+      getExportedSpanId: vi.fn(() => span.id),
       findParent: vi.fn(),
       executeInContext: vi.fn(async (fn: () => Promise<any>) => fn()),
       executeInContextSync: vi.fn((fn: () => any) => fn()),
@@ -274,8 +279,8 @@ describe('resumed AGENT_RUN span input and trace continuity', () => {
         toolName: 'findUserTool',
         toolCallId,
       });
-      expect(resumedCall.tracingOptions?.traceId).toBe('mock-trace-id');
-      expect(resumedCall.tracingOptions?.parentSpanId).toBeTruthy();
+      expect(resumedCall.resumeFrom).toMatchObject({ traceId: 'mock-trace-id', spanId: expect.any(String) });
+      expect(resumedCall.tracingOptions?.parentSpanId).toBeUndefined();
     } finally {
       spy.mockRestore();
     }
@@ -502,6 +507,7 @@ describe('resumed AGENT_RUN span input and trace continuity', () => {
       const resumedCall = agentRunCalls[1];
       expect(resumedCall.tracingOptions?.traceId).toBe('caller-trace-id');
       expect(resumedCall.tracingOptions?.parentSpanId).toBe('caller-parent-span');
+      expect(resumedCall.resumedFromSpanId).toBeUndefined();
     } finally {
       spy.mockRestore();
     }
@@ -594,8 +600,8 @@ describe('resumed AGENT_RUN span input and trace continuity', () => {
         toolName: 'findUserTool',
         toolCallId: output.suspendPayload!.toolCallId,
       });
-      expect(resumedCall.tracingOptions?.traceId).toBe('mock-trace-id');
-      expect(resumedCall.tracingOptions?.parentSpanId).toBeTruthy();
+      expect(resumedCall.resumeFrom).toMatchObject({ traceId: 'mock-trace-id', spanId: expect.any(String) });
+      expect(resumedCall.tracingOptions?.parentSpanId).toBeUndefined();
     } finally {
       spy.mockRestore();
     }

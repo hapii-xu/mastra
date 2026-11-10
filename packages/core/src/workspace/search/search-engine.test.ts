@@ -95,6 +95,16 @@ Line 3`;
       expect(results[0]?.lineRange).toEqual({ start: 2, end: 2 });
     });
 
+    it('should report lineRange matching a case-preserving custom tokenizer', async () => {
+      const caseEngine = new SearchEngine({
+        bm25: { tokenize: { tokenizer: text => text.split(/\s+/).filter(Boolean) } },
+      });
+      await caseEngine.index({ id: 'doc1', content: 'Introduction\nPython examples\npython alternatives' });
+
+      const results = await caseEngine.search('Python');
+      expect(results[0]?.lineRange).toEqual({ start: 2, end: 2 });
+    });
+
     it('should store and return metadata', async () => {
       await engine.index({
         id: 'doc1',
@@ -816,9 +826,267 @@ Third line has learning too`;
         .sort();
       expect(docCallSizes).toEqual([1, 2, 2]);
 
-      // Single upsert with all 5 vectors.
-      expect(store.upsert).toHaveBeenCalledTimes(1);
-      expect(store.upsert.mock.calls[0]![0].vectors).toHaveLength(5);
+      // Writes follow the same grouping as the embedder calls, so no single upsert carries
+      // the whole queue.
+      expect(store.upsert).toHaveBeenCalledTimes(3);
+      const upsertedIds = store.upsert.mock.calls.flatMap((call: unknown[]) => (call[0] as { ids: string[] }).ids);
+      expect(upsertedIds.sort()).toEqual(['1', '2', '3', '4', '5']);
+      const upsertSizes = store.upsert.mock.calls.map(
+        (call: unknown[]) => (call[0] as { vectors: number[][] }).vectors.length,
+      );
+      expect(upsertSizes.reduce((a: number, b: number) => a + b, 0)).toBe(5);
+    });
+
+    it('batches embedder calls on the eager path (default Workspace configuration)', async () => {
+      const store = makeStore();
+      const { embedder, fn } = makeBatchEmbedder(256);
+      // No lazyVectorIndex — exactly how Workspace builds its SearchEngine.
+      const engine = new SearchEngine({
+        vector: { vectorStore: store, embedder, indexName: 'idx' },
+      });
+
+      const docs = Array.from({ length: 500 }, (_, i) => ({ id: `doc-${i}`, content: `contents ${i}` }));
+      await engine.indexMany(docs);
+
+      // 500 docs / 256 per call = 2 embedder calls, not one per document.
+      expect(fn).toHaveBeenCalledTimes(2);
+      expect(fn.mock.calls.map((call: unknown[]) => (call[0] as string[]).length)).toEqual([256, 244]);
+
+      // Every document is embedded exactly once, in input order.
+      const embeddedTexts = fn.mock.calls.flatMap((call: unknown[]) => call[0] as string[]);
+      expect(embeddedTexts).toEqual(docs.map(d => d.content));
+    });
+
+    it('keeps each vector aligned with its own document when batching', async () => {
+      const store = makeStore();
+      // Order-sensitive polynomial hash so no two fixture contents share a vector: a plain
+      // character sum collides on anagrams like "contents 12" and "contents 21", which would
+      // hide a transposition instead of exposing it.
+      const vectorFor = (content: string) => {
+        const hash = content.split('').reduce((acc, c) => (acc * 131 + c.charCodeAt(0)) % 2147483647, 7);
+        return [hash, hash * 2, hash * 3];
+      };
+      const embedder: BatchEmbedder = Object.assign(async (texts: string[]) => texts.map(vectorFor), {
+        batch: true as const,
+        maxBatchSize: 256,
+      });
+      const engine = new SearchEngine({
+        vector: { vectorStore: store, embedder, indexName: 'idx' },
+      });
+
+      const docs = Array.from({ length: 250 }, (_, i) => ({ id: `doc-${i}`, content: `contents ${i}` }));
+      // Guard the guard: if the fixture ever collides, this test stops proving alignment.
+      expect(new Set(docs.map(d => vectorFor(d.content)[0])).size).toBe(docs.length);
+
+      await engine.indexMany(docs);
+
+      // Rebuild what actually reached the store, in upsert order.
+      const upserted = store.upsert.mock.calls.flatMap((call: unknown[]) => {
+        const arg = call[0] as { ids: string[]; vectors: number[][]; metadata: Record<string, unknown>[] };
+        return arg.ids.map((id, i) => ({ id, vector: arg.vectors[i]!, text: arg.metadata[i]!.text }));
+      });
+
+      expect(upserted).toHaveLength(docs.length);
+      for (const doc of docs) {
+        const row = upserted.find(r => r.id === doc.id);
+        expect(row, `missing ${doc.id}`).toBeDefined();
+        expect(row!.text).toBe(doc.content);
+        expect(row!.vector).toEqual(vectorFor(doc.content));
+      }
+    });
+
+    it('bounds how many vectors a single upsert carries', async () => {
+      const store = makeStore();
+      const { embedder } = makeBatchEmbedder(1000);
+      const engine = new SearchEngine({
+        vector: { vectorStore: store, embedder, indexName: 'idx' },
+      });
+
+      await engine.indexMany(Array.from({ length: 450 }, (_, i) => ({ id: `d-${i}`, content: `c ${i}` })));
+
+      const sizes = store.upsert.mock.calls.map(
+        (call: unknown[]) => (call[0] as { vectors: number[][] }).vectors.length,
+      );
+      expect(Math.max(...sizes)).toBeLessThanOrEqual(100);
+      expect(sizes.reduce((a: number, b: number) => a + b, 0)).toBe(450);
+    });
+
+    it('leaves documents searchable as soon as indexMany resolves on the eager path', async () => {
+      const store = makeStore();
+      store.query.mockResolvedValue([{ id: 'doc-7', score: 0.9, metadata: { id: 'doc-7', text: 'contents 7' } }]);
+      const { embedder } = makeBatchEmbedder(4);
+      const engine = new SearchEngine({
+        vector: { vectorStore: store, embedder, indexName: 'idx' },
+      });
+
+      await engine.indexMany(Array.from({ length: 10 }, (_, i) => ({ id: `doc-${i}`, content: `contents ${i}` })));
+
+      // Eager contract: no flush-on-search needed, the writes already happened.
+      const upsertsBeforeSearch = store.upsert.mock.calls.length;
+      const results = await engine.search('contents 7', { mode: 'vector' });
+      expect(store.upsert).toHaveBeenCalledTimes(upsertsBeforeSearch);
+      expect(results.map(r => r.id)).toContain('doc-7');
+    });
+
+    it('collapses duplicate ids within one indexMany call', async () => {
+      const store = makeStore();
+      const { embedder } = makeBatchEmbedder(256);
+      const engine = new SearchEngine({
+        vector: { vectorStore: store, embedder, indexName: 'idx' },
+      });
+
+      await engine.indexMany([
+        { id: 'x', content: 'first' },
+        { id: 'y', content: 'other' },
+        { id: 'x', content: 'second' },
+      ]);
+
+      const ids = store.upsert.mock.calls.flatMap((call: unknown[]) => (call[0] as { ids: string[] }).ids);
+      expect(ids.sort()).toEqual(['x', 'y']);
+      const texts = store.upsert.mock.calls.flatMap((call: unknown[]) =>
+        (call[0] as { metadata: Record<string, unknown>[] }).metadata.map(m => m.text),
+      );
+      // Last entry wins, matching the lazy flush path.
+      expect(texts).toContain('second');
+      expect(texts).not.toContain('first');
+    });
+
+    it.each([
+      ['zero', 0],
+      ['negative', -5],
+      ['NaN', Number('oops')],
+    ])('still indexes every document when maxBatchSize is unusable (%s)', async (_label, maxBatchSize) => {
+      const store = makeStore();
+      const { embedder, fn } = makeBatchEmbedder(maxBatchSize);
+      const engine = new SearchEngine({
+        vector: { vectorStore: store, embedder, indexName: 'idx' },
+      });
+
+      await engine.indexMany([
+        { id: 'a', content: 'alpha' },
+        { id: 'b', content: 'beta' },
+      ]);
+
+      // An unusable limit must fall back to the default, not stall and not silently index nothing.
+      expect(fn).toHaveBeenCalledTimes(1);
+      const ids = store.upsert.mock.calls.flatMap((call: unknown[]) => (call[0] as { ids: string[] }).ids);
+      expect(ids.sort()).toEqual(['a', 'b']);
+    });
+
+    it('creates the index once before running groups in parallel', async () => {
+      const store = makeStore();
+      let indexUnderConstruction = false;
+      let upsertedDuringCreate = 0;
+      store.createIndex = vi.fn(async () => {
+        indexUnderConstruction = true;
+        await new Promise(resolve => setTimeout(resolve, 10));
+        indexUnderConstruction = false;
+      });
+      store.upsert = vi.fn(async () => {
+        if (indexUnderConstruction) upsertedDuringCreate++;
+      });
+      const { embedder } = makeBatchEmbedder(10);
+      const engine = new SearchEngine({
+        vector: { vectorStore: store, embedder, indexName: 'idx' },
+      });
+
+      await engine.indexMany(Array.from({ length: 100 }, (_, i) => ({ id: `d-${i}`, content: `c ${i}` })));
+
+      expect(store.createIndex).toHaveBeenCalledTimes(1);
+      expect(upsertedDuringCreate).toBe(0);
+    });
+
+    it('handles an empty document list', async () => {
+      const store = makeStore();
+      const { embedder, fn } = makeBatchEmbedder(256);
+      const engine = new SearchEngine({
+        vector: { vectorStore: store, embedder, indexName: 'idx' },
+      });
+
+      await expect(engine.indexMany([])).resolves.toBeUndefined();
+      expect(fn).not.toHaveBeenCalled();
+      expect(store.createIndex).not.toHaveBeenCalled();
+      expect(store.upsert).not.toHaveBeenCalled();
+    });
+
+    it('rejects with a flat AggregateError of the individual failures when stopOnError is false', async () => {
+      const store = makeStore();
+      const fn = vi.fn(async (texts: string[]) => {
+        if (texts.some(t => t === 'BOOM')) throw new Error(`embed failed: ${texts.length}`);
+        return texts.map(t => [t.length, 0, 0]);
+      });
+      const embedder: BatchEmbedder = Object.assign(fn, { batch: true as const, maxBatchSize: 256 });
+      const engine = new SearchEngine({
+        vector: { vectorStore: store, embedder, indexName: 'idx' },
+      });
+
+      const error = await engine
+        .indexMany(
+          [
+            { id: 'a', content: 'alpha' },
+            { id: 'b', content: 'BOOM' },
+            { id: 'c', content: 'gamma' },
+          ],
+          { stopOnError: false },
+        )
+        .catch((e: unknown) => e);
+
+      // The documented contract is one AggregateError holding the per-document failures —
+      // not an AggregateError wrapping another AggregateError.
+      expect(error).toBeInstanceOf(AggregateError);
+      const errors = (error as AggregateError).errors;
+      expect(errors).toHaveLength(1);
+      expect(errors[0]).toBeInstanceOf(Error);
+      expect(errors[0]).not.toBeInstanceOf(AggregateError);
+      expect((errors[0] as Error).message).toBe('embed failed: 1');
+    });
+
+    it('does not leave BM25 populated with documents the vector half never indexed', async () => {
+      const store = makeStore();
+      const fn = vi.fn(async () => {
+        throw new Error('embedder down');
+      });
+      const embedder: BatchEmbedder = Object.assign(fn, { batch: true as const, maxBatchSize: 4 });
+      const engine = new SearchEngine({
+        bm25: {},
+        vector: { vectorStore: store, embedder, indexName: 'idx' },
+      });
+
+      const docs = Array.from({ length: 20 }, (_, i) => ({ id: `doc-${i}`, content: `zebra ${i}` }));
+      await expect(engine.indexMany(docs, { concurrency: 1 })).rejects.toThrow('embedder down');
+
+      // Only the group that was actually attempted may appear in the keyword index; a rejected
+      // indexMany must not leave all 20 documents searchable.
+      const results = await engine.search('zebra', { mode: 'bm25', topK: 100 });
+      expect(results.length).toBeLessThanOrEqual(4);
+    });
+
+    it('still processes every document when a grouped embed fails with stopOnError false', async () => {
+      const store = makeStore();
+      const fn = vi.fn(async (texts: string[]) => {
+        if (texts.length > 1 && texts.includes('BOOM')) throw new Error('batch embed failed');
+        if (texts[0] === 'BOOM') throw new Error('single embed failed');
+        return texts.map(t => [t.length, 0, 0]);
+      });
+      const embedder: BatchEmbedder = Object.assign(fn, { batch: true as const, maxBatchSize: 256 });
+      const engine = new SearchEngine({
+        vector: { vectorStore: store, embedder, indexName: 'idx' },
+      });
+
+      await expect(
+        engine.indexMany(
+          [
+            { id: 'a', content: 'alpha' },
+            { id: 'b', content: 'BOOM' },
+            { id: 'c', content: 'gamma' },
+          ],
+          { stopOnError: false },
+        ),
+      ).rejects.toThrow();
+
+      // The healthy documents are still written despite sharing a group with the bad one.
+      const ids = store.upsert.mock.calls.flatMap((call: unknown[]) => (call[0] as { ids: string[] }).ids);
+      expect(ids.sort()).toEqual(['a', 'c']);
     });
 
     it('uses batched call for single search query', async () => {
@@ -905,7 +1173,202 @@ Third line has learning too`;
   });
 });
 
+describe('SearchEngine with a vector store that embeds server-side', () => {
+  const makeStore = (overrides: Record<string, unknown> = {}): any => ({
+    isSelfEmbedding: true,
+    createIndex: vi.fn(async () => {}),
+    upsert: vi.fn(async () => []),
+    query: vi.fn(async () => []),
+    deleteVector: vi.fn(async () => {}),
+    ...overrides,
+  });
+
+  const makeEngine = (store: any, config: { lazy?: boolean; bm25?: boolean } = {}) =>
+    new SearchEngine({
+      ...(config.bm25 ? { bm25: {} } : {}),
+      vector: { vectorStore: store, indexName: 'test-index' },
+      lazyVectorIndex: config.lazy,
+    });
+
+  it('offers vector search without an embedder', () => {
+    const engine = makeEngine(makeStore());
+
+    expect(engine.canVector).toBe(true);
+  });
+
+  it('refuses a store that does not embed server-side when there is no embedder', () => {
+    const store = makeStore({ isSelfEmbedding: false });
+
+    expect(() => makeEngine(store)).toThrow(/requires an embedder/);
+  });
+
+  it('creates the index without a dimension and upserts the text', async () => {
+    const store = makeStore();
+    const engine = makeEngine(store);
+
+    await engine.index({ id: 'doc1', content: 'Hello world' });
+
+    expect(store.createIndex).toHaveBeenCalledTimes(1);
+    expect(store.createIndex).toHaveBeenCalledWith({ indexName: 'test-index' });
+    expect(store.upsert).toHaveBeenCalledWith({
+      indexName: 'test-index',
+      documents: ['Hello world'],
+      metadata: [{ id: 'doc1', text: 'Hello world' }],
+      ids: ['doc1'],
+    });
+  });
+
+  it('writes a batch of documents in one upsert', async () => {
+    const store = makeStore();
+    const engine = makeEngine(store);
+
+    await engine.indexMany([
+      { id: 'doc1', content: 'First' },
+      { id: 'doc2', content: 'Second' },
+      { id: 'doc1', content: 'First, revised' },
+    ]);
+
+    expect(store.upsert).toHaveBeenCalledTimes(1);
+    expect(store.upsert).toHaveBeenCalledWith({
+      indexName: 'test-index',
+      documents: ['First, revised', 'Second'],
+      metadata: [
+        { id: 'doc1', text: 'First, revised' },
+        { id: 'doc2', text: 'Second' },
+      ],
+      ids: ['doc1', 'doc2'],
+    });
+  });
+
+  it('splits a large batch into upserts of at most 100 documents', async () => {
+    const store = makeStore();
+    const engine = makeEngine(store);
+    const docs = Array.from({ length: 250 }, (_, i) => ({ id: `doc${i}`, content: `Document ${i}` }));
+
+    await engine.indexMany(docs);
+
+    expect(store.upsert.mock.calls.map((call: any[]) => call[0].ids.length)).toEqual([100, 100, 50]);
+    expect(store.createIndex).toHaveBeenCalledTimes(1);
+  });
+
+  it('writes pending documents in one upsert when the lazy index is flushed by a search', async () => {
+    const store = makeStore();
+    const engine = makeEngine(store, { lazy: true });
+
+    await engine.index({ id: 'doc1', content: 'First' });
+    await engine.index({ id: 'doc2', content: 'Second' });
+    expect(store.upsert).not.toHaveBeenCalled();
+
+    await engine.search('anything', { mode: 'vector' });
+
+    expect(store.upsert).toHaveBeenCalledTimes(1);
+    expect((store.upsert.mock.calls[0] as any[])[0].documents).toEqual(['First', 'Second']);
+  });
+
+  it('queries with the search string and returns the stored text', async () => {
+    const store = makeStore({
+      query: vi.fn(async () => [{ id: 'doc1', score: 0.9, metadata: { id: 'doc1', text: 'Hello world', topic: 'x' } }]),
+    });
+    const engine = makeEngine(store);
+
+    const results = await engine.search('greeting', { mode: 'vector', topK: 3, filter: { topic: 'x' } });
+
+    expect(store.query).toHaveBeenCalledWith({
+      indexName: 'test-index',
+      queryText: 'greeting',
+      topK: 3,
+      filter: { topic: 'x' },
+    });
+    expect(results).toHaveLength(1);
+    expect(results[0]).toMatchObject({
+      id: 'doc1',
+      content: 'Hello world',
+      score: 0.9,
+      metadata: { topic: 'x' },
+      scoreDetails: { vector: 0.9 },
+    });
+  });
+
+  it('combines keyword and vector results in hybrid mode', async () => {
+    const store = makeStore({
+      query: vi.fn(async () => [{ id: 'doc2', score: 0.8, metadata: { id: 'doc2', text: 'Semantic match' } }]),
+    });
+    const engine = makeEngine(store, { bm25: true });
+
+    await engine.index({ id: 'doc1', content: 'Keyword match' });
+    const results = await engine.search('keyword', { mode: 'hybrid' });
+
+    expect(store.query).toHaveBeenCalledWith(expect.objectContaining({ queryText: 'keyword' }));
+    expect(results.map(r => r.id).sort()).toEqual(['doc1', 'doc2']);
+  });
+
+  it('removes a document by id', async () => {
+    const store = makeStore();
+    const engine = makeEngine(store);
+    await engine.index({ id: 'doc1', content: 'Hello world' });
+
+    await engine.remove('doc1');
+
+    expect(store.deleteVector).toHaveBeenCalledWith({ indexName: 'test-index', id: 'doc1' });
+  });
+
+  it('keeps embedding on the client when an embedder is configured', async () => {
+    const store = makeStore();
+    const embedder = vi.fn(async () => [1, 2, 3]);
+    const engine = new SearchEngine({ vector: { vectorStore: store, embedder, indexName: 'test-index' } });
+
+    await engine.index({ id: 'doc1', content: 'Hello world' });
+    await engine.search('hello', { mode: 'vector' });
+
+    expect(store.createIndex).toHaveBeenCalledWith({ indexName: 'test-index', dimension: 3 });
+    expect(store.upsert).toHaveBeenCalledWith(expect.objectContaining({ vectors: [[1, 2, 3]] }));
+    expect(store.upsert.mock.calls[0][0].documents).toBeUndefined();
+    expect(store.query).toHaveBeenCalledWith(expect.objectContaining({ queryVector: [1, 2, 3] }));
+    expect(store.query.mock.calls[0][0].queryText).toBeUndefined();
+  });
+});
+
 describe('splitIntoChunks', () => {
+  const lastLine = (c: { content: string; startLine: number }) => c.startLine + c.content.split('\n').length - 1;
+  const expectNoRedundantChunks = (chunks: { content: string; startLine: number }[]) => {
+    for (let i = 1; i < chunks.length; i++) {
+      if (chunks[i]!.startLine === chunks[i - 1]!.startLine) continue; // character fragments of one line
+      expect(lastLine(chunks[i]!)).toBeGreaterThan(lastLine(chunks[i - 1]!));
+    }
+  };
+
+  it('should not emit a trailing chunk made only of overlap lines', () => {
+    const lines = Array.from({ length: 10 }, (_, i) => `${i + 1}`.padEnd(790, 'x'));
+    const withNewline = splitIntoChunks(lines.join('\n') + '\n');
+    expect(withNewline.map(c => c.startLine)).toEqual([1, 3, 5, 7]);
+    expect(lastLine(withNewline.at(-1)!)).toBe(11);
+    expectNoRedundantChunks(withNewline);
+
+    const withoutNewline = splitIntoChunks(lines.join('\n'));
+    expect(lastLine(withoutNewline.at(-1)!)).toBe(10);
+    expectNoRedundantChunks(withoutNewline);
+  });
+
+  it('should cover all lines without redundant chunks for zero and large overlap', () => {
+    const text = Array.from({ length: 20 }, (_, i) => `line-${i + 1}`).join('\n');
+    for (const overlapLines of [0, 10]) {
+      const chunks = splitIntoChunks(text, { maxChunkChars: 40, overlapLines });
+      expect(lastLine(chunks.at(-1)!)).toBe(20);
+      expectNoRedundantChunks(chunks);
+    }
+  });
+
+  it('should keep all fragments of an oversized final line', () => {
+    const text = ['short', 'y'.repeat(250)].join('\n');
+    const chunks = splitIntoChunks(text, { maxChunkChars: 100, overlapLines: 1 });
+    expect(
+      chunks
+        .filter(c => c.startLine === 2)
+        .map(c => c.content)
+        .join(''),
+    ).toBe('y'.repeat(250));
+  });
+
   it('should return a single chunk for short text', () => {
     const chunks = splitIntoChunks('hello world');
     expect(chunks).toHaveLength(1);

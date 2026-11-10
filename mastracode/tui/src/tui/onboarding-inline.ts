@@ -5,18 +5,18 @@
  *  1. Welcome
  *  2. Auth / Login prompt
  *  3. Mode pack selection (build / plan / fast model preset)
- *  4. OM pack selection (observational memory model)
- *  5. YOLO mode toggle
+ *  4. YOLO mode toggle
  *
  * The component renders as a settings overlay. On completion it fires
  * `onComplete` with the collected choices.
  */
 
-import { Box, SelectList, Spacer, Text } from '@earendil-works/pi-tui';
+import { Box, SelectList, Spacer, Text, visibleWidth } from '@earendil-works/pi-tui';
 import type { Focusable, SelectItem, TUI } from '@earendil-works/pi-tui';
-import type { ModePack, OMPack } from '@mastra/code-sdk/onboarding/packs';
+import type { ModePack } from '@mastra/code-sdk/onboarding/packs';
 import chalk from 'chalk';
 import { AskQuestionInlineComponent } from './components/ask-question-inline.js';
+import { LOGO_HEADER, LOGO_LARGE, renderLogo } from './components/banner.js';
 import { BOX_INDENT, theme, getSelectListTheme, mastra } from './theme.js';
 
 // ---------------------------------------------------------------------------
@@ -25,7 +25,6 @@ import { BOX_INDENT, theme, getSelectListTheme, mastra } from './theme.js';
 
 export interface OnboardingResult {
   modePack: ModePack;
-  omPack: OMPack;
   yolo: boolean;
   /** True if the user chose to log in (auth flow handled externally). */
   loginRequested: boolean;
@@ -35,7 +34,6 @@ export interface OnboardingResult {
 /** Previously saved selections to pre-populate when re-running /setup. */
 export interface PreviousSetupChoices {
   modePackId: string | null;
-  omPackId: string | null;
   yolo: boolean | null;
 }
 
@@ -45,8 +43,6 @@ export interface OnboardingOptions {
   authProviders: Array<{ label: string; value: string; loggedIn: boolean }>;
   /** Available mode packs (pre-filtered by provider access). */
   modePacks: ModePack[];
-  /** Available OM packs (pre-filtered by provider access). */
-  omPacks: OMPack[];
   /** Whether the user has any provider access (API key or OAuth) — even for providers without a built-in pack. */
   hasProviderAccess: boolean;
   /** Previously saved choices — used to highlight current selections when re-running. */
@@ -65,7 +61,21 @@ export interface OnboardingOptions {
 // Steps
 // ---------------------------------------------------------------------------
 
-type StepId = 'welcome' | 'auth' | 'modePack' | 'omPack' | 'yolo' | 'done';
+type StepId = 'welcome' | 'auth' | 'modePack' | 'yolo' | 'done';
+
+const STEP_LABELS = ['Welcome', 'Sign in', 'Models', 'Approval'];
+const STEP_INDEX: Record<StepId, number> = { welcome: 0, auth: 1, modePack: 2, yolo: 3, done: 4 };
+
+/** "✓ Welcome   ● Sign in   ○ Models …": done steps checked, the current one bold. */
+function renderStepper(current: number): string {
+  return STEP_LABELS.map((label, i) =>
+    i < current
+      ? `${theme.fg('success', '✓')} ${theme.fg('muted', label)}`
+      : i === current
+        ? `${theme.fg('accent', '●')} ${theme.bold(theme.fg('text', label))}`
+        : theme.fg('dim', `○ ${label}`),
+  ).join('   ');
+}
 
 // ---------------------------------------------------------------------------
 // Component
@@ -86,7 +96,6 @@ export class OnboardingInlineComponent extends Box implements Focusable {
   private loginRequested = false;
   private loginProvider?: string;
   private selectedModePack!: ModePack;
-  private selectedOmPack!: OMPack;
   private selectedYolo = true;
 
   // Focusable
@@ -99,7 +108,8 @@ export class OnboardingInlineComponent extends Box implements Focusable {
   }
 
   constructor(options: OnboardingOptions) {
-    super(4, 2, (text: string) => theme.bg('overlayBg', text));
+    // Full-screen and borderless: no panel background (see render()).
+    super(4, 2, (text: string) => text);
     this.tui = options.tui;
     this.options = options;
 
@@ -109,17 +119,45 @@ export class OnboardingInlineComponent extends Box implements Focusable {
       : undefined;
     this.selectedModePack = prevModePack ?? options.modePacks[0]!;
 
-    const prevOmPack = options.previous?.omPackId
-      ? options.omPacks.find(p => p.id === options.previous!.omPackId)
-      : undefined;
-    this.selectedOmPack = prevOmPack ??
-      options.omPacks[0] ?? { id: 'none', name: 'None available', description: '', modelId: '' };
-
     if (options.previous?.yolo != null) {
       this.selectedYolo = options.previous.yolo;
     }
 
     this.renderStep('welcome');
+  }
+
+  /**
+   * Full-screen setup: the large logo, a step indicator and the current step, centered. Earlier steps
+   * are not repeated (the indicator shows progress). On short terminals the gaps tighten, then the logo
+   * shrinks, then it is dropped, so the step itself is never cut off.
+   */
+  override render(width: number): string[] {
+    const rows = this.tui.terminal?.rows ?? 40;
+    const contentWidth = Math.max(20, Math.min(width - 8, 80));
+    const step = this.stepBox ? this.stepBox.render(contentWidth) : [];
+    // Trim padding so the block can be centered by its real width.
+    const body = step.map(line => line.replace(/\s+$/, ''));
+    while (body.length && body[0] === '') body.shift();
+    while (body.length && body.at(-1) === '') body.pop();
+
+    const center = (lines: string[]) => {
+      const blockWidth = Math.max(0, ...lines.map(line => visibleWidth(line)));
+      const pad = ' '.repeat(Math.max(0, Math.floor((width - blockWidth) / 2)));
+      return lines.map(line => (line ? pad + line : ''));
+    };
+    const stepper = center([renderStepper(STEP_INDEX[this.currentStep])]);
+    const layouts = [
+      [...center(renderLogo(LOGO_LARGE)), '', '', ...stepper, '', '', ...center(body)],
+      [...center(renderLogo(LOGO_LARGE)), '', ...stepper, '', ...center(body)],
+      [...center(renderLogo(LOGO_HEADER)), '', ...stepper, '', ...center(body)],
+      [...stepper, '', ...center(body)],
+      center(body),
+    ];
+    const content = layouts.find(layout => layout.length <= rows) ?? layouts.at(-1)!;
+    const top = Math.max(0, Math.floor((rows - content.length) / 2));
+    const screen = [...Array.from({ length: top }, () => ''), ...content];
+    while (screen.length < rows) screen.push('');
+    return screen.map(line => line + ' '.repeat(Math.max(0, width - visibleWidth(line))));
   }
 
   get finished(): boolean {
@@ -139,14 +177,6 @@ export class OnboardingInlineComponent extends Box implements Focusable {
     this.options.modePacks = packs;
     if (!this.selectedModePack || !packs.find(p => p.id === this.selectedModePack.id)) {
       this.selectedModePack = packs[0]!;
-    }
-  }
-
-  /** Refresh the available OM packs (e.g. after a login grants new provider access). */
-  updateOmPacks(packs: OMPack[]): void {
-    this.options.omPacks = packs;
-    if (!this.selectedOmPack || !packs.find(p => p.id === this.selectedOmPack.id)) {
-      this.selectedOmPack = packs[0]!;
     }
   }
 
@@ -176,8 +206,6 @@ export class OnboardingInlineComponent extends Box implements Focusable {
         return this.renderAuth();
       case 'modePack':
         return this.renderModePack();
-      case 'omPack':
-        return this.renderOmPack();
       case 'yolo':
         return this.renderYolo();
       case 'done':
@@ -189,7 +217,7 @@ export class OnboardingInlineComponent extends Box implements Focusable {
 
   private makeBox(): Box {
     this.clearStep();
-    this.stepBox = new Box(BOX_INDENT, 1, (text: string) => theme.bg('overlayBg', text));
+    this.stepBox = new Box(BOX_INDENT, 1, (text: string) => text);
     // Add a spacer between steps, but not before the very first one
     if (this.stepCount > 0) {
       this.addChild(new Spacer(1));
@@ -205,7 +233,7 @@ export class OnboardingInlineComponent extends Box implements Focusable {
 
   private renderWelcome(): void {
     const box = this.makeBox();
-    box.addChild(new Text(theme.bold(theme.fg('accent', '👋 Welcome to Mastra Code')), 0, 0));
+    box.addChild(new Text(theme.bold(theme.fg('text', 'Welcome to Mastra Code')), 0, 0));
     box.addChild(new Spacer(1));
     box.addChild(new Text(theme.fg('text', "Let's configure your models and preferences."), 0, 0));
     box.addChild(new Text(chalk.white('You can re-run this anytime with /setup.'), 0, 0));
@@ -240,7 +268,7 @@ export class OnboardingInlineComponent extends Box implements Focusable {
 
   private renderAuth(): void {
     const box = this.makeBox();
-    box.addChild(new Text(theme.bold(theme.fg('accent', '🔑 Authentication')), 0, 0));
+    box.addChild(new Text(theme.bold(theme.fg('text', 'Authentication')), 0, 0));
     box.addChild(new Spacer(1));
 
     const providers = this.options.authProviders;
@@ -261,7 +289,7 @@ export class OnboardingInlineComponent extends Box implements Focusable {
     }));
     items.push({
       value: '__skip',
-      label: `  ${theme.fg('dim', 'Skip (use API keys or configure later with /login)')}`,
+      label: `  ${theme.fg('dim', 'Skip (use API keys or configure later with /connect)')}`,
     });
 
     this.selectList = new SelectList(items, Math.min(items.length, 8), getSelectListTheme());
@@ -309,12 +337,12 @@ export class OnboardingInlineComponent extends Box implements Focusable {
       );
       box.addChild(new Spacer(1));
       box.addChild(
-        new Text(theme.fg('dim', 'Set an API key and restart, or run /login to authenticate via OAuth.'), 0, 0),
+        new Text(theme.fg('dim', 'Run /connect to configure an API key or authenticate with an account.'), 0, 0),
       );
       box.addChild(new Spacer(1));
     }
 
-    box.addChild(new Text(theme.bold(theme.fg('accent', 'Model Packs')), 0, 0));
+    box.addChild(new Text(theme.bold(theme.fg('text', 'Model Packs')), 0, 0));
     box.addChild(new Spacer(1));
     box.addChild(new Text(theme.fg('text', 'Choose default models for each mode (build / plan / fast):'), 0, 0));
     box.addChild(new Spacer(1));
@@ -338,12 +366,12 @@ export class OnboardingInlineComponent extends Box implements Focusable {
       } else {
         this.selectedModePack = pack;
         this.collapseStep(`Model pack → ${theme.bold(this.selectedModePack.name)}`);
-        this.renderStep('omPack');
+        this.renderStep('yolo');
       }
     };
     this.selectList.onCancel = () => {
       this.collapseStep(`Model pack → ${theme.bold(this.selectedModePack.name)} (default)`);
-      this.renderStep('omPack');
+      this.renderStep('yolo');
     };
     this.selectList.onSelectionChange = (item: SelectItem) => {
       this.updateModePackDetail(packs, item.value);
@@ -420,7 +448,7 @@ export class OnboardingInlineComponent extends Box implements Focusable {
       const fallback = this.options.modePacks.find(p => p.id !== 'custom') ?? this.options.modePacks[0]!;
       this.selectedModePack = fallback;
       this.collapseStep(`Model pack → ${theme.bold(this.selectedModePack.name)} (cancelled custom)`);
-      this.renderStep('omPack');
+      this.renderStep('yolo');
       this.tui.requestRender();
       return;
     }
@@ -444,7 +472,7 @@ export class OnboardingInlineComponent extends Box implements Focusable {
         const fallback = this.options.modePacks.find(p => p.id !== 'custom') ?? this.options.modePacks[0]!;
         this.selectedModePack = fallback;
         this.collapseStep(`Model pack → ${theme.bold(this.selectedModePack.name)} (cancelled custom)`);
-        this.renderStep('omPack');
+        this.renderStep('yolo');
         this.tui.requestRender();
         return;
       }
@@ -465,81 +493,6 @@ export class OnboardingInlineComponent extends Box implements Focusable {
         `${chalk.hex(mastra.purple)('build')} ${models.build}  ` +
         `${chalk.hex(mastra.green)('fast')} ${models.fast}`,
     );
-    this.renderStep('omPack');
-    this.tui.requestRender();
-  }
-
-  // ---------------------------------------------------------------------------
-  // Step: OM pack
-  // ---------------------------------------------------------------------------
-
-  private renderOmPack(): void {
-    const omPacks = this.options.omPacks;
-
-    // If no OM packs at all (unlikely — would mean zero supported providers),
-    // skip to next step
-    if (omPacks.length === 0) {
-      this.renderStep('yolo');
-      return;
-    }
-
-    const box = this.makeBox();
-    box.addChild(new Text(theme.bold(theme.fg('accent', '🧠 Observational Memory')), 0, 0));
-    box.addChild(new Spacer(1));
-    box.addChild(new Text(theme.fg('text', 'Choose the model for observational memory:'), 0, 0));
-    box.addChild(new Text(theme.fg('dim', 'https://mastra.ai/docs/memory/observational-memory'), 0, 0));
-    box.addChild(new Spacer(1));
-
-    const prevOmId = this.options.previous?.omPackId ?? null;
-    const items: SelectItem[] = omPacks.map(p => ({
-      value: p.id,
-      label: `  ${p.name}  ${theme.fg('dim', p.description)}${p.id === prevOmId ? theme.fg('dim', ' (current)') : ''}`,
-    }));
-
-    this.selectList = new SelectList(items, items.length, getSelectListTheme());
-
-    // Pre-select the previously chosen OM pack
-    const prevOmIdx = prevOmId ? omPacks.findIndex(p => p.id === prevOmId) : -1;
-    if (prevOmIdx > 0) this.selectList.setSelectedIndex(prevOmIdx);
-
-    this.selectList.onSelect = (item: SelectItem) => {
-      const pack = omPacks.find(p => p.id === item.value) ?? omPacks[0]!;
-      if (pack.id === 'custom') {
-        this.runCustomOmFlow();
-      } else {
-        this.selectedOmPack = pack;
-        this.collapseStep(`Observational memory → ${theme.bold(this.selectedOmPack.name)}`);
-        this.renderStep('yolo');
-      }
-    };
-    this.selectList.onCancel = () => {
-      this.collapseStep(`Observational memory → ${theme.bold(this.selectedOmPack.name)} (default)`);
-      this.renderStep('yolo');
-    };
-
-    box.addChild(this.selectList);
-    box.addChild(new Spacer(1));
-    box.addChild(new Text(theme.fg('dim', '↑↓ navigate · Enter select · Esc use default'), 0, 0));
-  }
-
-  private async runCustomOmFlow(): Promise<void> {
-    this.selectList = undefined;
-    this.collapseStep(`Observational memory → ${theme.bold('Custom')}`);
-
-    const modelId = await this.options.onSelectModel('Select model for observational memory');
-    if (modelId) {
-      this.selectedOmPack = { id: 'custom', name: 'Custom', description: 'User-selected model', modelId };
-      this.collapseStep(`Observational memory → ${theme.bold('Custom')}  ${modelId}`);
-    } else {
-      // Cancelled — fall back to first non-custom pack
-      const fallback = this.options.omPacks.find(p => p.id !== 'custom');
-      if (fallback) {
-        this.selectedOmPack = fallback;
-        this.collapseStep(`Observational memory → ${theme.bold(fallback.name)} (cancelled custom)`);
-      } else {
-        this.collapseStep(`Observational memory → ${theme.bold('Custom')} (cancelled)`);
-      }
-    }
     this.renderStep('yolo');
     this.tui.requestRender();
   }
@@ -550,7 +503,7 @@ export class OnboardingInlineComponent extends Box implements Focusable {
 
   private renderYolo(): void {
     const box = this.makeBox();
-    box.addChild(new Text(theme.bold(theme.fg('accent', '⚡ Tool Approval')), 0, 0));
+    box.addChild(new Text(theme.bold(theme.fg('text', 'Tool Approval')), 0, 0));
     box.addChild(new Spacer(1));
     box.addChild(new Text(theme.fg('text', 'YOLO mode auto-approves all tool calls (edits, commands, etc).'), 0, 0));
     box.addChild(new Text(theme.fg('text', 'You can toggle this anytime with Ctrl+Y or /yolo.'), 0, 0));
@@ -605,7 +558,7 @@ export class OnboardingInlineComponent extends Box implements Focusable {
       `  ${chalk.hex(mastra.blue)('plan')}  → ${this.selectedModePack.models.plan}`,
       `  ${chalk.hex(mastra.purple)('build')} → ${this.selectedModePack.models.build}`,
       `  ${chalk.hex(mastra.green)('fast')}  → ${this.selectedModePack.models.fast}`,
-      `Observational memory: ${theme.bold(this.selectedOmPack.name)}`,
+      `Observational memory: ${theme.bold('Auto')}`,
       `YOLO mode: ${theme.bold(this.selectedYolo ? 'enabled' : 'disabled')}`,
     ];
     for (const line of lines) {
@@ -616,7 +569,6 @@ export class OnboardingInlineComponent extends Box implements Focusable {
 
     this.options.onComplete({
       modePack: this.selectedModePack,
-      omPack: this.selectedOmPack,
       yolo: this.selectedYolo,
       loginRequested: this.loginRequested,
       loginProvider: this.loginProvider,
@@ -630,7 +582,7 @@ export class OnboardingInlineComponent extends Box implements Focusable {
   private collapseStep(summary: string): void {
     if (!this.stepBox) return;
     this.stepBox.clear();
-    this.stepBox.setBgFn((text: string) => theme.bg('overlayBg', text));
+    this.stepBox.setBgFn((text: string) => text);
     this.stepBox.addChild(new Text(`${theme.fg('success', '✓')} ${theme.fg('text', summary)}`, 0, 0));
     this.selectList = undefined;
     this.activeInlineQuestion = undefined;
@@ -650,7 +602,6 @@ export class OnboardingInlineComponent extends Box implements Focusable {
 
     if (this.selectList) {
       this.selectList.handleInput(data);
-      return;
     }
   }
 }

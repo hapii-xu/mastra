@@ -1,6 +1,8 @@
 import fs from 'fs/promises'
 import path from 'path'
 import { pathToFileURL } from 'url'
+import { isDirectRun } from './is-direct-run'
+import { extractSidebarDocIds, type SidebarItem } from './sidebar-doc-ids'
 
 /**
  * Validates that every MDX file under the content directories is referenced
@@ -10,28 +12,14 @@ import { pathToFileURL } from 'url'
  *   pnpm validate:sidebar-docs
  */
 
-interface SidebarDoc {
-  type: 'doc'
-  id: string
-  label?: string
-}
-
-interface SidebarCategory {
-  type: 'category'
-  label: string
-  items: SidebarItem[]
-}
-
-type SidebarItem = SidebarDoc | SidebarCategory | string
-
-interface SectionConfig {
+export interface SectionConfig {
   name: string
   contentDir: string
   sidebarPath: string
   sidebarKey: string
 }
 
-const SECTIONS: SectionConfig[] = [
+export const SECTIONS: SectionConfig[] = [
   {
     name: 'docs',
     contentDir: 'src/content/en/docs',
@@ -39,10 +27,10 @@ const SECTIONS: SectionConfig[] = [
     sidebarKey: 'docsSidebar',
   },
   {
-    name: 'guides',
-    contentDir: 'src/content/en/guides',
-    sidebarPath: 'src/content/en/guides/sidebars.js',
-    sidebarKey: 'guidesSidebar',
+    name: 'integrations',
+    contentDir: 'src/content/en/integrations',
+    sidebarPath: 'src/content/en/integrations/sidebars.js',
+    sidebarKey: 'integrationsSidebar',
   },
   {
     name: 'reference',
@@ -61,24 +49,6 @@ const IGNORED_PATTERNS = [
   /\/agents\/networks/,
   /\/license\.mdx$/,
 ]
-
-function extractDocIds(items: SidebarItem[]): Set<string> {
-  const ids = new Set<string>()
-
-  for (const item of items) {
-    if (typeof item === 'string') {
-      ids.add(item)
-    } else if (item.type === 'doc') {
-      ids.add(item.id)
-    } else if (item.type === 'category') {
-      for (const id of extractDocIds(item.items)) {
-        ids.add(id)
-      }
-    }
-  }
-
-  return ids
-}
 
 async function collectMdxFiles(dir: string): Promise<string[]> {
   const results: string[] = []
@@ -105,12 +75,12 @@ function shouldIgnore(filePath: string): boolean {
   return IGNORED_PATTERNS.some(pattern => pattern.test(filePath))
 }
 
-interface ValidationResult {
+export interface ValidationResult {
   section: string
   ghostPages: string[]
 }
 
-async function validateSection(section: SectionConfig, rootDir: string): Promise<ValidationResult> {
+export async function validateSection(section: SectionConfig, rootDir: string): Promise<ValidationResult> {
   const sidebarFullPath = path.join(rootDir, section.sidebarPath)
   const contentFullDir = path.join(rootDir, section.contentDir)
 
@@ -122,7 +92,7 @@ async function validateSection(section: SectionConfig, rootDir: string): Promise
     throw new Error(`${section.sidebarKey} not found in ${section.sidebarPath}`)
   }
 
-  const sidebarIds = extractDocIds(items)
+  const sidebarIds = extractSidebarDocIds(items)
   const mdxFiles = await collectMdxFiles(contentFullDir)
 
   const ghostPages: string[] = []
@@ -173,7 +143,9 @@ async function main(): Promise<void> {
   process.exit(1)
 }
 
-main().catch(error => {
-  console.error('Unhandled error:', error instanceof Error ? error.message : error)
-  process.exit(1)
-})
+if (isDirectRun(import.meta.url)) {
+  main().catch(error => {
+    console.error('Unhandled error:', error instanceof Error ? error.message : error)
+    process.exit(1)
+  })
+}

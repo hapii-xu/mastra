@@ -1,8 +1,9 @@
 import { Command } from 'commander';
 import { beforeEach, describe, expect, it } from 'vitest';
-import { API_ROUTE_METADATA } from './route-metadata.generated';
+import { FACTORY_API_ROUTE_CATALOG, FACTORY_API_ROUTE_METADATA } from './factory-route-metadata.generated';
+import { BUNDLED_ROUTE_SCHEMAS } from './schema';
 import type { ApiCommandDescriptor } from './types';
-import { API_COMMANDS, registerApiCommand } from './index';
+import { API_COMMANDS, CLI_ROUTE_METADATA, registerApiCommand } from './index';
 
 interface CommandLeaf {
   path: string;
@@ -39,8 +40,8 @@ function commandKey(name: string): string {
   return name.replace(/ ([a-z])/g, (_, letter: string) => letter.toUpperCase());
 }
 
-function routeKey(descriptor: ApiCommandDescriptor): keyof typeof API_ROUTE_METADATA {
-  return `${descriptor.method} ${descriptor.path}` as keyof typeof API_ROUTE_METADATA;
+function routeKey(descriptor: ApiCommandDescriptor): keyof typeof CLI_ROUTE_METADATA {
+  return `${descriptor.method} ${descriptor.path}` as keyof typeof CLI_ROUTE_METADATA;
 }
 
 function pathParams(path: string): string[] {
@@ -80,7 +81,7 @@ describe('api command descriptors', () => {
     expect(new Set(names).size).toBe(names.length);
 
     for (const descriptor of Object.values(API_COMMANDS)) {
-      const metadata = API_ROUTE_METADATA[routeKey(descriptor)];
+      const metadata = CLI_ROUTE_METADATA[routeKey(descriptor)];
       expect(metadata, descriptor.key).toBeDefined();
       expect(descriptor.method, descriptor.key).toBe(metadata.method);
       expect(descriptor.path, descriptor.key).toBe(metadata.path);
@@ -109,6 +110,78 @@ describe('api command descriptors', () => {
         );
       }
     }
+  });
+
+  it('exposes every generated Factory contract through root-level descriptors and bundled schemas', () => {
+    const expected = {
+      factoryProjectList: ['projectList', [], true, false, true],
+      factoryProjectGet: ['projectGet', ['id'], false, false, false],
+      factoryProjectCreate: ['projectCreate', [], true, true, false],
+      factoryProjectUpdate: ['projectUpdate', ['id'], true, true, false],
+      'factoryProjectApply-default-model': ['projectApplyDefaultModel', ['id'], false, false, false],
+      factoryProjectDelete: ['projectDelete', ['id'], false, false, false],
+      factoryProjectEnvironmentGet: ['projectEnvironmentGet', ['id'], false, false, false],
+      factoryProjectEnvironmentUpdate: ['projectEnvironmentUpdate', ['id'], true, true, false],
+      factoryProjectEnvironmentBuild: ['projectEnvironmentBuild', ['id'], false, false, false],
+      factoryProjectEnvironmentBuildsList: ['projectEnvironmentBuilds', ['id'], false, false, false],
+      factoryProjectEnvironmentBuildsGet: ['projectEnvironmentBuildGet', ['id', 'buildId'], false, false, false],
+      'factoryWork-itemList': ['workItemList', ['id'], false, false, false],
+      'factoryWork-itemCreate': ['workItemCreate', ['id'], true, true, false],
+      'factoryWork-itemUpdate': ['workItemUpdate', ['id'], true, true, false],
+      'factoryWork-itemDelete': ['workItemDelete', ['id'], false, false, false],
+      'factoryWork-itemTransition': ['workItemTransition', ['id', 'workItemId'], true, true, false],
+      'factoryWork-itemStart': ['workItemStart', ['id'], true, true, false],
+      'factoryWork-itemAutomation-run': ['workItemAutomationRun', ['id', 'workItemId'], true, true, false],
+      factoryBoards: ['boardCatalog', ['id'], false, false, false],
+      factoryBoardGet: ['boardGet', ['id', 'boardKey'], false, false, false],
+      factoryBoardCreate: ['boardCreate', ['id'], true, true, false],
+      factoryBoardUpdate: ['boardReplace', ['id', 'boardKey'], true, true, false],
+      factoryBoardDelete: ['boardDelete', ['id', 'boardKey'], true, true, false],
+      factoryBoardReset: ['boardReset', ['id', 'boardKey'], true, true, false],
+      factorySkills: ['skillList', [], true, false, false],
+      factorySkillUpdate: ['skillOverrideSave', ['id', 'name'], true, true, false],
+      factorySkillRevert: ['skillOverrideRevert', ['id', 'name'], false, false, false],
+      'factoryIntake-routeList': ['intakeRouteList', ['id'], false, false, false],
+      'factoryIntake-routeGet': ['intakeRouteGet', ['id', 'routeId'], false, false, false],
+      'factoryIntake-routeCreate': ['intakeRouteCreate', ['id'], true, true, false],
+      'factoryIntake-routeUpdate': ['intakeRouteUpdate', ['id', 'routeId'], true, true, false],
+      'factoryIntake-routeDelete': ['intakeRouteDelete', ['id', 'routeId'], true, true, false],
+      'factoryIntake-routeReorder': ['intakeRouteReorder', ['id'], true, true, false],
+      factoryMetrics: ['metricsGet', ['id'], true, false, false],
+      factoryHealthThresholds: ['healthThresholdsGet', ['id'], false, false, false],
+      factoryDecisionList: ['decisionList', ['id'], true, false, false],
+      factoryDecisionApprove: ['decisionApprove', ['id', 'decisionId'], false, false, false],
+      factoryDecisionDismiss: ['decisionDismiss', ['id', 'decisionId'], false, false, false],
+      factoryDecisionRetry: ['decisionRetry', ['id', 'decisionId'], false, false, false],
+      factoryAttentionList: ['attentionList', ['id'], true, false, false],
+      'factoryAttentionRead-all': ['attentionReadAll', ['id'], true, false, false],
+      factoryAttentionRead: ['attentionRead', ['id', 'kind', 'sourceId', 'occurrence'], false, false, false],
+      factoryAttentionArchive: ['attentionArchive', ['id', 'kind', 'sourceId', 'occurrence'], false, false, false],
+      factoryAttentionRestore: ['attentionRestore', ['id', 'kind', 'sourceId', 'occurrence'], false, false, false],
+    } as const;
+
+    const exposedRouteKeys = new Set<string>();
+    for (const [descriptorKey, [contractKey, positionals, acceptsInput, inputRequired, list]] of Object.entries(
+      expected,
+    )) {
+      const descriptor = API_COMMANDS[descriptorKey];
+      const generatedRouteKey = FACTORY_API_ROUTE_CATALOG[contractKey];
+
+      expect(descriptor, descriptorKey).toBeDefined();
+      expect(descriptor, descriptorKey).toMatchObject({
+        positionals,
+        acceptsInput,
+        inputRequired,
+        list,
+        routePlacement: 'origin',
+      });
+      expect(`${descriptor.method} ${descriptor.path}`, descriptorKey).toBe(generatedRouteKey);
+      expect(CLI_ROUTE_METADATA[generatedRouteKey], descriptorKey).toBe(FACTORY_API_ROUTE_METADATA[generatedRouteKey]);
+      expect(BUNDLED_ROUTE_SCHEMAS[generatedRouteKey], descriptorKey).toBeDefined();
+      exposedRouteKeys.add(generatedRouteKey);
+    }
+
+    expect(exposedRouteKeys).toEqual(new Set(Object.values(FACTORY_API_ROUTE_CATALOG)));
   });
 
   it('keeps targeted regressions for commands with non-obvious input behavior', () => {

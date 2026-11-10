@@ -1,24 +1,18 @@
-import { CpuIcon } from 'lucide-react';
+import type { EntityLearningProgressResponse, SignalCatalogEntry } from '@mastra/client-js';
+import { CpuIcon, ExternalLink } from 'lucide-react';
 import type { CSSProperties, ReactNode } from 'react';
 
-import './signals-empty-state.css';
 import { Button } from '../../../ds/components/Button';
 import { Card } from '../../../ds/components/Card';
-import { nodeColor } from '../../../ds/components/SankeyChart/sankeyColor';
 import type { LinkComponent } from '../../../ds/types/link-component';
-import { getSignalHue } from '../signal-colors';
-
-const signalDefinitions = [
-  { label: 'Goal', description: 'What the user is trying to achieve or have completed.' },
-  { label: 'Sentiment', description: "The user's emotional state or attitude." },
-  {
-    label: 'Behavior',
-    description:
-      "The entity's observable actions and patterns, including tool use, omissions, retries, failures, and recovery.",
-  },
-  { label: 'Outcome', description: 'The final completed, unresolved, or blocked state.' },
-];
-const signalLabels = signalDefinitions.map(signal => signal.label);
+import { getSignalColor } from '../signal-colors';
+import { BUILT_IN_SIGNAL_CATALOG, orderedSignals, signalDescription, signalLabel } from '../signal-formatting';
+import { Metadata } from '@/ds/components/Metadata';
+import { Txt } from '@/ds/components/Txt';
+import { TraceIcon } from '@/ds/icons/TraceIcon';
+import { raisedSurfaceStyle } from '@/ds/primitives/raised-surface';
+import { textStyle } from '@/ds/primitives/text';
+import { cn } from '@/lib/utils';
 
 const traceRows = [
   ['chat.completion', '1.2s'],
@@ -27,150 +21,340 @@ const traceRows = [
 ];
 
 const signalStyle = (label: string): CSSProperties => ({
-  color: nodeColor(getSignalHue(label)),
+  color: getSignalColor(label),
 });
 
 const PipelineConnector = () => (
   <div aria-hidden="true" className="relative hidden h-full items-center lg:flex">
-    <div className="border-border1 w-full border-t border-dashed" />
-    <span className="signals-pipeline-connector bg-positive1 absolute left-1/2 size-2.5 -translate-x-1/2 rounded-full shadow-[0_0_12px_currentColor]" />
+    <div className="w-full border-t border-dashed border-border" />
+    <span className="absolute left-1/2 size-2.5 -translate-x-1/2 rounded-full bg-brand-green-indicator" />
   </div>
 );
+
+export type TraceIntelligenceProgress = EntityLearningProgressResponse;
 
 export type SignalsEmptyStateProps = {
   actionSlot?: ReactNode;
   LinkComponent?: LinkComponent;
+  progress?: TraceIntelligenceProgress;
+  signalCatalog?: readonly SignalCatalogEntry[];
+  isRangeEmpty?: boolean;
 };
 
-export const SignalsEmptyState = ({ actionSlot, LinkComponent = 'a' }: SignalsEmptyStateProps) => {
+function formatNumber(value: number) {
+  return new Intl.NumberFormat('en-US').format(value);
+}
+
+function statusCopy(progress?: TraceIntelligenceProgress, isRangeEmpty?: boolean) {
+  if (isRangeEmpty) {
+    return {
+      title: 'No Trace Intelligence themes in this date range.',
+      body: 'Choose a wider snapshot date range, or wait for newly processed traces to form recurring themes.',
+    };
+  }
+  if (!progress || progress.status === 'collecting') {
+    return {
+      title: 'Collecting traces for Trace Intelligence.',
+      body: 'Trace Intelligence starts grouping recurring patterns after your deployed agents send enough completed traces.',
+    };
+  }
+  if (progress.status === 'ready') {
+    return {
+      title: 'Trace Intelligence themes are ready.',
+      body: 'Select at least two available trace signal types to see how goals, outcomes, behaviors, and sentiment connect.',
+    };
+  }
+  return {
+    title: 'Analyzing traces for Trace Intelligence.',
+    body: 'Trace signals have started processing. Themes appear after enough generated and embedded trace signals form recurring patterns.',
+  };
+}
+
+function ProgressSummary({ progress }: { progress: TraceIntelligenceProgress }) {
+  const catalog = progress.signalCatalog ?? BUILT_IN_SIGNAL_CATALOG;
+  const enabledSignalCount = catalog.filter(signal => signal.enabled).length;
+  const readySignalCount = catalog.filter(signal => signal.enabled && signal.status === 'ready').length;
   return (
-    <section className="bg-surface1 min-h-full w-full p-6 md:px-10 lg:px-12 xl:px-[4.375rem]">
+    <dl className="mt-4 grid gap-2 sm:grid-cols-3">
+      <div className={cn(raisedSurfaceStyle, 'rounded-md px-3 py-2')}>
+        <dt className={textStyle({ tone: 'muted', variant: 'caption' })}>Traces analyzed</dt>
+        <dd className={cn(textStyle({ tone: 'ink', variant: 'heading' }), 'mt-1')}>
+          {formatNumber(progress.traceCount)}
+        </dd>
+      </div>
+      <div className={cn(raisedSurfaceStyle, 'rounded-md px-3 py-2')}>
+        <dt className={textStyle({ tone: 'muted', variant: 'caption' })}>Trace signal types ready</dt>
+        <dd className={cn(textStyle({ tone: 'ink', variant: 'heading' }), 'mt-1')}>
+          {progress.signalCatalog ? readySignalCount : progress.availableSignals.length} of {enabledSignalCount}
+        </dd>
+      </div>
+      <div className={cn(raisedSurfaceStyle, 'rounded-md px-3 py-2')}>
+        <dt className={textStyle({ tone: 'muted', variant: 'caption' })}>Status</dt>
+        <dd className={cn(textStyle({ tone: 'ink', variant: 'heading' }), 'mt-1 capitalize')}>{progress.status}</dd>
+      </div>
+    </dl>
+  );
+}
+
+function SignalProgressList({ progress }: { progress?: TraceIntelligenceProgress }) {
+  if (!progress) return null;
+
+  const catalog = progress.signalCatalog ?? BUILT_IN_SIGNAL_CATALOG;
+  return (
+    <ul aria-label="Trace signal processing progress" className="mt-3 grid gap-2 sm:grid-cols-2 lg:grid-cols-4">
+      {orderedSignals(
+        catalog,
+        catalog.filter(signal => signal.enabled).map(signal => signal.name),
+      ).map(signalName => {
+        const value = progress.signals[signalName] ?? { generated: 0, embedded: 0 };
+        const catalogEntry = catalog.find(signal => signal.name === signalName);
+        const label = signalLabel(catalog, signalName);
+        const isReady = catalogEntry ? catalogEntry.status === 'ready' : progress.availableSignals.includes(signalName);
+        return (
+          <li className="rounded-md border border-border bg-background px-3 py-2" key={signalName}>
+            <div className="flex items-center justify-between gap-2">
+              <Txt as="span" variant="subheading" style={signalStyle(signalName)}>
+                {label}
+              </Txt>
+              <Txt as="span" variant="caption" tone="muted">
+                {isReady ? 'Themes ready' : 'Processing'}
+              </Txt>
+            </div>
+            <Txt variant="caption" tone="muted" className="mt-1">
+              <Metadata>
+                <Metadata.Item>{formatNumber(value.generated)} generated</Metadata.Item>
+                <Metadata.Item>{formatNumber(value.embedded)} embedded</Metadata.Item>
+              </Metadata>
+            </Txt>
+          </li>
+        );
+      })}
+    </ul>
+  );
+}
+
+export function PendingSignalProgress({
+  progress,
+  signalCatalog,
+}: {
+  progress?: TraceIntelligenceProgress;
+  signalCatalog: readonly SignalCatalogEntry[];
+}) {
+  const catalog = progress?.signalCatalog ?? signalCatalog;
+  const pendingSignals = catalog.filter(signal => signal.enabled && signal.status !== 'ready');
+  if (pendingSignals.length === 0) return null;
+
+  return (
+    <section className="rounded-lg border border-border bg-background p-4" aria-labelledby="pending-signals-heading">
+      <Txt as="h2" variant="subheading" tone="ink" id="pending-signals-heading">
+        Signals building themes
+      </Txt>
+      <Txt variant="caption" tone="muted" className="mt-1">
+        Themes appear once enough new traces are analyzed, embedded, and clustered.
+      </Txt>
+      <ul aria-label="Pending trace signals" className="mt-3 grid gap-2 sm:grid-cols-2">
+        {pendingSignals.map(signal => {
+          const value = progress?.signals[signal.name] ?? { generated: 0, embedded: 0 };
+          return (
+            <li className={cn(raisedSurfaceStyle, 'rounded-md px-3 py-2')} key={signal.name}>
+              <div className="flex items-center justify-between gap-2">
+                <Txt font="body" as="span" variant="subheading" style={signalStyle(signal.name)}>
+                  {signalLabel(catalog, signal.name)}
+                </Txt>
+                <Txt font="body" as="span" variant="caption" tone="muted" className="capitalize">
+                  {signal.status}
+                </Txt>
+              </div>
+              {signalDescription(catalog, signal.name) ? (
+                <Txt font="body" variant="caption" tone="muted" className="mt-1">
+                  {signalDescription(catalog, signal.name)}
+                </Txt>
+              ) : null}
+              <Txt font="body" variant="caption" tone="muted" className="mt-1">
+                <Metadata>
+                  <Metadata.Item>{formatNumber(value.generated)} generated</Metadata.Item>
+                  <Metadata.Item>{formatNumber(value.embedded)} embedded</Metadata.Item>
+                </Metadata>
+              </Txt>
+            </li>
+          );
+        })}
+      </ul>
+    </section>
+  );
+}
+
+export const SignalsEmptyState = ({
+  actionSlot,
+  LinkComponent = 'a',
+  progress,
+  signalCatalog,
+  isRangeEmpty,
+}: SignalsEmptyStateProps) => {
+  const copy = statusCopy(progress, isRangeEmpty);
+  const catalog = signalCatalog ?? progress?.signalCatalog ?? BUILT_IN_SIGNAL_CATALOG;
+  const enabledSignalNames = orderedSignals(
+    catalog,
+    catalog.filter(signal => signal.enabled).map(signal => signal.name),
+  );
+  const signalDefinitions = enabledSignalNames.map(name => ({
+    key: name,
+    label: signalLabel(catalog, name),
+    description: signalDescription(catalog, name),
+  }));
+
+  return (
+    <section className="min-h-full w-full bg-sidebar p-6 md:px-10 lg:px-12 xl:px-[4.375rem]">
       <div className="mx-auto w-full max-w-260">
         <header>
-          <h1 className="text-header-xl text-neutral6 font-medium tracking-tight">
+          <Txt variant="eyebrow" tone="muted" className="flex items-center gap-2">
+            <span aria-hidden="true" className="size-2 rounded-full bg-brand-green-indicator" />
+            Trace Intelligence
+          </Txt>
+          <Txt as="h1" variant="display" tone="ink" className="mt-2">
             Understand what drives every agent interaction
-          </h1>
+          </Txt>
+          <Txt tone="muted" className="mt-2 max-w-180">
+            Trace Intelligence groups recurring goals, outcomes, behaviors, and sentiment across completed traces.
+          </Txt>
         </header>
 
         <div
-          aria-label="Signals analysis pipeline"
-          className="mt-14 grid gap-4 lg:grid-cols-[17.5rem_4.5rem_17.5rem_4.5rem_minmax(0,1fr)] lg:gap-0"
           role="list"
+          aria-label="Trace Intelligence analysis pipeline"
+          className="mt-14 grid gap-4 lg:grid-cols-[17.5rem_4.5rem_17.5rem_4.5rem_minmax(0,1fr)] lg:gap-0"
         >
-          <article className="h-50 p-5" role="listitem">
-            <h2 className="text-neutral6 text-lg font-semibold">Traces</h2>
-            <p className="text-neutral3 mt-0.5 text-xs">Every agent interaction</p>
-            <p className="text-neutral2 mt-5 font-mono text-[0.5625rem] tracking-[0.24em] uppercase">Input</p>
+          <div role="listitem" className="min-h-50 p-5">
+            <Txt as="h2" variant="heading" tone="ink">
+              Traces
+            </Txt>
+            <Txt variant="caption" tone="muted" className="mt-0.5">
+              Every agent interaction
+            </Txt>
+            <Txt variant="eyebrow" tone="muted" className="mt-5">
+              Input
+            </Txt>
             <div className="mt-2.5 space-y-2">
               {traceRows.map(([name, duration]) => (
                 <div
-                  className="border-border1 bg-surface3 text-ui-xs flex items-center justify-between rounded border px-3 py-1.5 font-mono"
+                  className={cn(raisedSurfaceStyle, 'flex items-center justify-between rounded px-3 py-1.5')}
                   key={name}
                 >
-                  <span className="text-neutral4">{name}</span>
-                  <span className="text-neutral2">{duration}</span>
+                  <Txt as="span" variant="meta" font="mono" tone="muted">
+                    {name}
+                  </Txt>
+                  <Txt as="span" variant="meta" font="mono" tone="muted">
+                    {duration}
+                  </Txt>
                 </div>
               ))}
             </div>
-          </article>
+          </div>
 
           <PipelineConnector />
 
           <Card
-            as="article"
-            className="flex h-50 flex-col items-center p-5 text-center"
-            elevation="elevated"
+            as="div"
             role="listitem"
+            className="flex min-h-50 flex-col items-center p-5 text-center"
+            elevation="raised"
           >
-            <h2 className="text-neutral6 text-lg font-semibold">Mastra Engine</h2>
-            <p className="text-neutral3 mt-0.5 text-xs">Clusters recurring patterns</p>
-            <div aria-hidden="true" className="relative mt-5 flex size-20 items-center justify-center">
-              <span className="signals-engine-pulse border-positive1/15 absolute size-20 rounded-full border" />
-              <span className="border-positive1/25 absolute size-14 rounded-full border" />
-              <span className="border-positive1/40 bg-positive1/5 absolute size-9 rounded-full border shadow-[0_0_24px_var(--color-positive1)]" />
-              <CpuIcon className="text-positive1 relative size-4" />
+            <Txt as="h2" variant="heading" tone="ink">
+              Trace Intelligence
+            </Txt>
+            <Txt variant="caption" tone="muted" className="mt-0.5">
+              Finds recurring themes
+            </Txt>
+            <div
+              aria-hidden="true"
+              className="mt-5 flex size-14 items-center justify-center rounded-full border border-brand-green-indicator bg-fill-subtle"
+            >
+              <CpuIcon className="size-4 text-brand-green-indicator" />
             </div>
-            <p className="text-ui-xs text-neutral2 mt-3 max-w-40 leading-4">
-              Finds relationships across conversations, tools, and workflows
-            </p>
+            <Txt variant="meta" tone="muted" className="mt-3 max-w-40">
+              Clusters similar trace signals into themes for each dimension
+            </Txt>
           </Card>
 
           <PipelineConnector />
 
-          <article className="h-50 p-5" role="listitem">
-            <h2 className="text-neutral6 text-lg font-semibold">Signal analysis</h2>
-            <p className="text-neutral3 mt-0.5 text-xs">What your users actually do</p>
-            <p className="text-neutral2 mt-5 font-mono text-[0.5625rem] tracking-[0.24em] uppercase">Output</p>
+          <div role="listitem" className="min-h-50 p-5">
+            <Txt as="h2" variant="heading" tone="ink">
+              Theme analysis
+            </Txt>
+            <Txt variant="caption" tone="muted" className="mt-0.5">
+              How recurring patterns connect
+            </Txt>
+            <Txt variant="eyebrow" tone="muted" className="mt-5">
+              Output
+            </Txt>
             <div className="mt-3 flex flex-wrap gap-2">
-              {signalLabels.map(label => (
-                <span
-                  className="signals-chip bg-surface3 inline-flex items-center gap-2 rounded border border-current/25 px-2.5 py-1.5 text-xs font-medium shadow-[0_0_14px_color-mix(in_oklch,currentColor_12%,transparent)]"
-                  key={label}
-                  style={signalStyle(label)}
+              {signalDefinitions.map(signal => (
+                <Txt
+                  as="span"
+                  variant="column"
+                  className="inline-flex items-center gap-2 rounded border border-border bg-card px-2.5 py-1.5"
+                  key={signal.key}
+                  style={signalStyle(signal.key)}
                 >
-                  <span aria-hidden="true" className="size-1.5 rounded-full bg-current shadow-[0_0_7px_currentColor]" />
-                  {label}
-                </span>
+                  <span aria-hidden="true" className="size-1.5 rounded-full bg-current" />
+                  {signal.label}
+                </Txt>
               ))}
             </div>
-          </article>
+          </div>
         </div>
 
         <section className="mt-10" aria-labelledby="signal-definitions-heading">
-          <h2 id="signal-definitions-heading" className="text-neutral6 text-lg font-semibold">
-            What each signal means
-          </h2>
-          <div aria-label="Signal definitions" className="mt-4 grid gap-3 sm:grid-cols-2" role="list">
+          <Txt as="h2" variant="heading" tone="ink" id="signal-definitions-heading">
+            What each trace signal means
+          </Txt>
+          <ul aria-label="Trace signal definitions" className="mt-4 grid gap-3 sm:grid-cols-2">
             {signalDefinitions.map(signal => (
-              <article className="px-1 py-2" key={signal.label} role="listitem">
-                <h3 className="text-sm font-semibold" style={signalStyle(signal.label)}>
+              <li className="px-1 py-2" key={signal.key}>
+                <Txt as="h3" variant="subheading" style={signalStyle(signal.key)}>
                   {signal.label}
-                </h3>
-                <p className="text-neutral3 mt-1.5 text-xs leading-5">{signal.description}</p>
-              </article>
+                </Txt>
+                {signal.description ? (
+                  <Txt variant="caption" tone="muted" className="mt-1.5">
+                    {signal.description}
+                  </Txt>
+                ) : null}
+              </li>
             ))}
-          </div>
+          </ul>
         </section>
 
-        <section className="mt-10" aria-label="Signal relationship preview">
-          <p className="text-neutral2 font-mono text-[0.5625rem] tracking-[0.2em] uppercase">
-            Grouped trace relationships will appear after traces contain at least two signal types
-          </p>
-          <div aria-hidden="true" className="mt-3 grid h-18 grid-cols-3 gap-5 opacity-35">
-            {[0, 1, 2].map(index => (
-              <div className="border-border1 bg-surface2/30 rounded-md border border-dashed p-4" key={index}>
-                <div className="bg-neutral1 h-1.5 w-16 rounded-full" />
-                <div className="bg-neutral1/60 mt-3 h-1 w-full rounded-full" />
-                <div className="bg-neutral1/40 mt-2 h-1 w-2/3 rounded-full" />
-              </div>
-            ))}
+        <aside className="mt-9 rounded-md border border-border bg-background px-5 py-4">
+          <div className="flex min-w-0 items-start gap-3">
+            <span aria-hidden="true" className="mt-1.5 size-2 shrink-0 rounded-full bg-warning-indicator" />
+            <div className="min-w-0 flex-1">
+              <Txt variant="caption" tone="muted">
+                <Txt as="strong" variant="column" tone="ink">
+                  {copy.title}
+                </Txt>{' '}
+                {copy.body}
+              </Txt>
+              {progress ? <ProgressSummary progress={progress} /> : null}
+              <SignalProgressList progress={progress} />
+            </div>
           </div>
-        </section>
-
-        <aside className="border-border1 bg-surface2 mt-9 flex min-h-16 flex-col gap-4 rounded-md border px-5 py-3.5 sm:flex-row sm:items-center sm:justify-between">
-          <div className="flex min-w-0 items-start gap-3 sm:items-center">
-            <span
-              aria-hidden="true"
-              className="bg-warning1 mt-1.5 size-2 shrink-0 rounded-full shadow-[0_0_9px_currentColor] sm:mt-0"
-            />
-            <p className="text-neutral3 text-xs leading-5">
-              <strong className="text-neutral5 font-semibold">Waiting for traces.</strong> Signals activate
-              automatically once your agents start receiving traffic.
-            </p>
-          </div>
-          <div className="flex shrink-0 flex-wrap items-center gap-2">
+          <div className="mt-4 flex shrink-0 flex-wrap items-center gap-2 sm:justify-end">
             {actionSlot}
             <Button
-              as="a"
-              href="https://mastra.ai/en/docs/observability/tracing/overview"
-              target="_blank"
-              rel="noopener noreferrer"
-              variant="outline"
+              icon={<ExternalLink />}
+              render={
+                <a
+                  href="https://mastra.ai/en/docs/mastra-platform/trace-intelligence"
+                  target="_blank"
+                  rel="noopener noreferrer"
+                />
+              }
               size="sm"
             >
-              Read the docs
+              Read the docs<span className="sr-only"> (opens in new tab)</span>
             </Button>
-            <Button as={LinkComponent} href="/observability" variant="primary" size="sm">
+            <Button icon={<TraceIcon />} render={<LinkComponent href="/traces" />} variant="primary" size="sm">
               View incoming traces
             </Button>
           </div>

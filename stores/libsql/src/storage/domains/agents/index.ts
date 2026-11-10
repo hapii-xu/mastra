@@ -1,4 +1,3 @@
-import type { Client, InValue } from '@libsql/client';
 import { ErrorCategory, ErrorDomain, MastraError } from '@mastra/core/error';
 import {
   AgentsStorage,
@@ -25,6 +24,7 @@ import type {
 } from '@mastra/core/storage';
 import { LibSQLDB, resolveClient } from '../../db';
 import type { LibSQLDomainConfig } from '../../db';
+import type { SqliteClient as Client, SqliteInValue as InValue } from '../../db/client';
 import { buildSelectColumnsWithAlias } from '../../db/utils';
 
 export class AgentsLibSQL extends AgentsStorage {
@@ -60,8 +60,10 @@ export class AgentsLibSQL extends AgentsStorage {
         'workspace',
         'skills',
         'skillsFormat',
+        'durable',
         'browser',
         'toolProviders',
+        'modelList',
       ],
     });
 
@@ -679,8 +681,9 @@ export class AgentsLibSQL extends AgentsStorage {
           versionNumber: input.versionNumber,
           name: input.name ?? null,
           description: input.description ?? null,
-          instructions: this.serializeInstructions(input.instructions),
-          model: input.model,
+          instructions: this.serializeInstructions(input.instructions ?? ''),
+          model: input.model ?? {},
+          modelList: input.modelList ?? null,
           tools: input.tools ?? null,
           defaultOptions: input.defaultOptions ?? null,
           workflows: input.workflows ?? null,
@@ -696,6 +699,7 @@ export class AgentsLibSQL extends AgentsStorage {
           workspace: input.workspace ?? null,
           skills: input.skills ?? null,
           skillsFormat: input.skillsFormat ?? null,
+          durable: input.durable ?? null,
           browser: input.browser ?? null,
           changedFields: input.changedFields ?? null,
           changeMessage: input.changeMessage ?? null,
@@ -741,6 +745,33 @@ export class AgentsLibSQL extends AgentsStorage {
           domain: ErrorDomain.STORAGE,
           category: ErrorCategory.THIRD_PARTY,
           details: { versionId: id },
+        },
+        error,
+      );
+    }
+  }
+
+  async getVersions(ids: string[]): Promise<AgentVersion[]> {
+    if (ids.length === 0) {
+      return [];
+    }
+    try {
+      const rows = await this.#db.selectMany<Record<string, any>>({
+        tableName: TABLE_AGENT_VERSIONS,
+        whereClause: {
+          sql: `WHERE id IN (${ids.map(() => '?').join(', ')})`,
+          args: ids,
+        },
+      });
+      return (rows ?? []).map(row => this.parseVersionRow(row));
+    } catch (error) {
+      if (error instanceof MastraError) throw error;
+      throw new MastraError(
+        {
+          id: createStorageErrorId('LIBSQL', 'GET_VERSIONS', 'FAILED'),
+          domain: ErrorDomain.STORAGE,
+          category: ErrorCategory.THIRD_PARTY,
+          details: { count: ids.length },
         },
         error,
       );
@@ -988,6 +1019,7 @@ export class AgentsLibSQL extends AgentsStorage {
       description: row.description as string | undefined,
       instructions: this.deserializeInstructions(row.instructions as string),
       model: this.parseJson(row.model, 'model'),
+      modelList: this.parseJson(row.modelList, 'modelList'),
       tools: this.parseJson(row.tools, 'tools'),
       defaultOptions: this.parseJson(row.defaultOptions, 'defaultOptions'),
       workflows: this.parseJson(row.workflows, 'workflows'),
@@ -1003,6 +1035,7 @@ export class AgentsLibSQL extends AgentsStorage {
       workspace: this.parseJson(row.workspace, 'workspace'),
       skills: this.parseJson(row.skills, 'skills'),
       skillsFormat: row.skillsFormat as 'xml' | 'json' | 'markdown' | undefined,
+      durable: this.parseJson(row.durable, 'durable'),
       browser: this.parseJson(row.browser, 'browser'),
       changedFields: this.parseJson(row.changedFields, 'changedFields'),
       changeMessage: row.changeMessage as string | undefined,

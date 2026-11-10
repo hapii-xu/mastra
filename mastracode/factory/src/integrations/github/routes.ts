@@ -11,46 +11,58 @@
  * so the SPA can cleanly hide all GitHub UI.
  */
 
-import { randomUUID } from 'node:crypto';
 import type { MountedMastraCode } from '@mastra/code-sdk';
-import type { ApiRoute } from '@mastra/core/server';
+import { resolveModel } from '@mastra/code-sdk/agents/model';
+import { RequestContext } from '@mastra/core/request-context';
+import type { ApiRoute, IUserProvider } from '@mastra/core/server';
 import { registerApiRoute } from '@mastra/core/server';
+import { UniqueViolationError } from '@mastra/core/storage';
 import type { FactoryStorage } from '@mastra/core/storage';
+import type { FactorySandbox } from '@mastra/core/workspace';
 import type { Context } from 'hono';
-import { streamSSE } from 'hono/streaming';
+import { loose } from '../../routes/route.js';
 import type { RouteAuth } from '../../routes/route.js';
-import { SandboxBudgetError } from '../../sandbox/fleet.js';
-import type { MaterializationSandbox, PrepareProgress, ProgressFn, SandboxFleet } from '../../sandbox/fleet.js';
+import { canReadSessionResource, canViewSourceControlSession } from '../../routes/session-access.js';
+import { AUTO_TRIAGED_LABEL, NEEDS_APPROVAL_LABEL } from '../../rules/types.js';
+import { requireExec } from '../../sandbox/materialization.js';
+import type { ExecutableSandbox } from '../../sandbox/materialization.js';
+import { peekSessionSandbox } from '../../sandbox/session-sandbox.js';
+import { sanitizeSegment } from '../../sandbox/workdir.js';
+import { waitForPendingFilesystemCapture } from '../../session/filesystem-capture.js';
+import { sessionMemoryResourceId, listFactorySessionThreads } from '../../session/session-threads.js';
+import { normalizeSessionTitle } from '../../session/session-title.js';
 import type { StateSigner } from '../../state-signing.js';
 import type { AuditEmitter } from '../../storage/domains/audit/domain.js';
+import type { MemorySettingsStorage } from '../../storage/domains/memory-settings/base.js';
 import type { FactoryProjectsStorage } from '../../storage/domains/projects/base.js';
 import type {
   ProjectRepository,
-  ProjectRepositorySandbox,
   ProjectSourceControlConnection,
   SourceControlInstallation,
   SourceControlRepository,
 } from '../../storage/domains/source-control/base.js';
+import { listRepositoryCommits } from './commits.js';
 import { getGithubFeatureDiagnostics, isGithubFeatureEnabled } from './config.js';
 import type { GithubIntegration } from './integration.js';
 import { clearGithubPat, getGithubPat, getGithubPatStatus, setGithubPat } from './pat.js';
 import type { GithubPatKind } from './pat.js';
+import { polledPullRequestEvent } from './rules.js';
+import type { PolledPullRequestState, ReconcileRepository } from './rules.js';
 
+import { reclaimDeletedSessionSandbox } from './sandbox-release.js';
 import {
   commitAll,
-  computeWorktreePath,
-  ensureProjectSandbox,
   isValidGitRef as isValidGitRefSandbox,
-  materializeRepo,
   MaterializeError,
   pushBranch,
-  teardownProjectSandbox,
-  WorktreeError,
+  SetupCommandError,
 } from './sandbox.js';
 import type { GitIdentity } from './sandbox.js';
 
 const sessionOperationLocks = new Map<string, Promise<unknown>>();
-
+const USER_SESSION_BRANCH_PREFIX = 'user/session-';
+// lowercase only (crypto.randomUUID output), so casing cannot fork one logical ID into two sessions
+const UUID_PATTERN = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/;
 /**
  * Serialize same-session mutations within one Factory process. Factory sessions
  * normally issue these operations sequentially, so this lock is probably not
@@ -72,7 +84,7 @@ function withSessionOperationLock<T>(sessionId: string, fn: () => Promise<T>): P
 }
 import { listPullRequestSubscriptionsForThread, subscribeToPullRequest } from './subscriptions.js';
 import { handleGithubWebhook } from './webhook.js';
-import type { GithubIssueTriageRunInput, GithubIssueTriageRunResult, ParsedGithubWebhook } from './webhook.js';
+import type { ParsedGithubWebhook } from './webhook.js';
 
 /**
  * Loose Hono context accepted by the shared GitHub route helpers. The
@@ -83,20 +95,18 @@ import type { GithubIssueTriageRunInput, GithubIssueTriageRunResult, ParsedGithu
  */
 type RouteContext = Context;
 
-/** Erase a route handler's path-parameterized context to a plain `Context`. */
-function loose(c: unknown): RouteContext {
-  return c as RouteContext;
-}
-
 export interface MountGithubRoutesOptions {
   /** Host auth seam — resolves the signed-in user/tenant for each request. */
   auth: RouteAuth;
+  /** Optional user directory used to resolve session-owner display profiles. */
+  users?: SessionOwnerUserProvider;
   /**
-   * Sandbox fleet for per-project sandboxes. A fleet constructed without a
-   * machine config reports `enabled: false` and the sandbox-backed routes
-   * respond 503.
+   * The host's session-sandbox callback. Routes only read whether it is
+   * configured: without one, `/web/github/status` reports
+   * `sandboxEnabled: false` and sandbox-backed routes respond 503. Sandboxes
+   * themselves are constructed per session and started lazily elsewhere.
    */
-  fleet: SandboxFleet;
+  sandbox?: FactorySandbox;
   /** Factory storage backend used for the `appDbConfigured` diagnostic. */
   storage?: FactoryStorage;
   /**
@@ -120,32 +130,20 @@ export interface MountGithubRoutesOptions {
   redirectUri?: string;
   /** Controller used to route verified webhook notifications to exact subscribed sessions. */
   controller?: MountedMastraCode['controller'];
-  /** Run seam used by GitHub webhooks and manual Intake triage. */
-  runIssueTriage?: (input: GithubIssueTriageRunInput) => Promise<GithubIssueTriageRunResult>;
+  /** Owner-scoped observational-memory settings — the source of the model that names a thread. */
+  memorySettings: Pick<MemorySettingsStorage, 'get'>;
   /** Best-effort audit emission supplied by the factory-owned audit domain. */
   emitAudit?: AuditEmitter['emit'];
   /** Factory projects domain — resolves a project's default triage model. */
   projects?: FactoryProjectsStorage;
+  sessionRetirement?: import('../../sandbox/session-retirement.js').SessionRetirementCoordinator;
+  /** Work-items domain — session deletion strips the refs work items hold on it. */
+  workItems?: Pick<
+    import('../../storage/domains/work-items/base.js').WorkItemsStorage,
+    'clearSessionReferences' | 'hasRunBindingForSession'
+  >;
   /** Authoritative Factory rule ingress for normalized, signature-verified GitHub deliveries. */
   ingestFactoryEvent?: (event: ParsedGithubWebhook) => Promise<unknown>;
-}
-
-/**
- * Resolve the Factory project's default model for a triage run. Best-effort:
- * a missing project or an uninitialized storage domain simply means "no
- * default", never a failed run.
- */
-async function resolveFactoryDefaultModelId(
-  projects: FactoryProjectsStorage | undefined,
-  factoryProjectId: string | undefined,
-): Promise<string | undefined> {
-  if (!projects || !factoryProjectId) return undefined;
-  try {
-    const project = await projects.getById({ id: factoryProjectId });
-    return project?.defaultModelId ?? undefined;
-  } catch {
-    return undefined;
-  }
 }
 
 function pullRequestNumberFromUrl(value: string, expectedRepo: string): number | undefined {
@@ -166,22 +164,6 @@ function pullRequestNumberFromUrl(value: string, expectedRepo: string): number |
   }
 }
 
-function isCanonicalGithubIssueUrl(value: string, repoFullName: string, issueNumber: number): boolean {
-  try {
-    const url = new URL(value);
-    const [owner, repo] = repoFullName.split('/');
-    return (
-      url.protocol === 'https:' &&
-      url.hostname === 'github.com' &&
-      url.pathname === `/${owner}/${repo}/issues/${issueNumber}` &&
-      url.search === '' &&
-      url.hash === ''
-    );
-  } catch {
-    return false;
-  }
-}
-
 /**
  * Validate a git branch/ref name against a strict whitelist. The value is later
  * interpolated into a shell `git clone --branch` command, so it must never
@@ -190,6 +172,10 @@ function isCanonicalGithubIssueUrl(value: string, repoFullName: string, issueNum
  */
 function isValidGitRef(value: unknown): value is string {
   return typeof value === 'string' && value.length > 0 && value.length <= 255 && /^[A-Za-z0-9_./-]+$/.test(value);
+}
+
+function isJsonObject(value: unknown): value is Record<string, unknown> {
+  return typeof value === 'object' && value !== null && !Array.isArray(value);
 }
 
 /**
@@ -237,23 +223,18 @@ function parseListPage(raw: string | undefined): number | null {
   return page >= 1 ? page : null;
 }
 
-const VALID_ISSUE_LABEL_FILTERS = new Set(['auto-triaged', 'needs-approval']);
+function parseResourceNumber(raw: string | undefined): number | null {
+  if (raw === undefined || !/^\d{1,10}$/.test(raw)) return null;
+  const parsed = Number(raw);
+  return parsed > 0 ? parsed : null;
+}
+
+const VALID_ISSUE_LABEL_FILTERS = new Set<string>([AUTO_TRIAGED_LABEL, NEEDS_APPROVAL_LABEL]);
 
 function parseIssueLabelFilter(raw: string | undefined): string | undefined | null {
   if (raw === undefined || raw === '') return undefined;
   if (VALID_ISSUE_LABEL_FILTERS.has(raw)) return raw;
   return null;
-}
-
-function parseIssueNumberParam(raw: string | undefined): number | null {
-  if (!raw || !/^\d{1,10}$/.test(raw)) return null;
-  const issueNumber = Number(raw);
-  return Number.isSafeInteger(issueNumber) && issueNumber > 0 ? issueNumber : null;
-}
-
-function parseStringList(value: unknown): string[] {
-  if (!Array.isArray(value)) return [];
-  return value.filter((item): item is string => typeof item === 'string' && item.length > 0);
 }
 
 interface ResolvedProjectRepository extends ProjectRepository {
@@ -306,11 +287,14 @@ function polledIssueEvent(
     title: string;
     url: string;
     author: string | null;
+    assignee: string | null;
+    assignees?: string[];
     labels: string[];
     createdAt: string;
   },
 ): ParsedGithubWebhook {
   const repositoryId = Number(project.repository.externalId);
+  const assigneeLogins = issue.assignees ?? (issue.assignee ? [issue.assignee] : []);
   return {
     event: 'issues',
     deliveryId: `poll:${repositoryId}:issue:${issue.number}:${issue.createdAt}`,
@@ -324,44 +308,59 @@ function polledIssueEvent(
         title: issue.title,
         html_url: issue.url,
         created_at: issue.createdAt,
+        assignees: assigneeLogins.map(login => ({ login })),
         labels: issue.labels.map(name => ({ name })),
       },
     },
   };
 }
 
-function polledPullRequestEvent(
+interface ListedPullRequest {
+  number: number;
+  title: string;
+  url: string;
+  author: string | null;
+  assignees: string[];
+  requestedReviewers: string[];
+  labels: string[];
+  headBranch: string;
+  baseBranch: string;
+  createdAt: string;
+}
+
+function listedPullRequestEvent(
   project: ResolvedProjectRepository,
-  pullRequest: {
-    number: number;
-    title: string;
-    url: string;
-    author: string | null;
-    headBranch: string;
-    baseBranch: string;
-    createdAt: string;
-  },
+  pullRequest: ListedPullRequest,
 ): ParsedGithubWebhook {
-  const repositoryId = Number(project.repository.externalId);
+  return polledPullRequestEvent(
+    reconcileRepositoryOf(project),
+    pullRequest.number,
+    listedOpenPullRequestState(pullRequest),
+  );
+}
+
+function reconcileRepositoryOf(project: ResolvedProjectRepository): ReconcileRepository {
   return {
-    event: 'pull_request',
-    deliveryId: `poll:${repositoryId}:pull-request:${pullRequest.number}:${pullRequest.createdAt}`,
-    payload: {
-      action: 'opened',
-      installation: { id: Number(project.installation.externalId) },
-      repository: { id: repositoryId, full_name: project.repository.slug },
-      sender: { login: pullRequest.author ?? '__unknown__' },
-      pull_request: {
-        number: pullRequest.number,
-        title: pullRequest.title,
-        html_url: pullRequest.url,
-        created_at: pullRequest.createdAt,
-        state: 'open',
-        merged: false,
-        head: { ref: pullRequest.headBranch },
-        base: { ref: pullRequest.baseBranch },
-      },
-    },
+    id: Number(project.repository.externalId),
+    fullName: project.repository.slug,
+    installationId: Number(project.installation.externalId),
+  };
+}
+
+function listedOpenPullRequestState(pullRequest: ListedPullRequest): PolledPullRequestState {
+  return {
+    title: pullRequest.title,
+    url: pullRequest.url,
+    state: 'open',
+    draft: false,
+    merged: false,
+    assignees: pullRequest.assignees,
+    requestedReviewers: pullRequest.requestedReviewers,
+    labels: pullRequest.labels,
+    headBranch: pullRequest.headBranch,
+    baseBranch: pullRequest.baseBranch,
+    author: pullRequest.author ?? undefined,
+    createdAt: pullRequest.createdAt,
   };
 }
 
@@ -372,7 +371,137 @@ async function ingestPolledEvents(
   if (!ingestFactoryEvent) return;
   const results = await Promise.allSettled(events.map(event => ingestFactoryEvent(event)));
   const rejected = results.find((result): result is PromiseRejectedResult => result.status === 'rejected');
-  if (rejected) throw rejected.reason;
+  // Best-effort: a rule-ingress failure must not fail the GitHub list response it piggybacks on.
+  if (rejected) {
+    console.warn('[Mastra Factory] Failed to ingest polled GitHub events', { error: rejected.reason });
+  }
+}
+
+// Under the boards' 30 s issue and pull request polls: a lone board still runs the rules on every poll while passes take under 10 s.
+const POLLED_PAGE_INGEST_REST_MS = 20_000;
+// A stuck pass keeps its page so no other pass piles onto it, but stops holding the boards' lists after this.
+const POLLED_PAGE_INGEST_WAIT_MS = 10_000;
+// Past this a pass is presumed stuck, and the next poll runs the rules again as if it were not there.
+const POLLED_PAGE_INGEST_ABANDON_MS = 120_000;
+
+function waitAtMost(pass: Promise<void>): Promise<void> {
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  const waited = new Promise<void>(resolve => {
+    timer = setTimeout(resolve, POLLED_PAGE_INGEST_WAIT_MS);
+  });
+  return Promise.race([pass, waited]).finally(() => clearTimeout(timer));
+}
+
+/**
+ * One rules pass per listed page at a time, whichever board asked, then a rest: each pass reads the
+ * whole project, and every open board polls the same pages. A board joins a running pass unless it
+ * looks stuck, and a resting page still ingests the issues or pull requests its last pass did not list.
+ * Keys name the feed as well as the page, so an issue page never joins a pull request pass.
+ */
+function createPolledPageIngest() {
+  const running = new Map<string, { startedAt: number; done: Promise<void> }>();
+  const resting = new Map<string, { finishedAt: number; ingested: Set<number> }>();
+  return <T extends { number: number }>(
+    key: string,
+    listed: readonly T[],
+    ingest: (listed: readonly T[]) => Promise<void>,
+  ): Promise<void> => {
+    const pending = running.get(key);
+    if (pending && Date.now() - pending.startedAt < POLLED_PAGE_INGEST_ABANDON_MS) return waitAtMost(pending.done);
+    // Finish order: a key is only set again after it was pruned, so the oldest entries come first.
+    for (const [rested, { finishedAt }] of resting) {
+      if (Date.now() - finishedAt < POLLED_PAGE_INGEST_REST_MS) break;
+      resting.delete(rested);
+    }
+    const rest = resting.get(key);
+    const due = rest ? listed.filter(entry => !rest.ingested.has(entry.number)) : listed;
+    if (due.length === 0) return Promise.resolve();
+    const done = ingest(due).finally(() => {
+      if (running.get(key)?.done !== done) return;
+      running.delete(key);
+      if (rest) for (const entry of due) rest.ingested.add(entry.number);
+      else resting.set(key, { finishedAt: Date.now(), ingested: new Set(due.map(entry => entry.number)) });
+    });
+    running.set(key, { startedAt: Date.now(), done });
+    return waitAtMost(done);
+  };
+}
+
+const LINKED_BACKLOG_MAX_PAGES = 5;
+
+function listedIssueOf(issue: Awaited<ReturnType<GithubIntegration['intake']['listIssues']>>['issues'][number]) {
+  return {
+    number: Number(issue.id),
+    title: issue.title,
+    url: issue.url,
+    author: issue.author,
+    assignee: issue.assignee,
+    assignees: issue.assignees,
+    labels: issue.labels,
+    createdAt: issue.createdAt,
+  };
+}
+
+function listedPullRequestOf(
+  pr: Awaited<ReturnType<GithubIntegration['versionControl']['listPullRequests']>>['pullRequests'][number],
+): ListedPullRequest {
+  return {
+    number: Number(pr.id),
+    title: pr.title,
+    url: pr.url,
+    author: pr.author,
+    assignees: pr.assignees ?? [],
+    requestedReviewers: pr.requestedReviewers ?? [],
+    labels: pr.labels ?? [],
+    headBranch: pr.headBranch,
+    baseBranch: pr.baseBranch,
+    createdAt: pr.createdAt,
+  };
+}
+
+/**
+ * Feed a just-linked repository's open issues and pull requests through the
+ * same rules ingress the list routes use, so its backlog reaches the board
+ * without anyone browsing it. Rows owned by another integration don't resolve
+ * through this integration's storage handle and are skipped.
+ */
+export async function ingestLinkedRepositoryBacklog(args: {
+  github: GithubIntegration;
+  orgId: string;
+  projectRepositoryId: string;
+  ingestFactoryEvent: MountGithubRoutesOptions['ingestFactoryEvent'];
+}): Promise<void> {
+  if (!args.ingestFactoryEvent) return;
+  const project = await resolveProjectRepository(args);
+  if (!project) return;
+  const connection = { type: 'app-installation' as const, installationId: Number(project.installation.externalId) };
+  const sourceId = project.repository.slug;
+
+  for (let page = 1; page <= LINKED_BACKLOG_MAX_PAGES; page += 1) {
+    const { issues, nextCursor } = await args.github.intake.listIssues({
+      connection,
+      sourceIds: [sourceId],
+      cursor: String(page),
+    });
+    await ingestPolledEvents(
+      issues.map(issue => polledIssueEvent(project, listedIssueOf(issue))),
+      args.ingestFactoryEvent,
+    );
+    if (nextCursor === null) break;
+  }
+  for (let page = 1; page <= LINKED_BACKLOG_MAX_PAGES; page += 1) {
+    const { pullRequests, nextCursor } = await args.github.versionControl.listPullRequests({
+      connection,
+      sourceId,
+      includeDrafts: false,
+      cursor: String(page),
+    });
+    await ingestPolledEvents(
+      pullRequests.map(pr => listedPullRequestEvent(project, listedPullRequestOf(pr))),
+      args.ingestFactoryEvent,
+    );
+    if (nextCursor === null) break;
+  }
 }
 
 /**
@@ -381,9 +510,22 @@ async function ingestPolledEvents(
  */
 export function buildGithubRoutes(options: MountGithubRoutesOptions): ApiRoute[] {
   const routes: ApiRoute[] = [];
-  const { auth, fleet, storage, github, stateSigner, emitAudit } = options;
+  const {
+    auth,
+    sandbox,
+    users,
+    storage,
+    github,
+    stateSigner,
+    controller,
+    memorySettings,
+    emitAudit,
+    sessionRetirement,
+    workItems,
+  } = options;
   const diagnostics = () =>
-    getGithubFeatureDiagnostics({ github, auth, appDbConfigured: storage !== undefined, stateSigner, fleet });
+    getGithubFeatureDiagnostics({ github, auth, appDbConfigured: storage !== undefined, stateSigner, sandbox });
+  const ingestPolledPage = createPolledPageIngest();
 
   // The status route is always registered so the SPA can detect the disabled state.
   routes.push(
@@ -411,7 +553,7 @@ export function buildGithubRoutes(options: MountGithubRoutesOptions): ApiRoute[]
         if (!tenant.orgId) {
           return c.json({
             enabled: true,
-            sandboxEnabled: fleet.enabled,
+            sandboxEnabled: !!sandbox,
             organizationRequired: true,
             connected: false,
             installations: [],
@@ -427,7 +569,7 @@ export function buildGithubRoutes(options: MountGithubRoutesOptions): ApiRoute[]
         const connected = rows.length > 0;
         return c.json({
           enabled: true,
-          sandboxEnabled: fleet.enabled,
+          sandboxEnabled: !!sandbox,
           connected,
           installations: rows.map(r => ({
             installationId: Number(r.externalId),
@@ -450,22 +592,6 @@ export function buildGithubRoutes(options: MountGithubRoutesOptions): ApiRoute[]
   const signState = (orgId: string, userId: string): string => stateSigner.sign(orgId, userId);
   const verifyState = (state: string | undefined) => stateSigner.verify(state);
 
-  const { runIssueTriage } = options;
-  const runBoardIssueTriage = runIssueTriage
-    ? async (input: GithubIssueTriageRunInput): Promise<GithubIssueTriageRunResult> => {
-        if (!input.resourceId || !input.projectPath) {
-          throw new Error('GitHub issue triage requires an explicit Factory project repository');
-        }
-        await github.addIssueLabels(input.installationId, input.repository, input.issueNumber, ['auto-triaged']);
-        return runIssueTriage({
-          ...input,
-          defaultModelId:
-            input.defaultModelId ?? (await resolveFactoryDefaultModelId(options.projects, input.resourceId)),
-          labels: input.labels.includes('auto-triaged') ? input.labels : [...input.labels, 'auto-triaged'],
-        });
-      }
-    : undefined;
-
   routes.push(
     registerApiRoute('/web/github/subscriptions', {
       method: 'GET',
@@ -474,20 +600,20 @@ export function buildGithubRoutes(options: MountGithubRoutesOptions): ApiRoute[]
         const tenant = auth.tenant(loose(c));
         if (!tenant?.orgId) return c.json({ error: 'unauthorized' }, 401);
 
+        // Sessions read by session id; resourceId is the older address.
+        const sessionId = c.req.query('sessionId');
         const resourceId = c.req.query('resourceId');
         const threadId = c.req.query('threadId');
-        const sessionScope = c.req.query('scope');
-        if (!resourceId || !threadId) return c.json({ error: 'resourceId and threadId are required' }, 400);
+        const target = !threadId
+          ? null
+          : sessionId
+            ? { orgId: tenant.orgId, sessionId, threadId }
+            : resourceId
+              ? { orgId: tenant.orgId, resourceId, threadId }
+              : null;
+        if (!target) return c.json({ error: 'sessionId (or resourceId) and threadId are required' }, 400);
 
-        const subscriptions = await listPullRequestSubscriptionsForThread(
-          {
-            orgId: tenant.orgId,
-            resourceId,
-            threadId,
-            sessionScope,
-          },
-          github.integrationStorage,
-        );
+        const subscriptions = await listPullRequestSubscriptionsForThread(target, github.integrationStorage);
         return c.json({
           subscriptions: subscriptions.map(subscription => ({
             id: subscription.id,
@@ -505,7 +631,6 @@ export function buildGithubRoutes(options: MountGithubRoutesOptions): ApiRoute[]
       handler: async c => {
         const result = await handleGithubWebhook(loose(c), {
           github,
-          runIssueTriage: runBoardIssueTriage,
           ingestFactoryEvent: options.ingestFactoryEvent,
           ...(options.controller
             ? {
@@ -641,103 +766,64 @@ export function buildGithubRoutes(options: MountGithubRoutesOptions): ApiRoute[]
         const resolved = await resolveOrgTenant(loose(c), auth);
         if ('response' in resolved) return resolved.response;
 
-        const installs = await github.sourceControlStorage.installations.list({ orgId: resolved.tenant.orgId });
+        const orgId = resolved.tenant.orgId;
+        const installs = await github.sourceControlStorage.installations.list({ orgId });
 
         const query = (c.req.query('q') ?? '').toLowerCase();
-        const repos = [];
+        const fresh = c.req.query('refresh') === '1';
+        // List every installation's repositories in parallel — installations
+        // are independent upstream calls, and serial listing multiplied
+        // worst-case latency by installation count.
+        const listed = await Promise.all(
+          installs.map(async inst => {
+            try {
+              return { inst, list: await github.listInstallationRepos(Number(inst.externalId), { fresh }) };
+            } catch (err) {
+              // 403 means this credential may not use the installation (e.g. the
+              // Platform refuses personal-account installations to org API
+              // keys). Skip it so the org's usable installations still list.
+              if ((err as { status?: number }).status === 403) {
+                console.warn(
+                  `[Mastra Factory] skipping GitHub installation ${inst.externalId} (${inst.accountName}): ${(err as Error).message}`,
+                );
+                return { inst, list: [] };
+              }
+              // GitHub 404s when the installation no longer exists for this app
+              // (app uninstalled/reinstalled, or the row was recorded under
+              // different app credentials). Prune the stale row so `/status`
+              // reflects reality and the UI prompts a reconnect, then keep
+              // listing the remaining installations.
+              if ((err as { status?: number }).status !== 404) throw err;
+              console.error(`[Mastra Factory] pruning stale GitHub installation ${inst.externalId} (404 from GitHub)`);
+              await github.sourceControlStorage.installations.delete({ orgId, id: inst.id });
+              return { inst, list: [] };
+            }
+          }),
+        );
+
+        // Filter + dedupe by repo id in installation order — same result
+        // ordering as the previous serial loop.
+        const matches = [];
         const seenRepositoryIds = new Set<number>();
-        for (const inst of installs) {
-          let list;
-          try {
-            list = await github.listInstallationRepos(Number(inst.externalId));
-          } catch (err) {
-            // GitHub 404s when the installation no longer exists for this app
-            // (app uninstalled/reinstalled, or the row was recorded under
-            // different app credentials). Prune the stale row so `/status`
-            // reflects reality and the UI prompts a reconnect, then keep
-            // listing the remaining installations.
-            if ((err as { status?: number }).status !== 404) throw err;
-            console.error(`[Mastra Factory] pruning stale GitHub installation ${inst.externalId} (404 from GitHub)`);
-            await github.sourceControlStorage.installations.delete({ orgId: resolved.tenant.orgId, id: inst.id });
-            continue;
-          }
+        for (const { inst, list } of listed) {
           for (const repo of list) {
             if (query && !repo.fullName.toLowerCase().includes(query)) continue;
             if (seenRepositoryIds.has(repo.id)) continue;
             seenRepositoryIds.add(repo.id);
-            const repository = await github.sourceControlStorage.repositories.upsert({
-              orgId: resolved.tenant.orgId,
-              input: {
-                installationId: inst.id,
-                externalId: repo.id.toString(),
-                slug: repo.fullName,
-                defaultBranch: isValidGitRef(repo.defaultBranch) ? repo.defaultBranch : 'main',
-                providerMetadata: { private: repo.private, owner: repo.owner },
-              },
-            });
-            repos.push({
-              ...repo,
-              installationStorageId: inst.id,
-              repositoryStorageId: repository.id,
-              sandboxProvider: fleet.provider,
-              sandboxWorkdir: fleet.computeWorkdir(repo.fullName),
-            });
+            matches.push({ inst, repo });
           }
         }
+
+        const repos = matches.map(({ inst, repo }) => ({
+          ...repo,
+          installationStorageId: inst.id,
+          sandboxProvider: sandbox ? 'custom' : 'none',
+          // Display only — the runtime workdir is resolved from the
+          // live sandbox at open time. Repositories are persisted only after
+          // selection, so `~/<repo>` is the honest listing-time guess.
+          sandboxWorkdir: `~/${sanitizeSegment(repo.fullName.split('/', 2)[1] || 'repo')}`,
+        }));
         return c.json({ repos });
-      },
-    }),
-  );
-
-  // ── Materialize a project into the caller's per-user sandbox ─────────────
-  routes.push(
-    registerApiRoute('/web/github/projects/:id/ensure', {
-      method: 'POST',
-      requiresAuth: false,
-      handler: async c => {
-        const resolved = await resolveOrgTenant(loose(c), auth);
-        if ('response' in resolved) return resolved.response;
-        const { orgId, userId } = resolved.tenant;
-
-        if (!fleet.enabled) {
-          return c.json({ error: 'sandbox_not_configured', message: 'No sandbox provider is configured.' }, 503);
-        }
-
-        const projectRepositoryId = c.req.param('id');
-        if (!projectRepositoryId) return c.json({ error: 'Project repository not found' }, 404);
-        const project = await resolveProjectRepository({ github, orgId, projectRepositoryId });
-        if (!project) {
-          return c.json({ error: 'Project repository not found' }, 404);
-        }
-
-        // Stream live server-side progress when the client asks for it (EventSource
-        // / fetch with `Accept: text/event-stream`); otherwise fall back to a single
-        // JSON response so non-streaming callers and tests keep working unchanged.
-        const wantsStream = (c.req.header('accept') ?? '').includes('text/event-stream');
-        if (wantsStream) {
-          return streamSSE(loose(c), async stream => {
-            try {
-              const result = await prepareProject({
-                github,
-                fleet,
-                project,
-                userId,
-                onProgress: ev => void stream.writeSSE({ event: 'progress', data: JSON.stringify(ev) }),
-              });
-              await stream.writeSSE({ event: 'done', data: JSON.stringify(result) });
-            } catch (err) {
-              await stream.writeSSE({ event: 'error', data: JSON.stringify(ensureErrorPayload(err).body) });
-            }
-          });
-        }
-
-        try {
-          const result = await prepareProject({ github, fleet, project, userId });
-          return c.json(result);
-        } catch (err) {
-          const { status, body } = ensureErrorPayload(err);
-          return c.json(body, status);
-        }
       },
     }),
   );
@@ -765,18 +851,27 @@ export function buildGithubRoutes(options: MountGithubRoutesOptions): ApiRoute[]
             cursor: String(page),
           });
           const responseIssues = issues.map(issue => ({
+            repositoryId: Number(loaded.project.repository.externalId),
             number: Number(issue.id),
             title: issue.title,
             url: issue.url,
             author: issue.author,
+            assignee: issue.assignee,
+            assignees: issue.assignees,
             labels: issue.labels,
             comments: issue.commentCount ?? 0,
             createdAt: issue.createdAt,
             updatedAt: issue.updatedAt,
           }));
-          await ingestPolledEvents(
-            responseIssues.map(issue => polledIssueEvent(loaded.project, issue)),
-            options.ingestFactoryEvent,
+          // The label is part of the page: the triage feed polls a filtered page beside the unfiltered one.
+          await ingestPolledPage(
+            `issues:${loaded.project.installation.externalId}:${loaded.project.repository.externalId}:${page}:${label ?? ''}`,
+            responseIssues,
+            listed =>
+              ingestPolledEvents(
+                listed.map(issue => polledIssueEvent(loaded.project, issue)),
+                options.ingestFactoryEvent,
+              ),
           );
           return c.json({
             issues: responseIssues,
@@ -792,73 +887,43 @@ export function buildGithubRoutes(options: MountGithubRoutesOptions): ApiRoute[]
     }),
   );
 
-  // ── Manually run issue triage using the same run seam as webhooks ──
   routes.push(
-    registerApiRoute('/web/github/projects/:id/issues/:number/triage', {
-      method: 'POST',
+    registerApiRoute('/web/github/projects/:id/issues/:number', {
+      method: 'GET',
       requiresAuth: false,
       handler: async c => {
-        const owned = await loadOwnedProject({ github, auth, fleet, c: loose(c) });
-        if ('response' in owned) return owned.response;
-        const { project, sandboxRow } = owned;
-        const issueNumber = parseIssueNumberParam(c.req.param('number'));
-        if (issueNumber === null) return c.json({ error: 'invalid_issue_number' }, 400);
-
-        let body: { title?: unknown; url?: unknown; labels?: unknown };
+        const loaded = await loadOrgProject({ github, auth, c: loose(c) });
+        if ('response' in loaded) return loaded.response;
+        const number = parseResourceNumber(c.req.param('number'));
+        if (number === null) return c.json({ error: 'invalid_number' }, 400);
         try {
-          body = await c.req.json();
-        } catch {
-          return c.json({ error: 'Invalid JSON body' }, 400);
+          const detail = await github.intake.getIssue({
+            connection: {
+              type: 'app-installation',
+              installationId: Number(loaded.project.installation.externalId),
+            },
+            sourceId: loaded.project.repository.slug,
+            issueId: String(number),
+          });
+          if (detail === null) return c.json({ error: 'issue_not_found' }, 404);
+          return c.json({
+            number: Number(detail.id),
+            title: detail.title,
+            url: detail.url,
+            author: detail.author,
+            assignee: detail.assignee,
+            labels: detail.labels,
+            comments: detail.commentCount ?? 0,
+            createdAt: detail.createdAt,
+            updatedAt: detail.updatedAt,
+            description: detail.description,
+          });
+        } catch (err) {
+          return c.json(
+            { error: 'github_fetch_failed', message: err instanceof Error ? err.message : String(err) },
+            502,
+          );
         }
-        if (typeof body.title !== 'string' || body.title.trim().length === 0 || body.title.length > 5000) {
-          return c.json({ error: 'invalid_title' }, 400);
-        }
-        if (
-          typeof body.url !== 'string' ||
-          body.url.trim().length === 0 ||
-          body.url.length > 2048 ||
-          !isCanonicalGithubIssueUrl(body.url, project.repository.slug, issueNumber)
-        ) {
-          return c.json({ error: 'invalid_url' }, 400);
-        }
-
-        if (!runIssueTriage) return c.json({ error: 'triage_unavailable' }, 503);
-        const branch = `factory/issue-${issueNumber}`;
-        const projectPath = computeWorktreePath(sandboxRow.sandboxWorkdir, branch);
-        await github.addIssueLabels(Number(project.installation.externalId), project.repository.slug, issueNumber, [
-          'auto-triaged',
-        ]);
-        const result = await runIssueTriage({
-          repository: project.repository.slug,
-          issueNumber,
-          issueTitle: body.title,
-          issueUrl: body.url,
-          labels: parseStringList(body.labels),
-          installationId: Number(project.installation.externalId),
-          resourceId: project.factoryProjectId,
-          projectPath,
-          branch,
-          defaultModelId: await resolveFactoryDefaultModelId(options.projects, project.factoryProjectId),
-        });
-        await emitAudit?.({
-          context: loose(c),
-          input: {
-            action: 'factory.triage.started',
-            factoryProjectId: project.factoryProjectId,
-            projectRepositoryId: project.id,
-            targets: [{ type: 'issue', id: String(issueNumber), name: body.title }],
-            metadata: { issueNumber, branch, threadId: result.threadId },
-          },
-        });
-        return c.json(
-          {
-            ok: true,
-            threadId: result.threadId,
-            projectPath: result.projectPath ?? projectPath,
-            branch: result.branch ?? branch,
-          },
-          202,
-        );
       },
     }),
   );
@@ -884,22 +949,73 @@ export function buildGithubRoutes(options: MountGithubRoutesOptions): ApiRoute[]
             cursor: String(page),
           });
           const responsePullRequests = pullRequests.map(pr => ({
+            repositoryId: Number(loaded.project.repository.externalId),
             number: Number(pr.id),
             title: pr.title,
             url: pr.url,
             author: pr.author,
+            assignees: pr.assignees ?? [],
+            requestedReviewers: pr.requestedReviewers ?? [],
+            labels: pr.labels ?? [],
             baseBranch: pr.baseBranch,
             headBranch: pr.headBranch,
             createdAt: pr.createdAt,
             updatedAt: pr.updatedAt,
           }));
-          await ingestPolledEvents(
-            responsePullRequests.map(pullRequest => polledPullRequestEvent(loaded.project, pullRequest)),
-            options.ingestFactoryEvent,
+          await ingestPolledPage(
+            `prs:${loaded.project.installation.externalId}:${loaded.project.repository.externalId}:${page}`,
+            responsePullRequests,
+            listed =>
+              ingestPolledEvents(
+                listed.map(pullRequest => listedPullRequestEvent(loaded.project, pullRequest)),
+                options.ingestFactoryEvent,
+              ),
           );
           return c.json({
             pullRequests: responsePullRequests,
             nextPage: nextCursor === null ? null : Number(nextCursor),
+          });
+        } catch (err) {
+          return c.json(
+            { error: 'github_fetch_failed', message: err instanceof Error ? err.message : String(err) },
+            502,
+          );
+        }
+      },
+    }),
+  );
+
+  routes.push(
+    registerApiRoute('/web/github/projects/:id/prs/:number', {
+      method: 'GET',
+      requiresAuth: false,
+      handler: async c => {
+        const loaded = await loadOrgProject({ github, auth, c: loose(c) });
+        if ('response' in loaded) return loaded.response;
+        const number = parseResourceNumber(c.req.param('number'));
+        if (number === null) return c.json({ error: 'invalid_number' }, 400);
+        try {
+          const pr = await github.versionControl.getPullRequest({
+            connection: {
+              type: 'app-installation',
+              installationId: Number(loaded.project.installation.externalId),
+            },
+            sourceId: loaded.project.repository.slug,
+            pullRequestId: String(number),
+          });
+          if (pr === null) return c.json({ error: 'pull_request_not_found' }, 404);
+          return c.json({
+            number: Number(pr.id),
+            title: pr.title,
+            url: pr.url,
+            author: pr.author,
+            assignees: pr.assignees ?? [],
+            requestedReviewers: pr.requestedReviewers ?? [],
+            baseBranch: pr.baseBranch,
+            headBranch: pr.headBranch,
+            createdAt: pr.createdAt,
+            updatedAt: pr.updatedAt,
+            description: pr.body,
           });
         } catch (err) {
           return c.json(
@@ -919,7 +1035,10 @@ export function buildGithubRoutes(options: MountGithubRoutesOptions): ApiRoute[]
       handler: async c => {
         const loaded = await loadOrgProject({ github, auth, c: loose(c) });
         if ('response' in loaded) return loaded.response;
-        return c.json({ setupCommand: loaded.project.setupCommand });
+        return c.json({
+          setupCommand: loaded.project.setupCommand,
+          teardownCommand: loaded.project.teardownCommand,
+        });
       },
     }),
   );
@@ -933,36 +1052,50 @@ export function buildGithubRoutes(options: MountGithubRoutesOptions): ApiRoute[]
         const loaded = await loadOrgProject({ github, auth, c: loose(c) });
         if ('response' in loaded) return loaded.response;
 
-        let body: { setupCommand?: unknown };
+        let body: { setupCommand?: unknown; teardownCommand?: unknown };
         try {
           body = await c.req.json();
         } catch {
           return c.json({ error: 'Invalid JSON body' }, 400);
         }
-        if (body.setupCommand !== null && typeof body.setupCommand !== 'string') {
-          return c.json({ error: 'Invalid setupCommand' }, 400);
+
+        const commands = ['setupCommand', 'teardownCommand'] as const;
+        for (const command of commands) {
+          const value = body[command];
+          if (value === undefined) continue;
+          if (value !== null && typeof value !== 'string') {
+            return c.json({ error: `Invalid ${command}` }, 400);
+          }
+          if (typeof value === 'string' && value.length > 2000) {
+            return c.json({ error: `${command} too long (max 2000 characters)` }, 400);
+          }
+          // Reject control characters (except newline/tab). Commands are shell
+          // scripts by design, but escape sequences and NULs can spoof logs or
+          // confuse the sandbox shell.
+          if (typeof value === 'string' && /[\0-\x08\x0b\x0c\x0e-\x1f\x7f]/.test(value)) {
+            return c.json({ error: `${command} contains control characters` }, 400);
+          }
         }
-        if (typeof body.setupCommand === 'string' && body.setupCommand.length > 2000) {
-          return c.json({ error: 'setupCommand too long (max 2000 characters)' }, 400);
-        }
-        // Reject control characters (except newline/tab). The command is a
-        // shell script by design, but escape sequences and NULs have no
-        // legitimate use and can spoof logs or confuse the sandbox shell.
-        if (typeof body.setupCommand === 'string' && /[\0-\x08\x0b\x0c\x0e-\x1f\x7f]/.test(body.setupCommand)) {
-          return c.json({ error: 'setupCommand contains control characters' }, 400);
-        }
-        // An empty/whitespace command means "no setup step".
-        const setupCommand =
-          typeof body.setupCommand === 'string' && body.setupCommand.trim().length > 0
-            ? body.setupCommand.trim()
-            : null;
+
+        const normalizeCommand = (value: unknown): string | null | undefined => {
+          if (value === undefined) return undefined;
+          return typeof value === 'string' && value.trim().length > 0 ? value.trim() : null;
+        };
+        const setupCommand = normalizeCommand(body.setupCommand);
+        const teardownCommand = normalizeCommand(body.teardownCommand);
 
         await github.sourceControlStorage.projectRepositories.update({
           orgId: loaded.project.installation.orgId,
           id: loaded.project.id,
-          input: { setupCommand },
+          input: {
+            ...(setupCommand !== undefined ? { setupCommand } : {}),
+            ...(teardownCommand !== undefined ? { teardownCommand } : {}),
+          },
         });
-        return c.json({ setupCommand });
+        return c.json({
+          setupCommand: setupCommand === undefined ? loaded.project.setupCommand : setupCommand,
+          teardownCommand: teardownCommand === undefined ? loaded.project.teardownCommand : teardownCommand,
+        });
       },
     }),
   );
@@ -1028,7 +1161,19 @@ export function buildGithubRoutes(options: MountGithubRoutesOptions): ApiRoute[]
   );
 
   // ── Sessions / commit / push / PR ────────────────────────────────────────
-  routes.push(...buildProjectGitRoutes({ github, auth, fleet, emitAudit }));
+  routes.push(
+    ...buildProjectGitRoutes({
+      github,
+      auth,
+      sandbox,
+      users,
+      controller,
+      memorySettings,
+      emitAudit,
+      sessionRetirement,
+      workItems,
+    }),
+  );
 
   return routes;
 }
@@ -1043,7 +1188,7 @@ async function loadOrgProject(options: {
   github: GithubIntegration;
   auth: RouteAuth;
   c: RouteContext;
-}): Promise<{ project: ResolvedProjectRepository; userId: string } | { response: Response }> {
+}): Promise<{ project: ResolvedProjectRepository; orgId: string; userId: string } | { response: Response }> {
   const { github, auth, c } = options;
   const resolved = await resolveOrgTenant(c, auth);
   if ('response' in resolved) return { response: resolved.response };
@@ -1057,7 +1202,7 @@ async function loadOrgProject(options: {
   if (!project) {
     return { response: c.json({ error: 'Project repository not found' }, 404) };
   }
-  return { project, userId };
+  return { project, orgId, userId };
 }
 
 /** Derive a commit/author identity from the authenticated host user. */
@@ -1066,120 +1211,10 @@ function identityFromUser(user: unknown): GitIdentity {
   return { name: u?.name ?? null, email: u?.email ?? null };
 }
 
-/**
- * Resolve a live, started sandbox for the caller's per-user sandbox binding. The
- * sandbox must already have been provisioned (`sandboxId` set) — the git write
- * routes never clone, they operate on the existing checkout.
- */
-async function resolveProjectSandbox(options: {
-  fleet: SandboxFleet;
-  sandboxRow: ProjectRepositorySandbox;
-}): Promise<MaterializationSandbox> {
-  const { fleet, sandboxRow } = options;
-  if (!sandboxRow.sandboxId) {
-    throw new MaterializeError('Project sandbox is not provisioned. Open the project first.', 'clone-failed');
-  }
-  return fleet.reattachSandbox(sandboxRow.sandboxId);
-}
-
-/**
- * Load (or create) the caller's per-(project,user) sandbox binding row. The
- * binding inherits its workdir from the org-owned project, but `sandboxId` /
- * `materializedAt` stay null until the user first opens the project.
- */
-async function loadOrCreateSandboxRow(
-  github: GithubIntegration,
-  project: ResolvedProjectRepository,
-  userId: string,
-): Promise<ProjectRepositorySandbox> {
-  return github.sourceControlStorage.sandboxes.getOrCreate({ projectRepository: project, userId });
-}
-
-interface EnsureResult {
-  resourceId: string;
-  factoryProjectId: string;
-  projectRepositoryId: string;
-  sandboxId: string | null;
-  sandboxWorkdir: string;
-}
-
-/**
- * Provision/reattach the caller's sandbox and materialize the repo into it,
- * emitting coarse progress events as each server step happens. Shared by both
- * the JSON and SSE variants of the `/ensure` route. Throws on failure so the
- * caller can shape the response (HTTP status vs SSE `error` event).
- */
-async function prepareProject(options: {
-  github: GithubIntegration;
-  fleet: SandboxFleet;
-  project: ResolvedProjectRepository;
-  userId: string;
-  onProgress?: ProgressFn;
-}): Promise<EnsureResult> {
-  const { github, fleet, project, userId, onProgress } = options;
-  const sandboxRow = await loadOrCreateSandboxRow(github, project, userId);
-  const access = await github.versionControl.getRepositoryAccess({
-    orgId: project.installation.orgId,
-    repositoryId: project.repository.id,
-  });
-  if (!access.authorization) {
-    throw new MaterializeError('Repository access did not include a bearer token.', 'clone-failed');
-  }
-  // The sandbox env token feeds the `gh` CLI — a configured org PAT wins
-  // there. Git clone/pull below keep the minted installation token.
-  const ghCliToken =
-    (await getGithubPat(() => github.integrationStorage, project.installation.orgId)) ?? access.authorization.token;
-  const sandbox = await ensureProjectSandbox({
-    fleet,
-    row: sandboxRow,
-    storage: github.sourceControlStorage.sandboxes,
-    token: ghCliToken,
-    onProgress,
-  });
-  // Re-read the sandbox binding so we have the freshly persisted sandboxId.
-  const fresh = await github.sourceControlStorage.sandboxes.getById({ id: sandboxRow.id });
-  const finalRow = fresh ?? sandboxRow;
-  await materializeRepo({
-    row: finalRow,
-    repoInfo: { repoFullName: project.repository.slug, defaultBranch: project.defaultBranch },
-    sandbox,
-    token: access.authorization.token,
-    storage: github.sourceControlStorage.sandboxes,
-    onProgress,
-  });
-  const result: EnsureResult = {
-    resourceId: project.factoryProjectId,
-    factoryProjectId: project.factoryProjectId,
-    projectRepositoryId: project.id,
-    sandboxId: finalRow.sandboxId,
-    sandboxWorkdir: finalRow.sandboxWorkdir,
-  };
-  const done: PrepareProgress = { phase: 'done', message: 'Workspace ready.' };
-  onProgress?.(done);
-  return result;
-}
-
-/** Shape an /ensure failure into an HTTP status + JSON body (also used as the SSE error payload). */
-function ensureErrorPayload(err: unknown): {
-  status: 429 | 502 | 500;
-  body: { error: string; message: string };
-} {
-  if (err instanceof SandboxBudgetError) {
-    return { status: 429, body: { error: err.code, message: err.message } };
-  }
-  if (err instanceof MaterializeError) {
-    return { status: 502, body: { error: err.code, message: err.message } };
-  }
-  return {
-    status: 500,
-    body: { error: 'materialize_failed', message: err instanceof Error ? err.message : String(err) },
-  };
-}
-
-/** Map a sandbox/worktree error to an actionable HTTP response. */
+/** Map a sandbox/setup-command error to an actionable HTTP response. */
 function gitErrorResponse(c: Context, err: unknown) {
-  if (err instanceof WorktreeError) {
-    return c.json({ error: err.code, message: err.message }, err.code === 'invalid-branch' ? 400 : 502);
+  if (err instanceof SetupCommandError) {
+    return c.json({ error: err.code, message: err.message }, 502);
   }
   if (err instanceof MaterializeError) {
     return c.json({ error: err.code, message: err.message }, 502);
@@ -1188,27 +1223,23 @@ function gitErrorResponse(c: Context, err: unknown) {
 }
 
 /**
- * Load the org-owned project and the caller's per-user sandbox binding for a git
- * route. Centralizes the auth + org/ownership checks every git route shares:
- * the project is scoped by `(id, orgId)`, the sandbox binding by
- * `(projectRepositoryId, userId)`. Returns the tenant, project, and sandbox row, or
- * a ready-to-return error response.
+ * Load the org-owned project for a git route. Centralizes the auth +
+ * org/ownership checks every git route shares: the project is scoped by
+ * `(id, orgId)`. Returns the tenant and project, or a ready-to-return error
+ * response.
  */
 async function loadOwnedProject(options: {
   github: GithubIntegration;
   auth: RouteAuth;
-  fleet: SandboxFleet;
+  sandbox?: FactorySandbox;
   c: RouteContext;
-}): Promise<
-  | { orgId: string; userId: string; project: ResolvedProjectRepository; sandboxRow: ProjectRepositorySandbox }
-  | { response: Response }
-> {
-  const { github, auth, fleet, c } = options;
+}): Promise<{ orgId: string; userId: string; project: ResolvedProjectRepository } | { response: Response }> {
+  const { github, auth, sandbox, c } = options;
   const resolved = await resolveOrgTenant(c, auth);
   if ('response' in resolved) return { response: resolved.response };
   const { orgId, userId } = resolved.tenant;
 
-  if (!fleet.enabled) {
+  if (!sandbox) {
     return {
       response: c.json({ error: 'sandbox_not_configured', message: 'No sandbox provider is configured.' }, 503),
     };
@@ -1222,21 +1253,141 @@ async function loadOwnedProject(options: {
   if (!project) {
     return { response: c.json({ error: 'Project repository not found' }, 404) };
   }
-  const sandboxRow = await loadOrCreateSandboxRow(github, project, userId);
-  return { orgId, userId, project, sandboxRow };
+  return { orgId, userId, project };
+}
+
+/**
+ * One naming per session at a time: a second caller joins the run already in
+ * flight instead of paying for another model call and racing its rename.
+ */
+function createSessionNaming() {
+  const inFlight = new Map<string, Promise<string | null>>();
+  return (sessionId: string, run: () => Promise<string | null>) => {
+    const pending = inFlight.get(sessionId);
+    if (pending) return pending;
+    const started = run().finally(() => inFlight.delete(sessionId));
+    inFlight.set(sessionId, started);
+    return started;
+  };
+}
+
+/**
+ * Name a thread with a stored model id. Resolution has to go through
+ * mastracode's gateway: a bare id handed to core's model router looks for a
+ * process env key instead of the caller's stored provider credentials.
+ */
+function titleModel(modelId: string) {
+  return ({ requestContext }: { requestContext: RequestContext }) =>
+    resolveModel(modelId, { remapForCodexOAuth: true, requestContext });
+}
+
+interface SessionOwnerProfile {
+  id: string;
+  name: string;
+  avatarUrl?: string;
+}
+
+type SessionOwnerUserProvider = Pick<IUserProvider, 'getUser'> & Partial<Pick<IUserProvider, 'getUsers'>>;
+
+/** A screenful of history; GitHub caps its own page at 100. */
+const DEFAULT_COMMIT_PAGE = 20;
+const MAX_COMMIT_PAGE = 100;
+
+const MAX_SESSION_OWNER_PROFILES = 100;
+const MAX_SESSION_OWNER_PROFILE_CACHE_ENTRIES = 500;
+const SESSION_OWNER_PROFILE_TTL_MS = 5 * 60_000;
+
+function createSessionOwnerProfileResolver(users: SessionOwnerUserProvider | undefined) {
+  const cache = new Map<string, { profile?: SessionOwnerProfile; expiresAt: number }>();
+  const cacheProfile = (userId: string, profile: SessionOwnerProfile | undefined, expiresAt: number) => {
+    cache.delete(userId);
+    cache.set(userId, { profile, expiresAt });
+    if (cache.size > MAX_SESSION_OWNER_PROFILE_CACHE_ENTRIES) {
+      const oldestUserId = cache.keys().next().value;
+      if (oldestUserId !== undefined) cache.delete(oldestUserId);
+    }
+  };
+
+  return async (userIds: string[]): Promise<Map<string, SessionOwnerProfile>> => {
+    if (!users) return new Map();
+
+    const requestedUserIds = [...new Set(userIds)].slice(0, MAX_SESSION_OWNER_PROFILES);
+    const profiles = new Map<string, SessionOwnerProfile>();
+    const unresolvedUserIds: string[] = [];
+    const now = Date.now();
+
+    for (const userId of requestedUserIds) {
+      const cached = cache.get(userId);
+      if (!cached || cached.expiresAt <= now) {
+        cache.delete(userId);
+        unresolvedUserIds.push(userId);
+      } else if (cached.profile) {
+        profiles.set(userId, cached.profile);
+      }
+    }
+
+    if (unresolvedUserIds.length === 0) return profiles;
+
+    let resolvedUsers: Array<Awaited<ReturnType<SessionOwnerUserProvider['getUser']>>>;
+    if (users.getUsers) {
+      try {
+        resolvedUsers = await users.getUsers(unresolvedUserIds);
+      } catch (error) {
+        console.warn('[GitHub Sessions] Bulk session owner profile lookup failed; falling back to individual lookups', {
+          error: error instanceof Error ? error.message : String(error),
+        });
+        resolvedUsers = (await Promise.allSettled(unresolvedUserIds.map(userId => users.getUser(userId))))
+          .filter(result => result.status === 'fulfilled')
+          .map(result => result.value);
+      }
+    } else {
+      resolvedUsers = (await Promise.allSettled(unresolvedUserIds.map(userId => users.getUser(userId))))
+        .filter(result => result.status === 'fulfilled')
+        .map(result => result.value);
+    }
+
+    for (const user of resolvedUsers) {
+      if (!user) continue;
+      const name = user.name?.trim() || user.email?.trim();
+      if (!name) continue;
+      profiles.set(user.id, {
+        id: user.id,
+        name,
+        ...(user.avatarUrl ? { avatarUrl: user.avatarUrl } : {}),
+      });
+    }
+
+    const expiresAt = now + SESSION_OWNER_PROFILE_TTL_MS;
+    for (const userId of unresolvedUserIds) {
+      cacheProfile(userId, profiles.get(userId), expiresAt);
+    }
+    return profiles;
+  };
 }
 
 function buildProjectGitRoutes({
   github,
   auth,
-  fleet,
+  sandbox,
+  users,
+  controller,
+  memorySettings,
   emitAudit,
+  sessionRetirement,
+  workItems,
 }: {
   github: GithubIntegration;
   auth: RouteAuth;
-  fleet: SandboxFleet;
+  sandbox?: FactorySandbox;
+  users?: SessionOwnerUserProvider;
+  controller?: MountedMastraCode['controller'];
+  memorySettings: MountGithubRoutesOptions['memorySettings'];
   emitAudit?: AuditEmitter['emit'];
+  sessionRetirement?: MountGithubRoutesOptions['sessionRetirement'];
+  workItems?: MountGithubRoutesOptions['workItems'];
 }): ApiRoute[] {
+  const nameSession = createSessionNaming();
+  const resolveSessionOwnerProfiles = createSessionOwnerProfileResolver(users);
   return [
     // ── Create / list Factory sessions ──────────────────────────────────────
     registerApiRoute('/web/github/projects/:id/sessions', {
@@ -1251,8 +1402,17 @@ function buildProjectGitRoutes({
           ? await resolveProjectRepository({ github, orgId, projectRepositoryId })
           : null;
         if (!project) return c.json({ error: 'Project repository not found' }, 404);
-        const sessions = await github.sourceControlStorage.sessions.list({ projectRepositoryId: project.id, userId });
-        return c.json({ sessions });
+        const sessions = await github.sourceControlStorage.sessions.list({
+          projectRepositoryId: project.id,
+          viewerUserId: userId,
+        });
+        const owners = await resolveSessionOwnerProfiles(sessions.map(session => session.userId));
+        return c.json({
+          sessions: sessions.map(session => {
+            const owner = owners.get(session.userId);
+            return { ...session, ...(owner ? { owner } : {}) };
+          }),
+        });
       },
     }),
     registerApiRoute('/web/github/projects/:id/sessions', {
@@ -1267,23 +1427,88 @@ function buildProjectGitRoutes({
           ? await resolveProjectRepository({ github, orgId, projectRepositoryId })
           : null;
         if (!project) return c.json({ error: 'Project repository not found' }, 404);
-        let body: { branch?: unknown; baseBranch?: unknown };
+        let body: unknown;
         try {
           body = await c.req.json();
         } catch {
           return c.json({ error: 'Invalid JSON body' }, 400);
         }
-        if (!isValidGitRefSandbox(body.branch)) return c.json({ error: 'Invalid branch' }, 400);
-        const baseBranch = body.baseBranch === undefined ? project.defaultBranch : body.baseBranch;
+        if (!isJsonObject(body)) return c.json({ error: 'Invalid JSON body' }, 400);
+        const requestedBaseBranch = body.baseBranch;
+        if (requestedBaseBranch !== undefined && typeof requestedBaseBranch !== 'string') {
+          return c.json({ error: 'Invalid baseBranch' }, 400);
+        }
+        const baseBranch = requestedBaseBranch ?? project.defaultBranch;
         if (!isValidGitRefSandbox(baseBranch)) return c.json({ error: 'Invalid baseBranch' }, 400);
-        const session = await github.sourceControlStorage.sessions.create({
-          sessionId: randomUUID(),
-          projectRepositoryId: project.id,
-          orgId,
-          userId,
-          branch: body.branch,
-          baseBranch,
-        });
+
+        const requestedSessionId = body.sessionId;
+        if (
+          requestedSessionId !== undefined &&
+          (typeof requestedSessionId !== 'string' || !UUID_PATTERN.test(requestedSessionId))
+        ) {
+          return c.json({ error: 'Invalid sessionId' }, 400);
+        }
+        const sessionId = requestedSessionId ?? globalThis.crypto.randomUUID();
+
+        const requestedTitle = body.title;
+        if (requestedTitle !== undefined && typeof requestedTitle !== 'string') {
+          return c.json({ error: 'Invalid title' }, 400);
+        }
+        const normalizedTitle = requestedTitle === undefined ? null : normalizeSessionTitle(requestedTitle);
+
+        const requestedBranch = body.branch;
+        let branch: string;
+        if (requestedBranch === undefined) {
+          branch = `${USER_SESSION_BRANCH_PREFIX}${sessionId}`;
+        } else if (typeof requestedBranch === 'string' && isValidGitRefSandbox(requestedBranch)) {
+          branch = requestedBranch;
+        } else {
+          return c.json({ error: 'Invalid branch' }, 400);
+        }
+
+        if (requestedSessionId !== undefined) {
+          const existing = await github.sourceControlStorage.sessions.getBySessionId(sessionId);
+          if (existing) {
+            if (
+              existing.projectRepositoryId !== project.id ||
+              existing.orgId !== orgId ||
+              existing.userId !== userId ||
+              existing.branch !== branch
+            ) {
+              return c.json({ error: 'Session ID conflict' }, 409);
+            }
+            return c.json({ session: existing });
+          }
+        }
+
+        const session = await github.sourceControlStorage.sessions
+          .create({
+            sessionId,
+            projectRepositoryId: project.id,
+            factoryProjectId: project.factoryProjectId,
+            orgId,
+            userId,
+            branch,
+            baseBranch,
+            title: normalizedTitle,
+            visibility: 'org',
+          })
+          .catch(async error => {
+            if (!(error instanceof UniqueViolationError) || requestedSessionId === undefined) throw error;
+            const conflict = await github.sourceControlStorage.sessions.getBySessionId(sessionId);
+            if (!conflict) throw error;
+            return conflict;
+          });
+        if (
+          requestedSessionId !== undefined &&
+          (session.sessionId !== sessionId ||
+            session.projectRepositoryId !== project.id ||
+            session.orgId !== orgId ||
+            session.userId !== userId ||
+            session.branch !== branch)
+        ) {
+          return c.json({ error: 'Session ID conflict' }, 409);
+        }
         return c.json({ session });
       },
     }),
@@ -1294,10 +1519,16 @@ function buildProjectGitRoutes({
         const resolved = await resolveOrgTenant(loose(c), auth);
         if ('response' in resolved) return resolved.response;
         const session = await github.sourceControlStorage.sessions.getBySessionId(c.req.param('sessionId'));
-        if (!session || session.orgId !== resolved.tenant.orgId || session.userId !== resolved.tenant.userId) {
+        // Private sessions 404 (not 403) for non-owners so their IDs do not
+        // leak existence; the body must match the genuinely-missing case.
+        if (!session || !canViewSourceControlSession(session, resolved.tenant)) {
           return c.json({ error: 'Session not found' }, 404);
         }
-        return c.json({ session });
+        const resourceId = await sessionMemoryResourceId(controller, session, workItems);
+        if (!canReadSessionResource(session, resourceId, resolved.tenant)) {
+          return c.json({ error: 'Session not found' }, 404);
+        }
+        return c.json({ session: { ...session, resourceId } });
       },
     }),
     registerApiRoute('/web/user-sessions/:sessionId', {
@@ -1310,30 +1541,87 @@ function buildProjectGitRoutes({
         if (!session || session.orgId !== resolved.tenant.orgId || session.userId !== resolved.tenant.userId) {
           return c.json({ error: 'Session not found' }, 404);
         }
-        let sandbox: MaterializationSandbox | undefined;
-        if (session.sandboxId) {
-          try {
-            sandbox = await fleet.reattachSandbox(session.sandboxId);
-          } catch {
-            // The provider may already have reclaimed the sandbox.
-          }
-          await fleet.teardownSandbox(
-            {
-              sandboxId: session.sandboxId,
-              setSandboxId: async () => {},
-              clear: async () => {
-                await github.sourceControlStorage.sessions.setSandbox({
-                  id: session.id,
-                  sandboxId: null,
-                  sandboxWorkdir: session.sandboxWorkdir ?? '',
-                });
-              },
-            },
-            sandbox,
-          );
+        try {
+          // Drain the turn's queued filesystem capture while the thread and sandbox still exist.
+          // A failed drain only costs the snapshot; it must not block teardown.
+          await waitForPendingFilesystemCapture(session.sessionId).catch(error => {
+            console.warn('[GitHub Sessions] Failed to drain filesystem capture before delete', {
+              sessionId: session.sessionId,
+              error,
+            });
+          });
+          await controller?.deleteSession({ sessionId: session.sessionId });
+        } catch (error) {
+          console.error('[GitHub Sessions] Failed to tear down live controller session', {
+            sessionId: session.sessionId,
+            error,
+          });
         }
-        await github.sourceControlStorage.sessions.delete(session.id);
+        if (sessionRetirement) {
+          await sessionRetirement.retireSession({
+            sourceControl: github.sourceControlStorage,
+            ...(workItems ? { workItems } : {}),
+            orgId: session.orgId,
+            sessionId: session.sessionId,
+            deleteSession: true,
+          });
+        } else {
+          await workItems?.clearSessionReferences({ orgId: session.orgId, sessionId: session.sessionId });
+          await github.sourceControlStorage.sessions.delete(session.id);
+          void reclaimDeletedSessionSandbox({ session }).catch((error: unknown) => {
+            console.error('[GitHub Sessions] Failed to reclaim sandbox for deleted session', {
+              sessionId: session.sessionId,
+              sandboxId: session.sandboxId,
+              error,
+            });
+          });
+        }
         return c.json({ removed: true });
+      },
+    }),
+
+    // ── Re-name a session's thread with the title model ────────────────────
+    registerApiRoute('/web/user-sessions/:sessionId/title', {
+      method: 'POST',
+      requiresAuth: false,
+      handler: async c => {
+        const resolved = await resolveOrgTenant(loose(c), auth);
+        if ('response' in resolved) return resolved.response;
+        const sessionId = c.req.param('sessionId');
+        const row = await github.sourceControlStorage.sessions.getBySessionId(sessionId);
+        if (!row || row.orgId !== resolved.tenant.orgId || row.userId !== resolved.tenant.userId) {
+          return c.json({ error: 'Session not found' }, 404);
+        }
+        if (!controller) return c.json({ error: 'Sessions are not available on this server.' }, 503);
+
+        const threads = await listFactorySessionThreads(controller, row, workItems);
+        const thread = threads.sort((a, b) => b.updatedAt.getTime() - a.updatedAt.getTime())[0];
+        if (!thread) return c.json({ error: 'This session has no conversation to name yet.' }, 409);
+
+        // A session that is not live carries neither the observer model that names
+        // its threads nor the identity whose provider credentials pay for it.
+        const stored = await memorySettings.get({ orgId: row.orgId, userId: row.userId });
+        const requestContext = new RequestContext();
+        requestContext.set('user', { workosId: row.userId, organizationId: row.orgId });
+        requestContext.set('mastra__factoryMemorySettings', stored);
+
+        try {
+          const title = await nameSession(sessionId, async () => {
+            const generated = await controller.generateThreadTitle({
+              threadId: thread.id,
+              sessionId,
+              requestContext,
+              ...(stored?.observerModelId ? { model: titleModel(stored.observerModelId) } : {}),
+            });
+            const named = generated ? normalizeSessionTitle(generated) : null;
+            if (named) await github.sourceControlStorage.sessions.rename({ sessionId, title: named });
+            return named;
+          });
+          if (!title) return c.json({ error: 'The model returned an empty title. Try again.' }, 502);
+          return c.json({ title });
+        } catch (error) {
+          return c.json({ error: error instanceof Error ? error.message : String(error) }, 500);
+        }
       },
     }),
 
@@ -1342,7 +1630,7 @@ function buildProjectGitRoutes({
       method: 'POST',
       requiresAuth: false,
       handler: async c => {
-        const owned = await loadOwnedProject({ github, auth, fleet, c: loose(c) });
+        const owned = await loadOwnedProject({ github, auth, sandbox, c: loose(c) });
         if ('response' in owned) return owned.response;
         const { userId, project } = owned;
 
@@ -1359,13 +1647,12 @@ function buildProjectGitRoutes({
         if (!sessionWorkspace) {
           return c.json({ error: 'Invalid sessionId' }, 400);
         }
-        const { workdir, sandboxBinding } = sessionWorkspace;
+        const { workdir, sandbox: sessionSandbox } = sessionWorkspace;
 
         try {
           return await withSessionOperationLock(sessionWorkspace.session.sessionId, async () => {
-            const sandbox = await resolveProjectSandbox({ fleet, sandboxRow: sandboxBinding });
             const result = await commitAll(
-              sandbox,
+              sessionSandbox,
               workdir,
               body.message as string,
               identityFromUser(await auth.ensureUser(loose(c))),
@@ -1390,12 +1677,38 @@ function buildProjectGitRoutes({
       },
     }),
 
+    // ── Recent commits on a repository branch ───────────────────────────────
+    registerApiRoute('/web/github/projects/:id/commits', {
+      method: 'GET',
+      requiresAuth: false,
+      handler: async c => {
+        const loaded = await loadOrgProject({ github, auth, c: loose(c) });
+        if ('response' in loaded) return loaded.response;
+        const { orgId, project } = loaded;
+
+        const branch = c.req.query('branch') ?? project.defaultBranch;
+        if (!isValidGitRefSandbox(branch)) return c.json({ error: 'Invalid branch' }, 400);
+        // GitHub takes `per_page` as an integer, so a fractional limit would go out verbatim.
+        const limit = Math.min(
+          Math.max(Math.floor(Number(c.req.query('limit') ?? DEFAULT_COMMIT_PAGE)) || DEFAULT_COMMIT_PAGE, 1),
+          MAX_COMMIT_PAGE,
+        );
+
+        try {
+          const commits = await listRepositoryCommits(github, { orgId, project, branch, limit });
+          return c.json({ commits, branch });
+        } catch (err) {
+          return gitErrorResponse(loose(c), err);
+        }
+      },
+    }),
+
     // ── Push a branch back to GitHub ────────────────────────────────────────
     registerApiRoute('/web/github/projects/:id/push', {
       method: 'POST',
       requiresAuth: false,
       handler: async c => {
-        const owned = await loadOwnedProject({ github, auth, fleet, c: loose(c) });
+        const owned = await loadOwnedProject({ github, auth, sandbox, c: loose(c) });
         if ('response' in owned) return owned.response;
         const { orgId, userId, project } = owned;
 
@@ -1413,17 +1726,16 @@ function buildProjectGitRoutes({
         if (!sessionWorkspace) {
           return c.json({ error: 'Invalid sessionId' }, 400);
         }
-        const { workdir, sandboxBinding } = sessionWorkspace;
+        const { workdir, sandbox: sessionSandbox } = sessionWorkspace;
 
         try {
           return await withSessionOperationLock(sessionWorkspace.session.sessionId, async () => {
-            const sandbox = await resolveProjectSandbox({ fleet, sandboxRow: sandboxBinding });
             const access = await github.versionControl.getRepositoryAccess({
               orgId,
               repositoryId: project.repository.id,
             });
             if (!access.authorization) throw new Error('Repository access did not include a bearer token.');
-            await pushBranch(sandbox, workdir, branch, access.authorization.token, project.repository.slug);
+            await pushBranch(sessionSandbox, workdir, branch, access.authorization.token, project.repository.slug);
             await emitAudit?.({
               context: loose(c),
               input: {
@@ -1447,7 +1759,7 @@ function buildProjectGitRoutes({
       method: 'POST',
       requiresAuth: false,
       handler: async c => {
-        const owned = await loadOwnedProject({ github, auth, fleet, c: loose(c) });
+        const owned = await loadOwnedProject({ github, auth, sandbox, c: loose(c) });
         if ('response' in owned) return owned.response;
         const { orgId, userId, project } = owned;
 
@@ -1521,7 +1833,7 @@ function buildProjectGitRoutes({
                   changeRequestId: pullRequestNumber.toString(),
                   sessionId,
                   ownerId: userId,
-                  resourceId: sessionId,
+                  resourceId: project.factoryProjectId,
                   threadId: sessionId,
                   source: 'factory-pr-create',
                   subscribedByUserId: userId,
@@ -1544,40 +1856,6 @@ function buildProjectGitRoutes({
         }
       },
     }),
-
-    // ── Tear down the caller's sandbox for a project ────────────────────────
-    // Per-user teardown only: drops the caller's `(project, user)` sandbox
-    // binding and stops the VM, freeing a slot in the per-replica budget. Project
-    // deletion at the org level is out of scope (org admin model is later).
-    registerApiRoute('/web/github/projects/:id/sandbox', {
-      method: 'DELETE',
-      requiresAuth: false,
-      handler: async c => {
-        const owned = await loadOwnedProject({ github, auth, fleet, c: loose(c) });
-        if ('response' in owned) return owned.response;
-        const { sandboxRow } = owned;
-
-        if (!sandboxRow.sandboxId) {
-          // Nothing provisioned for this user — idempotent success.
-          return c.json({ tornDown: false });
-        }
-
-        try {
-          return await withSessionOperationLock(`sandbox:${sandboxRow.id}`, async () => {
-            const sandbox = await fleet.reattachSandbox(sandboxRow.sandboxId!);
-            await teardownProjectSandbox({
-              fleet,
-              row: sandboxRow,
-              storage: github.sourceControlStorage.sandboxes,
-              sandbox,
-            });
-            return c.json({ tornDown: true });
-          });
-        } catch (err) {
-          return gitErrorResponse(loose(c), err);
-        }
-      },
-    }),
   ];
 }
 
@@ -1592,25 +1870,18 @@ async function resolveSessionWorkspace(
     return undefined;
   }
   const session = await github.sourceControlStorage.sessions.getBySessionId(sessionId);
-  if (
-    session?.projectRepositoryId !== projectId ||
-    session.userId !== userId ||
-    !session.sandboxId ||
-    !session.sandboxWorkdir
-  ) {
+  if (session?.projectRepositoryId !== projectId || session.userId !== userId) {
     return undefined;
   }
+  // Session sandboxes live in the per-process memo, keyed by the session row
+  // id. Passive resolution only — git write routes never provision. An
+  // unresolved workdir means the sandbox never started here: nothing is
+  // materialized, so there is no workspace to operate on.
+  const entry = peekSessionSandbox(session.id);
+  if (!entry?.workdir) return undefined;
   return {
     session,
-    workdir: session.sandboxWorkdir,
-    sandboxBinding: {
-      id: session.id,
-      projectRepositoryId: session.projectRepositoryId,
-      userId: session.userId,
-      sandboxId: session.sandboxId,
-      sandboxWorkdir: session.sandboxWorkdir,
-      materializedAt: session.materializedAt,
-      createdAt: session.createdAt,
-    },
+    workdir: entry.workdir,
+    sandbox: requireExec(entry.sandbox),
   };
 }

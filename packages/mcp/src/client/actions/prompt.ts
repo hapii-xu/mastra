@@ -1,6 +1,6 @@
 import type { IMastraLogger } from '@mastra/core/logger';
-import { ErrorCode } from '@modelcontextprotocol/sdk/types.js';
-import type { GetPromptResult, Prompt } from '@modelcontextprotocol/sdk/types.js';
+import type { GetPromptResult, Prompt } from '@modelcontextprotocol/client';
+import { ProtocolErrorCode } from '@modelcontextprotocol/client';
 import type { InternalMastraMCPClient } from '../client';
 
 interface PromptClientActionsConfig {
@@ -47,16 +47,15 @@ export class PromptClientActions {
       const response = await this.client.listPrompts();
       if (response && response.prompts && Array.isArray(response.prompts)) {
         return response.prompts.map(prompt => ({ ...prompt }));
-      } else {
-        this.logger.warn('Prompts response did not have expected structure', {
-          server: this.client.name,
-          response,
-        });
-        return [];
       }
+      this.logger.warn('Prompts response did not have expected structure', {
+        server: this.client.name,
+        response,
+      });
+      return [];
     } catch (e: any) {
       // MCP Server might not support prompts, so we return an empty array
-      if (e.code === ErrorCode.MethodNotFound) {
+      if (e.code === ProtocolErrorCode.MethodNotFound) {
         return [];
       }
       this.logger.error('Error getting prompts from server', {
@@ -116,6 +115,6 @@ export class PromptClientActions {
    * ```
    */
   public async onListChanged(handler: () => void): Promise<void> {
-    this.client.setPromptListChangedNotificationHandler(handler);
+    await this.client.setPromptListChangedNotificationHandler(handler);
   }
 }

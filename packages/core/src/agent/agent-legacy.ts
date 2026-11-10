@@ -1,4 +1,3 @@
-import { randomUUID } from 'node:crypto';
 import type { WritableStream } from 'node:stream/web';
 import type { CoreMessage, UIMessage, Tool } from '@internal/ai-sdk-v4';
 import deepEqual from 'fast-deep-equal';
@@ -19,7 +18,9 @@ import type {
 import type { ProviderOptions } from '../llm/model/provider-options';
 import type { MastraModelConfig, TripwireProperties } from '../llm/model/shared.types';
 import type { Mastra } from '../mastra';
+import { createRunScope, createRunScopeKey } from '../mastra/run-scope';
 import type { MastraMemory } from '../memory/memory';
+import { getMemoryRunState, MemoryRunState } from '../memory/run-state';
 import type { MemoryConfigInternal, StorageThreadType } from '../memory/types';
 import type { Span, TracingOptions, TracingProperties, ObservabilityContext } from '../observability';
 import {
@@ -35,8 +36,11 @@ import type { ChunkType } from '../stream/types';
 import type { CoreTool, ToolHooks } from '../tools/types';
 import type { DynamicArgument } from '../types';
 import type { OutputWriter } from '../workflows';
+import { assertThreadOwnedByResource } from './memory-thread-ownership';
 import { MessageList } from './message-list';
 import type { MastraDBMessage, MessageListInput, UIMessageWithMetadata } from './message-list/index';
+import { modelSpanAttributes } from './model-span-attributes';
+import { deriveAgentRunRequestContext, incomingAgentScopes, parseAgentScope, resolveAgentScopes } from './scopes';
 import type {
   ZodSchema,
   AgentGenerateOptions,
@@ -48,6 +52,12 @@ import type {
 } from './types';
 
 import { resolveThreadIdFromArgs } from './utils';
+import {
+  applyClientToolModelOutput,
+  fireClientToolOutputHooks,
+} from './workflows/prepare-stream/client-tool-output-hooks';
+
+const LEGACY_MEMORY_RUN_STATE_KEY = createRunScopeKey<MemoryRunState>('agent-legacy.memoryRunState');
 
 /**
  * Interface for accessing Agent methods needed by the legacy handler.
@@ -78,6 +88,8 @@ export interface AgentLegacyCapabilities {
   }): AgentStreamOptions | Promise<AgentStreamOptions>;
   /** Check if agent has own memory */
   hasOwnMemory(): boolean;
+  /** Get the agent's configured scopes */
+  getScopes(options: { requestContext: RequestContext; scopes?: string[] }): Promise<string[]>;
   /** Get instructions */
   getInstructions(options: { requestContext: RequestContext }): Promise<AgentInstructions>;
   /** Get the agent's LLM instance, optionally using a request-scoped model override */
@@ -234,6 +246,7 @@ export class AgentLegacyHandler {
   private __primitive({
     instructions,
     messages,
+    model,
     context,
     thread,
     memoryConfig,
@@ -248,9 +261,12 @@ export class AgentLegacyHandler {
     inputProcessors,
     providerOptions,
     hooks,
+    runScope,
     ...rest
   }: {
     instructions: AgentInstructions;
+    /** The resolved model this run was prepared with, named on the AGENT_RUN span */
+    model?: { modelId?: unknown; provider?: unknown };
     toolsets?: ToolsetsInput;
     clientTools?: ToolsInput;
     resourceId?: string;
@@ -266,6 +282,7 @@ export class AgentLegacyHandler {
     inputProcessors?: InputProcessorOrWorkflow[];
     providerOptions?: ProviderOptions;
     hooks?: ToolHooks;
+    runScope: ReturnType<typeof createRunScope>;
   } & Partial<ObservabilityContext>) {
     const observabilityContext = resolveObservabilityContext(rest);
     return {
@@ -281,6 +298,7 @@ export class AgentLegacyHandler {
           },
           attributes: {
             instructions: this.capabilities.convertInstructionsToString(instructions),
+            ...modelSpanAttributes(model),
             availableTools: [
               ...(toolsets ? Object.keys(toolsets) : []),
               ...(clientTools ? Object.keys(clientTools) : []),
@@ -319,6 +337,24 @@ export class AgentLegacyHandler {
           inputProcessors,
           hooks,
         });
+
+        // The legacy path has no abort signal to forward to the hook.
+        const fireClientHooks = async () => {
+          await fireClientToolOutputHooks({
+            messages,
+            tools: convertedTools,
+            logger: this.capabilities.logger,
+          });
+          // Enrich ingested client tool results with the server tool's
+          // toModelOutput. The legacy v4 prompt conversion does not consume the
+          // metadata, but it persists with the message so later requests on the
+          // current paths restore the mapped output.
+          await applyClientToolModelOutput({
+            messageList,
+            tools: convertedTools,
+            logger: this.capabilities.logger,
+          });
+        };
 
         let messageList = new MessageList({
           threadId,
@@ -367,6 +403,9 @@ export class AgentLegacyHandler {
               };
             }
           }
+          if (!tripwire) {
+            await fireClientHooks();
+          }
           return {
             messageObjects: tripwire ? [] : messageList.get.all.prompt(),
             convertedTools,
@@ -397,6 +436,12 @@ export class AgentLegacyHandler {
         let threadObject: StorageThreadType | undefined = undefined;
         const existingThread = await memory.getThreadById({ threadId });
         if (existingThread) {
+          assertThreadOwnedByResource({
+            thread: existingThread,
+            resourceId,
+            agentName: this.capabilities.name,
+          });
+
           if (
             (!existingThread.metadata && thread.metadata) ||
             (thread.metadata && !deepEqual(existingThread.metadata, thread.metadata))
@@ -423,11 +468,21 @@ export class AgentLegacyHandler {
           });
         }
 
+        const memoryRunState = new MemoryRunState({
+          memory,
+          threadId,
+          resourceId,
+          thread: threadObject ?? null,
+          ownershipValidated: true,
+        });
+        runScope.set(LEGACY_MEMORY_RUN_STATE_KEY, memoryRunState);
+
         // Set memory context in RequestContext for processors to access
         requestContext.set('MastraMemory', {
           thread: threadObject,
           resourceId,
           memoryConfig,
+          runState: () => runScope.get(LEGACY_MEMORY_RUN_STATE_KEY),
         });
 
         // Add new user messages to the list
@@ -473,6 +528,10 @@ export class AgentLegacyHandler {
               threadExists: !!existingThread,
             };
           }
+        }
+
+        if (!tripwire) {
+          await fireClientHooks();
         }
 
         // Messages are already processed by __runInputProcessors and __runProcessInputStep above
@@ -540,8 +599,10 @@ export class AgentLegacyHandler {
           threadId,
         });
 
-        // re-read the latest thread so metadata written mid-run (working memory, processors) isn't overwritten
         const memory = await this.capabilities.getMemory({ requestContext });
+        const memoryRunState = memory ? getMemoryRunState(requestContext, memory, threadId, resourceId) : undefined;
+        // re-read the latest thread so metadata written mid-run (working memory, processors) isn't overwritten.
+        // This write path stays authoritative and never reads through the run snapshot.
         const thread = (threadId ? await memory?.getThreadById({ threadId }) : undefined) ?? threadAfter;
 
         if (memory && resourceId && thread) {
@@ -565,7 +626,7 @@ export class AgentLegacyHandler {
               messageList.add(responseMessages, 'response');
             }
 
-            if (!threadExists) {
+            if (!threadExists && !memoryRunState?.ownershipValidated) {
               await memory.createThread({
                 threadId: thread.id,
                 metadata: thread.metadata,
@@ -602,15 +663,16 @@ export class AgentLegacyHandler {
                 promises.push(
                   this.capabilities
                     .genTitle(userMessage, requestContext, observabilityContext, titleModel, titleInstructions)
-                    .then(title => {
-                      if (title) {
-                        return memory.createThread({
-                          threadId: thread.id,
-                          resourceId,
-                          memoryConfig,
-                          title,
-                          metadata: thread.metadata,
-                        });
+                    .then(async title => {
+                      if (!title) return;
+                      // Update-only: the thread may have been deleted while the title was generating (#25203).
+                      if (!(await memory.getThreadById({ threadId: thread.id }))) return;
+                      try {
+                        await memory.updateThread({ id: thread.id, title, memoryConfig });
+                      } catch (error) {
+                        // A delete can still land between the check and the update; only swallow that case.
+                        if (!(await memory.getThreadById({ threadId: thread.id }))) return;
+                        throw error;
                       }
                     }),
                 );
@@ -757,7 +819,7 @@ export class AgentLegacyHandler {
       clientTools,
       temperature,
       toolChoice = 'auto',
-      requestContext = new RequestContext(),
+      requestContext: callerRequestContext = new RequestContext(),
       tracingOptions,
       savePerStep,
       writableStream,
@@ -769,15 +831,35 @@ export class AgentLegacyHandler {
     // Reserved keys from requestContext take precedence for security.
     // This allows middleware to securely set resourceId/threadId based on authenticated user,
     // preventing attackers from hijacking another user's memory by passing different values in the body.
-    const resourceIdFromContext = requestContext.get(MASTRA_RESOURCE_ID_KEY) as string | undefined;
-    const threadIdFromContext = requestContext.get(MASTRA_THREAD_ID_KEY) as string | undefined;
+    // Scopes from the reserved `mastra__scopes` key set the identity when they carry
+    // `resource:`/`thread:` and throw on conflict (see resolveAgentScopes).
+    const resourceIdFromContext = callerRequestContext.get(MASTRA_RESOURCE_ID_KEY) as string | undefined;
+    const threadIdFromContext = callerRequestContext.get(MASTRA_THREAD_ID_KEY) as string | undefined;
+    const incomingScopes = incomingAgentScopes({
+      requestContext: callerRequestContext,
+      mastra: this.capabilities.mastra,
+    });
+    const resolvedScopes = resolveAgentScopes({
+      requestContext: callerRequestContext,
+      agentScopes: await this.capabilities.getScopes({ requestContext: callerRequestContext, scopes: incomingScopes }),
+      incomingScopes,
+      memory: args.memory as { resource?: string; thread?: string | { id: string } } | undefined,
+      resourceId: resourceIdFromArgs,
+      threadId: args.threadId,
+      mastra: this.capabilities.mastra,
+    });
+    const requestContext = deriveAgentRunRequestContext(callerRequestContext, resolvedScopes.scopes);
+    const hasResourceScope = resolvedScopes.scopes.some(scope => parseAgentScope(scope)?.type === 'resource');
+    const hasThreadScope = resolvedScopes.scopes.some(scope => parseAgentScope(scope)?.type === 'thread');
 
     const threadFromArgs = resolveThreadIdFromArgs({
       threadId: args.threadId,
       memory: args.memory,
-      overrideId: threadIdFromContext,
+      overrideId: hasThreadScope ? resolvedScopes.threadId : threadIdFromContext,
     });
-    const resourceId = resourceIdFromContext || (args.memory as any)?.resource || resourceIdFromArgs;
+    const resourceId = hasResourceScope
+      ? resolvedScopes.resourceId
+      : resourceIdFromContext || (args.memory as any)?.resource || resourceIdFromArgs;
     const memoryConfig = (args.memory as any)?.options || memoryConfigFromArgs;
 
     if (resourceId && threadFromArgs && !this.capabilities.hasOwnMemory()) {
@@ -794,7 +876,7 @@ export class AgentLegacyHandler {
         threadId: threadFromArgs?.id,
         resourceId,
       }) ||
-      randomUUID();
+      globalThis.crypto.randomUUID();
     const instructions = args.instructions || (await this.capabilities.getInstructions({ requestContext }));
     const llm = await this.capabilities.getLLM({
       requestContext,
@@ -802,10 +884,12 @@ export class AgentLegacyHandler {
     });
 
     const memory = await this.capabilities.getMemory({ requestContext });
+    const runScope = createRunScope();
 
     const { before, after } = this.__primitive({
       messages,
       instructions,
+      model: llm.getModel(),
       context,
       thread: threadFromArgs,
       memoryConfig,
@@ -820,6 +904,7 @@ export class AgentLegacyHandler {
       inputProcessors,
       providerOptions: args.providerOptions,
       hooks,
+      runScope,
       ...resolveObservabilityContext(args as Partial<ObservabilityContext>),
     });
 
@@ -990,7 +1075,7 @@ export class AgentLegacyHandler {
         usage: { totalTokens: 0, promptTokens: 0, completionTokens: 0 },
         finishReason: 'other',
         response: {
-          id: randomUUID(),
+          id: globalThis.crypto.randomUUID(),
           timestamp: new Date(),
           modelId: 'tripwire',
           messages: [],
@@ -1065,7 +1150,7 @@ export class AgentLegacyHandler {
           usage: { totalTokens: 0, promptTokens: 0, completionTokens: 0 },
           finishReason: 'other',
           response: {
-            id: randomUUID(),
+            id: globalThis.crypto.randomUUID(),
             timestamp: new Date(),
             modelId: 'tripwire',
             messages: [],
@@ -1195,7 +1280,7 @@ export class AgentLegacyHandler {
         usage: { totalTokens: 0, promptTokens: 0, completionTokens: 0 },
         finishReason: 'other',
         response: {
-          id: randomUUID(),
+          id: globalThis.crypto.randomUUID(),
           timestamp: new Date(),
           modelId: 'tripwire',
           messages: [],
@@ -1341,7 +1426,7 @@ export class AgentLegacyHandler {
         finishReason: Promise.resolve('other'),
         tripwire: beforeResult.tripwire,
         response: {
-          id: randomUUID(),
+          id: globalThis.crypto.randomUUID(),
           timestamp: new Date(),
           modelId: 'tripwire',
           messages: [],

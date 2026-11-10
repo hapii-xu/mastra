@@ -1,0 +1,54 @@
+import type { PermissionPolicy, ToolCategory } from '@mastra/client-js';
+import { toast } from '@mastra/playground-ui/components/Toaster';
+import type { ReactNode } from 'react';
+
+import { useAgentControllerPermissions } from '../../../../hooks/useAgentControllerPermissions';
+import { useSetPermissionForCategoryMutation } from '../../../../hooks/useAgentControllerPermissionMutations';
+import { AGENT_CONTROLLER_ID } from '../services/constants';
+import { ChatPermissionsContext } from './ChatPermissionsContext';
+import type { ChatPermissionsApi } from './ChatPermissionsContext';
+import { useChatSessionContext } from './useChatSessionContext';
+
+interface ChatPermissionsProviderProps {
+  children: ReactNode;
+}
+
+export function ChatPermissionsProvider({ children }: ChatPermissionsProviderProps) {
+  const { sessionId, baseUrl, sessionEnabled, resourceReady, resourceEnabled, sandboxPreparing } =
+    useChatSessionContext();
+  const commonArgs = {
+    agentControllerId: AGENT_CONTROLLER_ID,
+    sessionId,
+    baseUrl,
+  };
+  // Read permissions as soon as the resource is addressable — the read is
+  // resource-keyed and does not require the sandbox. Session-less factory
+  // surfaces (routed Settings pages) still address the factory-level session.
+  const permissionsQuery = useAgentControllerPermissions({
+    ...commonArgs,
+    enabled: resourceReady || (resourceEnabled && Boolean(sessionId)),
+  });
+  // In-session writes wait for sandboxReady (= sessionEnabled). Sessionless
+  // Settings pages keep the factory-level resource path, which has no sandbox
+  // preparation window to wait for.
+  const setPermissionForCategoryMutation = useSetPermissionForCategoryMutation({
+    ...commonArgs,
+    enabled: sessionEnabled || (resourceEnabled && Boolean(sessionId) && !sandboxPreparing),
+  });
+
+  const setPermissionForCategory = async (category: ToolCategory, policy: PermissionPolicy) => {
+    try {
+      await setPermissionForCategoryMutation.mutateAsync({ category, policy });
+    } catch {
+      toast.error('Could not update the permission. Please try again.');
+    }
+  };
+
+  const value: ChatPermissionsApi = {
+    permissions: permissionsQuery.data,
+    permissionsLoading: permissionsQuery.isLoading,
+    setPermissionForCategory,
+  };
+
+  return <ChatPermissionsContext.Provider value={value}>{children}</ChatPermissionsContext.Provider>;
+}

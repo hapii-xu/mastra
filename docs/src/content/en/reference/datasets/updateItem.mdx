@@ -1,6 +1,6 @@
 ---
 title: "Reference: dataset.updateItem() | Datasets"
-description: "Documentation for the `dataset.updateItem()` method, which updates an existing item in a dataset."
+description: "Use dataset.updateItem() to change selected fields on an existing dataset item while validating data and preserving dataset version history."
 packages:
   - "@mastra/core"
 ---
@@ -24,6 +24,7 @@ const updated = await dataset.updateItem({
   itemId: 'item-id',
   input: { question: 'What is TypeScript?' },
   groundTruth: { answer: 'A typed superset of JavaScript' },
+  scorerIds: null,
   metadata: { reviewed: true },
 })
 ```
@@ -50,10 +51,48 @@ const updated = await dataset.updateItem({
     description: 'Updated ground truth.',
   },
   {
+    name: 'expectedTrajectory',
+    type: 'unknown',
+    isOptional: true,
+    description: 'Updated expected trajectory for trajectory scorers.',
+  },
+  {
+    name: 'toolMocks',
+    type: 'DatasetItemToolMock[]',
+    isOptional: true,
+    description:
+      "Updated static tool mocks used during experiments. Each mock has `toolName`, `args`, `output`, and an optional `matchArgs` (`'strict' | 'ignore'`).",
+  },
+  {
+    name: 'unmockedToolPolicy',
+    type: "'allow' | 'deny'",
+    isOptional: true,
+    description: 'Overrides how the experiment handles tool calls that are not declared in `toolMocks`.',
+  },
+  {
+    name: 'requestContext',
+    type: 'Record<string, unknown>',
+    isOptional: true,
+    description: 'Updated request context applied when the item runs.',
+  },
+  {
+    name: 'scorerIds',
+    type: 'string[] | null',
+    isOptional: true,
+    description:
+      'Scorer IDs that override dataset-attached scorers for this item. Use `[]` to run no scorers, `null` to remove the override and restore dataset inheritance, or omit the field to preserve the current value.',
+  },
+  {
     name: 'metadata',
     type: 'Record<string, unknown>',
     isOptional: true,
     description: 'Updated metadata.',
+  },
+  {
+    name: 'source',
+    type: "{ type: 'csv' | 'json' | 'trace' | 'llm' | 'experiment-result' | 'candidate-screener'; referenceId?: string }",
+    isOptional: true,
+    description: 'Updated provenance of the item.',
   },
 ]}
 />

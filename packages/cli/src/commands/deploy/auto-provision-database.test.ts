@@ -7,28 +7,35 @@ import { maybeAutoProvisionDatabases } from './auto-provision-database.js';
 
 const {
   confirmMock,
+  selectMock,
   cancelMock,
   logErrorMock,
   logSuccessMock,
+  logWarnMock,
   spinnerMock,
   attachDatabaseMock,
   pollDatabaseUntilReadyMock,
+  fetchDatabaseCatalogMock,
 } = vi.hoisted(() => ({
   confirmMock: vi.fn(),
+  selectMock: vi.fn(),
   cancelMock: vi.fn(),
   logErrorMock: vi.fn(),
   logSuccessMock: vi.fn(),
+  logWarnMock: vi.fn(),
   spinnerMock: { start: vi.fn(), stop: vi.fn(), message: vi.fn() },
   attachDatabaseMock: vi.fn(),
   pollDatabaseUntilReadyMock: vi.fn(),
+  fetchDatabaseCatalogMock: vi.fn(),
 }));
 
 vi.mock('@clack/prompts', () => ({
   confirm: (args: unknown) => confirmMock(args),
+  select: (args: unknown) => selectMock(args),
   cancel: (args: unknown) => cancelMock(args),
   isCancel: (v: unknown) => v === Symbol.for('clack.cancel'),
   spinner: () => spinnerMock,
-  log: { error: logErrorMock, success: logSuccessMock },
+  log: { error: logErrorMock, success: logSuccessMock, warn: logWarnMock },
 }));
 
 vi.mock('../db/platform-api.js', async () => {
@@ -37,8 +44,21 @@ vi.mock('../db/platform-api.js', async () => {
     ...actual,
     attachDatabase: (...args: unknown[]) => attachDatabaseMock(...args),
     pollDatabaseUntilReady: (...args: unknown[]) => pollDatabaseUntilReadyMock(...args),
+    fetchDatabaseCatalog: (...args: unknown[]) => fetchDatabaseCatalogMock(...args),
   };
 });
+
+const FULL_CATALOG = [
+  { kind: 'turso', name: 'Turso', status: 'available' },
+  { kind: 'neon', name: 'Postgres', status: 'available' },
+  { kind: 'redis', name: 'Redis', status: 'available' },
+  { kind: 'mongodb', name: 'MongoDB', status: 'coming_soon' },
+];
+
+// The Railway-hosted VPC Postgres provider is opt-in per org, so it isn't in
+// the default fixture — tests that exercise the neon-vs-postgres choice add
+// it explicitly.
+const CATALOG_WITH_VPC_POSTGRES = [...FULL_CATALOG, { kind: 'postgres', name: 'Postgres (VPC)', status: 'available' }];
 
 function makeCtx(overrides: Partial<AutoProvisionContext> = {}): AutoProvisionContext {
   return {
@@ -75,6 +95,17 @@ function neonIssue(overrides: Partial<PreflightIssue> = {}): PreflightIssue {
   };
 }
 
+function redisIssue(overrides: Partial<PreflightIssue> = {}): PreflightIssue {
+  return {
+    code: 'LOCAL_STORAGE_PATH',
+    severity: 'error',
+    message: 'RedisStreamsPubSub cannot connect at runtime because REDIS_URL is not set',
+    fix: 'mastra env db create --kind redis',
+    autofix: { kind: 'create-managed-database', provider: 'redis', envVarName: 'REDIS_URL' },
+    ...overrides,
+  };
+}
+
 function unrelatedIssue(): PreflightIssue {
   return {
     code: 'MISSING_ENV_VAR',
@@ -91,14 +122,19 @@ describe('maybeAutoProvisionDatabases', () => {
 
   beforeEach(() => {
     confirmMock.mockReset();
+    selectMock.mockReset();
     cancelMock.mockReset();
     logErrorMock.mockReset();
     logSuccessMock.mockReset();
     spinnerMock.start.mockReset();
     spinnerMock.stop.mockReset();
     spinnerMock.message.mockReset();
+    logWarnMock.mockReset();
     attachDatabaseMock.mockReset();
     pollDatabaseUntilReadyMock.mockReset();
+    fetchDatabaseCatalogMock.mockReset();
+    // Default: platform offers every provisionable kind.
+    fetchDatabaseCatalogMock.mockResolvedValue(FULL_CATALOG);
     // Default: interactive TTY.
     (process.stdin as unknown as { isTTY: boolean }).isTTY = true;
     (process.stdout as unknown as { isTTY: boolean }).isTTY = true;
@@ -148,21 +184,39 @@ describe('maybeAutoProvisionDatabases', () => {
 
   it('provisions when the user confirms, drops the resolved issue, and reports the injected vars', async () => {
     confirmMock.mockResolvedValue(true);
-    attachDatabaseMock.mockResolvedValue({ id: 'db-1', name: 'my-app-db', kind: 'turso' });
-    pollDatabaseUntilReadyMock.mockResolvedValue({ id: 'db-1', name: 'my-app-db', kind: 'turso' });
+    attachDatabaseMock.mockResolvedValue({ id: 'db-1', name: 'my-app-turso', kind: 'turso' });
+    pollDatabaseUntilReadyMock.mockResolvedValue({ id: 'db-1', name: 'my-app-turso', kind: 'turso' });
 
     const issues = [tursoIssue(), unrelatedIssue()];
     const result = await maybeAutoProvisionDatabases(issues, makeCtx());
 
     expect(attachDatabaseMock).toHaveBeenCalledWith('t', 'org-1', 'proj-1', {
       kind: 'turso',
-      name: 'my-app-db',
+      name: 'my-app-turso',
       environmentId: 'env-prod',
     });
     expect(pollDatabaseUntilReadyMock).toHaveBeenCalled();
     expect(result.issues.map(i => i.code)).toEqual(['MISSING_ENV_VAR']);
     expect(result.provisioned).toHaveLength(1);
     expect(result.newlyManagedEnvVarNames).toEqual(['TURSO_DATABASE_URL', 'TURSO_AUTH_TOKEN']);
+  });
+
+  it('provisions a managed Redis when the user confirms and reports REDIS_URL as newly managed', async () => {
+    confirmMock.mockResolvedValue(true);
+    attachDatabaseMock.mockResolvedValue({ id: 'db-redis-1', name: 'my-app-redis', kind: 'redis' });
+    pollDatabaseUntilReadyMock.mockResolvedValue({ id: 'db-redis-1', name: 'my-app-redis', kind: 'redis' });
+
+    const issues = [redisIssue()];
+    const result = await maybeAutoProvisionDatabases(issues, makeCtx());
+
+    expect(attachDatabaseMock).toHaveBeenCalledWith('t', 'org-1', 'proj-1', {
+      kind: 'redis',
+      name: 'my-app-redis',
+      environmentId: 'env-prod',
+    });
+    expect(result.issues).toEqual([]);
+    expect(result.provisioned).toHaveLength(1);
+    expect(result.newlyManagedEnvVarNames).toEqual(['REDIS_URL']);
   });
 
   it('leaves the issue in place when the user declines', async () => {
@@ -244,10 +298,42 @@ describe('maybeAutoProvisionDatabases', () => {
     );
   });
 
+  it('skips providers the platform catalog does not offer this org (feature-flag gate)', async () => {
+    // The platform hides `redis` from the catalog when the org's
+    // `managed-redis` flag is off — the CLI must mirror the dashboard and
+    // not offer it, while still handling ungated providers.
+    fetchDatabaseCatalogMock.mockResolvedValue(FULL_CATALOG.filter(entry => entry.kind !== 'redis'));
+    confirmMock.mockResolvedValue(true);
+    attachDatabaseMock.mockResolvedValue({ id: 'db-1', name: 'my-app-turso', kind: 'turso' });
+    pollDatabaseUntilReadyMock.mockResolvedValue({ id: 'db-1', name: 'my-app-turso', kind: 'turso' });
+
+    const issues = [redisIssue(), tursoIssue()];
+    const result = await maybeAutoProvisionDatabases(issues, makeCtx());
+
+    expect(confirmMock).toHaveBeenCalledTimes(1);
+    expect(attachDatabaseMock).toHaveBeenCalledTimes(1);
+    expect(attachDatabaseMock).toHaveBeenCalledWith('t', 'org-1', 'proj-1', expect.objectContaining({ kind: 'turso' }));
+    // The redis issue survives untouched for the normal issue printer.
+    expect(result.issues.map(i => i.autofix?.provider)).toEqual(['redis']);
+    expect(result.newlyManagedEnvVarNames).toEqual(['TURSO_DATABASE_URL', 'TURSO_AUTH_TOKEN']);
+  });
+
+  it('fails closed and skips all prompting when the catalog cannot be fetched', async () => {
+    fetchDatabaseCatalogMock.mockRejectedValue(new Error('boom'));
+
+    const issues = [tursoIssue()];
+    const result = await maybeAutoProvisionDatabases(issues, makeCtx());
+
+    expect(result.issues).toBe(issues);
+    expect(confirmMock).not.toHaveBeenCalled();
+    expect(attachDatabaseMock).not.toHaveBeenCalled();
+    expect(logWarnMock).toHaveBeenCalledWith(expect.stringContaining('boom'));
+  });
+
   it('derives an env-suffixed default name for non-production environments', async () => {
     confirmMock.mockResolvedValue(true);
-    attachDatabaseMock.mockResolvedValue({ id: 'db-1', name: 'my-app-eu-db', kind: 'turso' });
-    pollDatabaseUntilReadyMock.mockResolvedValue({ id: 'db-1', name: 'my-app-eu-db', kind: 'turso' });
+    attachDatabaseMock.mockResolvedValue({ id: 'db-1', name: 'my-app-eu-turso', kind: 'turso' });
+    pollDatabaseUntilReadyMock.mockResolvedValue({ id: 'db-1', name: 'my-app-eu-turso', kind: 'turso' });
 
     await maybeAutoProvisionDatabases(
       [tursoIssue()],
@@ -258,14 +344,14 @@ describe('maybeAutoProvisionDatabases', () => {
       't',
       'org-1',
       'proj-1',
-      expect.objectContaining({ name: 'my-app-eu-db' }),
+      expect.objectContaining({ name: 'my-app-eu-turso' }),
     );
   });
 
   it('keeps the canonical unsuffixed name for the production environment', async () => {
     confirmMock.mockResolvedValue(true);
-    attachDatabaseMock.mockResolvedValue({ id: 'db-1', name: 'my-app-db', kind: 'turso' });
-    pollDatabaseUntilReadyMock.mockResolvedValue({ id: 'db-1', name: 'my-app-db', kind: 'turso' });
+    attachDatabaseMock.mockResolvedValue({ id: 'db-1', name: 'my-app-turso', kind: 'turso' });
+    pollDatabaseUntilReadyMock.mockResolvedValue({ id: 'db-1', name: 'my-app-turso', kind: 'turso' });
 
     await maybeAutoProvisionDatabases(
       [tursoIssue()],
@@ -276,7 +362,65 @@ describe('maybeAutoProvisionDatabases', () => {
       't',
       'org-1',
       'proj-1',
-      expect.objectContaining({ name: 'my-app-db' }),
+      expect.objectContaining({ name: 'my-app-turso' }),
     );
+  });
+
+  describe('multi-candidate providers (DATABASE_URL: neon vs postgres)', () => {
+    it('presents a choice between Neon and the VPC Postgres when both are in the catalog', async () => {
+      fetchDatabaseCatalogMock.mockResolvedValue(CATALOG_WITH_VPC_POSTGRES);
+      selectMock.mockResolvedValue('postgres');
+      attachDatabaseMock.mockResolvedValue({ id: 'db-1', name: 'my-app-postgres', kind: 'postgres' });
+      pollDatabaseUntilReadyMock.mockResolvedValue({ id: 'db-1', name: 'my-app-postgres', kind: 'postgres' });
+
+      const result = await maybeAutoProvisionDatabases([neonIssue()], makeCtx());
+
+      // The single-provider confirm() is not used when there's a real choice.
+      expect(confirmMock).not.toHaveBeenCalled();
+      expect(selectMock).toHaveBeenCalledTimes(1);
+      const selectArgs = selectMock.mock.calls[0]![0] as { options: { value: string; label: string }[] };
+      expect(selectArgs.options.map(o => o.value)).toEqual(['neon', 'postgres', 'skip']);
+      // The user picked postgres — that's what's attached, not the primary neon.
+      expect(attachDatabaseMock).toHaveBeenCalledWith('t', 'org-1', 'proj-1', {
+        kind: 'postgres',
+        name: 'my-app-postgres',
+        environmentId: 'env-prod',
+      });
+      expect(result.provisioned.map(d => d.kind)).toEqual(['postgres']);
+      expect(result.newlyManagedEnvVarNames).toEqual(['DATABASE_URL']);
+      expect(result.issues).toEqual([]);
+    });
+
+    it('falls back to the yes/no confirm when the VPC Postgres is not offered', async () => {
+      // FULL_CATALOG has neon but no postgres — the choice collapses back to
+      // the single-provider prompt.
+      confirmMock.mockResolvedValue(true);
+      attachDatabaseMock.mockResolvedValue({ id: 'db-1', name: 'my-app-pg', kind: 'neon' });
+      pollDatabaseUntilReadyMock.mockResolvedValue({ id: 'db-1', name: 'my-app-pg', kind: 'neon' });
+
+      const result = await maybeAutoProvisionDatabases([neonIssue()], makeCtx());
+
+      expect(selectMock).not.toHaveBeenCalled();
+      expect(confirmMock).toHaveBeenCalledTimes(1);
+      expect(attachDatabaseMock).toHaveBeenCalledWith(
+        't',
+        'org-1',
+        'proj-1',
+        expect.objectContaining({ kind: 'neon' }),
+      );
+      expect(result.provisioned.map(d => d.kind)).toEqual(['neon']);
+    });
+
+    it('leaves the issue in place when the user picks "skip" in the choice prompt', async () => {
+      fetchDatabaseCatalogMock.mockResolvedValue(CATALOG_WITH_VPC_POSTGRES);
+      selectMock.mockResolvedValue('skip');
+
+      const issues = [neonIssue()];
+      const result = await maybeAutoProvisionDatabases(issues, makeCtx());
+
+      expect(attachDatabaseMock).not.toHaveBeenCalled();
+      expect(result.issues).toBe(issues);
+      expect(result.provisioned).toEqual([]);
+    });
   });
 });

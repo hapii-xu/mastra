@@ -1,6 +1,6 @@
 ---
 title: "Reference: Mastra client SDK | Client SDK"
-description: Learn how to interact with Mastra using the client-js SDK.
+description: "The Mastra Client SDK provides a type-safe interface for interacting with your Mastra Server from your client environment."
 packages:
   - "@mastra/client-js"
 ---
@@ -105,6 +105,18 @@ You can also pass `requestContext` as a `Record<string, any>`.
     description: 'Retrieves a specific agent instance by ID.',
   },
   {
+    name: 'listAgentControllers()',
+    type: 'Promise<AgentControllerInfo[]>',
+    description:
+      "Returns the agent controllers hosted on the connected Mastra instance. Each entry's `id` is the key the controller is registered under in `new Mastra({ agentControllers })`.",
+  },
+  {
+    name: 'getAgentController(controllerId)',
+    type: 'AgentController',
+    description:
+      'Retrieves a specific agent controller by the key it is registered under in `new Mastra({ agentControllers })`, which can differ from the controller `id`. `.session(sessionId)` returns a session client; call `await session.create()` to create or resume the server session.',
+  },
+  {
     name: 'listMemoryThreads(params)',
     type: 'Promise<StorageThreadType[]>',
     description:
@@ -152,15 +164,15 @@ You can also pass `requestContext` as a `Record<string, any>`.
   },
   {
     name: 'getAgentBuilderActions()',
-    type: 'Promise<Record<string, WorkflowInfo>>',
+    type: 'Promise<GetAgentBuilderActionsResponse>',
     description:
-      'Returns all available Agent Builder actions. See [Agent Builder API](/reference/client-js/agent-builder).',
+      'Returns all available Agent Builder actions. See [Agent Builder API](https://agent-builder.mastra.ai/reference/client).',
   },
   {
     name: 'getAgentBuilderAction(actionId)',
     type: 'AgentBuilder',
     description:
-      'Retrieves an Agent Builder action by ID. See [Agent Builder API](/reference/client-js/agent-builder).',
+      'Retrieves an Agent Builder action by ID. See [Agent Builder API](https://agent-builder.mastra.ai/reference/client).',
   },
   {
     name: 'responses',
@@ -172,6 +184,12 @@ You can also pass `requestContext` as a `Record<string, any>`.
     name: 'conversations',
     type: 'Conversations',
     description: 'Provides conversation helpers with `create()`, `retrieve()`, `delete()`, and `items.list()`.',
+  },
+  {
+    name: 'resumeBackgroundTask(backgroundTaskId, resumeData, options?)',
+    type: 'Promise<BackgroundTaskResponse>',
+    description:
+      "Answers a suspended [background task](/docs/harness/background-tasks#answer-a-suspended-task-from-a-client) with `resumeData` and returns the task. Pass `options.suspendedAt` (a `Date`, ISO string, or epoch milliseconds) from the task you read; the server rejects the answer with `409` if the task has resumed or suspended again since. Also rejects with `409` when the task isn't suspended or no concurrency slot is free, and `404` when the task doesn't exist or belongs to another resource.",
   },
   {
     name: 'getVector(vectorName)',
@@ -203,6 +221,11 @@ You can also pass `requestContext` as a `Record<string, any>`.
     type: 'Promise<GetTracesResponse>',
     description:
       'Retrieves paginated list of trace root spans with optional filtering. Use getTrace() to get complete traces with all spans.',
+  },
+  {
+    name: 'deleteTraces(params)',
+    type: 'Promise<{ success: true }>',
+    description: 'Deletes traces by ID and cascades deletion to their trace-linked observability signals.',
   },
 ]}
 />

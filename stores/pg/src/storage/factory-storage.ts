@@ -1,5 +1,3 @@
-import { randomUUID } from 'node:crypto';
-
 import { FactoryStorage, UniqueViolationError } from '@mastra/core/storage';
 import type {
   CollectionColumnSpec,
@@ -15,7 +13,11 @@ import type {
 import pg from 'pg';
 import type { Pool, PoolClient } from 'pg';
 
+import { guardCheckedOutClientErrors } from '../shared/pool-error-guard';
+import { toPgJson } from './db/sanitize-json';
 import { PostgresStore } from './index';
+
+export { guardCheckedOutClientErrors } from '../shared/pool-error-guard';
 
 export type PgFactoryStorageConfig =
   | {
@@ -131,7 +133,7 @@ class PgFactoryStorageOps implements FactoryStorageOps {
         return Boolean(value);
       case 'json':
         // Explicit stringify: node-pg would otherwise turn JS arrays into pg arrays.
-        return JSON.stringify(value);
+        return toPgJson(value);
       case 'bigint':
       case 'integer':
         return Number(value);
@@ -156,7 +158,10 @@ class PgFactoryStorageOps implements FactoryStorageOps {
           row[name] = Boolean(value);
           break;
         case 'json':
-          row[name] = typeof value === 'string' ? JSON.parse(value) : value;
+          // node-pg parses JSONB through its type parsers, so `value` is
+          // already the stored JSON value. Parsing again would throw on a JSON
+          // string scalar (the whole column reads back as a JS string).
+          row[name] = value;
           break;
         case 'bigint':
         case 'integer':
@@ -294,13 +299,23 @@ class PgFactoryStorageOps implements FactoryStorageOps {
     return this.#select<T>(this.#queryable, collection, where, opts);
   }
 
+  async count(collection: string, where: CollectionWhere): Promise<number> {
+    const schema = this.#schema(collection);
+    const filter = this.#buildWhere(schema, where);
+    const result = await this.#queryable.query(
+      `SELECT COUNT(*) AS count FROM "${schema.name}" WHERE ${filter.sql}`,
+      filter.args,
+    );
+    return Number(result.rows[0]?.count ?? 0);
+  }
+
   async insertOne<T extends Record<string, unknown>>(collection: string, row: Partial<T>): Promise<T> {
     const schema = this.#schema(collection);
     const pk = primaryKeyOf(schema);
 
     const values: Record<string, unknown> = { ...row };
     if (schema.columns[pk]!.type === 'uuid-pk' && values[pk] === undefined) {
-      values[pk] = randomUUID();
+      values[pk] = globalThis.crypto.randomUUID();
     }
 
     const columns = Object.keys(values).filter(column => values[column] !== undefined);
@@ -372,8 +387,13 @@ class PgFactoryStorageOps implements FactoryStorageOps {
     const assignments = columns.map((column, i) => `"${column}" = $${i + 1}`).join(', ');
     const filter = this.#buildWhere(schema, where, columns.length + 1);
     const args = [...columns.map(column => this.#serialize(this.#column(schema, column), set[column])), ...filter.args];
-    const result = await queryable.query(`UPDATE "${schema.name}" SET ${assignments} WHERE ${filter.sql}`, args);
-    return result.rowCount ?? 0;
+    try {
+      const result = await queryable.query(`UPDATE "${schema.name}" SET ${assignments} WHERE ${filter.sql}`, args);
+      return result.rowCount ?? 0;
+    } catch (error) {
+      if (isUniqueViolation(error)) throw new UniqueViolationError(collection, { cause: error });
+      throw error;
+    }
   }
 
   async deleteMany(collection: string, where: CollectionWhere): Promise<number> {
@@ -449,6 +469,17 @@ export class PgFactoryStorage extends FactoryStorage {
     } else {
       this.#pool = new pg.Pool({ connectionString: config.connectionString });
       this.#ownsPool = true;
+      // pg emits 'error' on the pool when an idle client's connection drops
+      // (backend restart, network partition, local address changes). Without a
+      // listener Node escalates the event to an uncaughtException and crashes
+      // the process. Only pools this storage creates get the listener — a
+      // wrapped store keeps its own listeners, mirroring close().
+      this.#pool.on('error', err => {
+        console.warn(
+          `PgFactoryStorage: idle pool client error (pool discards the client and reconnects on next checkout): ${err instanceof Error ? err.message : String(err)}`,
+        );
+      });
+      guardCheckedOutClientErrors(this.#pool);
     }
     this.ops = new PgFactoryStorageOps(this.#pool, this.#schemas);
   }
@@ -551,6 +582,19 @@ export class PgFactoryStorage extends FactoryStorage {
     for (const [name, spec] of Object.entries(schema.columns)) {
       if (!spec.nullable || spec.type === 'uuid-pk' || spec.primaryKey) continue;
       await this.#pool.query(`ALTER TABLE "${schema.name}" ALTER COLUMN "${name}" DROP NOT NULL`);
+    }
+
+    // Widening evolution: a column now declared bigint may still be the
+    // INTEGER an older schema created, which epoch-ms values overflow.
+    for (const [name, spec] of Object.entries(schema.columns)) {
+      if (spec.type !== 'bigint') continue;
+      const { rows } = await this.#pool.query<{ data_type: string }>(
+        `SELECT data_type FROM information_schema.columns WHERE table_schema = current_schema() AND table_name = $1 AND column_name = $2`,
+        [schema.name, name],
+      );
+      if (rows[0]?.data_type === 'integer') {
+        await this.#pool.query(`ALTER TABLE "${schema.name}" ALTER COLUMN "${name}" TYPE BIGINT`);
+      }
     }
 
     for (const index of schema.uniqueIndexes ?? []) {

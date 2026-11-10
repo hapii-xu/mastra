@@ -58,6 +58,58 @@ describe('deployer browser session probe', () => {
     await expect(response.json()).resolves.toEqual({ hasSession: false, screencastAvailable: true });
   });
 
+  it('skips setupBrowserStream and registers fallback when browser streaming is disabled', async () => {
+    const setupBrowserStreamMock = vi.fn().mockResolvedValue({ injectWebSocket: () => {}, registry: {} });
+    vi.doMock('@mastra/hono', async () => {
+      const actual = await vi.importActual<typeof MastraHono>('@mastra/hono');
+      return {
+        ...actual,
+        setupBrowserStream: setupBrowserStreamMock,
+      };
+    });
+
+    const { createHonoServer } = await import('../index');
+    const mastra = new Mastra({ logger: false });
+    const app = await createHonoServer(mastra, { tools: {}, browserStream: false });
+
+    expect(setupBrowserStreamMock).not.toHaveBeenCalled();
+
+    const response = await app.request('http://localhost/api/agents/some-agent/browser/session');
+    expect(response.status).toBe(200);
+    await expect(response.json()).resolves.toEqual({ hasSession: false, screencastAvailable: false });
+  });
+
+  it('resolves a workspace-level CLI browser through getToolset when the agent has no agent-level browser', async () => {
+    const setupBrowserStreamMock = vi.fn().mockResolvedValue({ injectWebSocket: () => {}, registry: {} });
+    vi.doMock('@mastra/hono', async () => {
+      const actual = await vi.importActual<typeof MastraHono>('@mastra/hono');
+      return {
+        ...actual,
+        setupBrowserStream: setupBrowserStreamMock,
+      };
+    });
+
+    const { Agent } = await import('@mastra/core/agent');
+    const { createHonoServer } = await import('../index');
+
+    const agent = new Agent({
+      id: 'cli-browser-agent',
+      name: 'cli-browser-agent',
+      instructions: 'test',
+      model: {} as any,
+    });
+    const workspaceBrowser = { providerType: 'cli', hasThreadSession: () => false };
+    vi.spyOn(agent, 'getWorkspace').mockResolvedValue({ id: 'ws', browser: workspaceBrowser } as any);
+
+    const mastra = new Mastra({ logger: false, agents: { 'cli-browser-agent': agent } });
+    await createHonoServer(mastra, { tools: {} });
+
+    const config = setupBrowserStreamMock.mock.calls[0]![1];
+    await expect(config.getToolset('cli-browser-agent')).resolves.toBe(workspaceBrowser);
+    // Unknown agents still resolve to undefined
+    await expect(config.getToolset('missing-agent')).resolves.toBeUndefined();
+  });
+
   it('mounts the fallback under a custom apiPrefix and forwards it to setupBrowserStream', async () => {
     const setupBrowserStreamMock = vi.fn().mockResolvedValue(null);
     vi.doMock('@mastra/hono', async () => {
@@ -88,5 +140,45 @@ describe('deployer browser session probe', () => {
     const defaultResponse = await app.request('http://localhost/api/agents/some-agent/browser/session');
     const defaultBody = defaultResponse.status === 200 ? await defaultResponse.json().catch(() => null) : null;
     expect(defaultBody).not.toEqual({ hasSession: false, screencastAvailable: false });
+  });
+
+  it('forwards an explicitly configured CORS origin as the browser stream origin allowlist', async () => {
+    const setupBrowserStreamMock = vi.fn().mockResolvedValue({ injectWebSocket: () => {}, registry: {} });
+    vi.doMock('@mastra/hono', async () => {
+      const actual = await vi.importActual<typeof MastraHono>('@mastra/hono');
+      return {
+        ...actual,
+        setupBrowserStream: setupBrowserStreamMock,
+      };
+    });
+
+    const { createHonoServer } = await import('../index');
+    const mastra = new Mastra({ logger: false, server: { cors: { origin: 'https://studio.example.com' } } });
+    await createHonoServer(mastra, { tools: {} });
+
+    expect(setupBrowserStreamMock).toHaveBeenCalledWith(
+      expect.anything(),
+      expect.objectContaining({ allowedOrigins: 'https://studio.example.com' }),
+    );
+  });
+
+  it('leaves the browser stream origin allowlist unset when no CORS origin is configured', async () => {
+    const setupBrowserStreamMock = vi.fn().mockResolvedValue({ injectWebSocket: () => {}, registry: {} });
+    vi.doMock('@mastra/hono', async () => {
+      const actual = await vi.importActual<typeof MastraHono>('@mastra/hono');
+      return {
+        ...actual,
+        setupBrowserStream: setupBrowserStreamMock,
+      };
+    });
+
+    const { createHonoServer } = await import('../index');
+    // The deployer reflects the request origin by default, so an unconfigured
+    // install must not be turned into a restrictive allowlist.
+    const mastra = new Mastra({ logger: false, server: { cors: { credentials: true } } });
+    await createHonoServer(mastra, { tools: {} });
+
+    const config = setupBrowserStreamMock.mock.calls[0]![1];
+    expect(config.allowedOrigins).toBeUndefined();
   });
 });

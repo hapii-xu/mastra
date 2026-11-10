@@ -39,11 +39,14 @@ const FALLBACK_PERMISSIONS = {
   AGENTS_DELETE: 'agents:delete',
   AGENTS_EXECUTE: 'agents:execute',
   AGENTS_READ: 'agents:read',
+  KNOWLEDGE_READ: 'knowledge:read',
   MEMORY_DELETE: 'memory:delete',
   MEMORY_READ: 'memory:read',
   MEMORY_WRITE: 'memory:write',
   TOOLS_EXECUTE: 'tools:execute',
   TOOLS_READ: 'tools:read',
+  STORED_WORKFLOWS_READ: 'stored-workflows:read',
+  STORED_WORKFLOWS_WRITE: 'stored-workflows:write',
   WORKFLOWS_EXECUTE: 'workflows:execute',
   WORKFLOWS_READ: 'workflows:read',
 } as const;
@@ -57,4 +60,5 @@ const realPermissions = (authEE as any).MastraFGAPermissions;
 // accesses (`MastraFGAPermissions.AGENTS_READ`) flow through cleanly on every
 // supported core.
 export const MastraFGAPermissions: any =
-  realPermissions && Object.keys(realPermissions).length > 0 ? realPermissions : FALLBACK_PERMISSIONS;
+  // Merge so a core that exports the map without a newer key (older than this PR) still resolves it.
+  { ...FALLBACK_PERMISSIONS, ...(realPermissions ?? {}) };

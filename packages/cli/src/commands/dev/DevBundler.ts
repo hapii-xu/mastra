@@ -24,16 +24,24 @@ interface FsRoutingWatchOptions {
   preparedEntry: PrepareFsAgentsEntryResult;
 }
 
-function collectInstructionPaths(agents: DiscoveredFsAgent[]): string[] {
+/**
+ * Files whose contents are inlined into the generated fs-agents module rather
+ * than imported by it. Rollup can't see them through the module graph, so the
+ * dev watcher has to register them explicitly or edits won't trigger a rebuild.
+ */
+function collectInlinedPaths(agents: DiscoveredFsAgent[]): string[] {
   return agents.flatMap(agent => [
     ...(agent.instructionsPath ? [agent.instructionsPath] : []),
-    ...collectInstructionPaths(agent.subagents),
+    ...(agent.schedules ?? []).flatMap(schedule => (schedule.kind === 'markdown' ? [schedule.path] : [])),
+    ...collectInlinedPaths(agent.subagents),
   ]);
 }
 
 export class DevBundler extends Bundler {
   private customEnvFile?: string;
   private factory: boolean;
+  /** Resolved `bundler.sourcemap`, set by {@link watch}. */
+  sourcemapEnabled = false;
 
   constructor(customEnvFile?: string, factory = false) {
     super('Dev');
@@ -49,21 +57,13 @@ export class DevBundler extends Bundler {
       return Promise.resolve([]);
     }
 
-    const possibleFiles = ['.env.development', '.env.local', '.env'];
+    const possibleFiles = ['.env', '.env.local', '.env.development'];
     if (this.customEnvFile) {
-      possibleFiles.unshift(this.customEnvFile);
+      const customEnvFiles = new FileService().getExistingFiles([this.customEnvFile]);
+      if (customEnvFiles.length > 0) return Promise.resolve(customEnvFiles);
     }
 
-    try {
-      const fileService = new FileService();
-      const envFile = fileService.getFirstExistingFile(possibleFiles);
-
-      return Promise.resolve([envFile]);
-    } catch {
-      // ignore
-    }
-
-    return Promise.resolve([]);
+    return Promise.resolve(new FileService().getExistingFiles(possibleFiles));
   }
 
   async prepare(outputDirectory: string): Promise<void> {
@@ -109,12 +109,16 @@ export class DevBundler extends Bundler {
     const envFiles = await this.getEnvFiles();
     const bundlerOptions = await this.getUserBundlerOptions(entryFile, outputDirectory);
     const sourcemapEnabled = !!bundlerOptions?.sourcemap;
+    this.sourcemapEnabled = sourcemapEnabled;
 
     const devServerAnalysisEntry = `
       import { scoreTracesWorkflow } from '@mastra/core/evals/scoreTraces';
       import { createNodeServer, getToolExports } from '#server';
       export { scoreTracesWorkflow, createNodeServer, getToolExports };
     `;
+    // Tool files aren't reachable from the entry, so analyze them too; otherwise workspace
+    // packages lose exports that only tools import.
+    const toolsInputOptions = await this.listToolsInputOptions(toolsPaths);
     const inputOptions = await getWatcherInputOptions(
       entryFile,
       this.platform,
@@ -123,10 +127,10 @@ export class DevBundler extends Bundler {
       },
       {
         sourcemap: sourcemapEnabled,
-        analysisEntries: [entryFile, devServerAnalysisEntry],
+        analysisEntries: [entryFile, devServerAnalysisEntry, ...Object.values(toolsInputOptions)],
+        outputDir: join(outputDirectory, this.analyzeOutputDir),
       },
     );
-    const toolsInputOptions = await this.listToolsInputOptions(toolsPaths);
 
     const outputDir = join(outputDirectory, this.outputDir);
 
@@ -167,8 +171,8 @@ export class DevBundler extends Bundler {
               }
 
               const agents = await discoverFsAgents(fsRoutingWatchOptions.mastraDir);
-              for (const instructionsPath of collectInstructionPaths(agents)) {
-                this.addWatchFile(resolve(instructionsPath));
+              for (const inlinedPath of collectInlinedPaths(agents)) {
+                this.addWatchFile(resolve(inlinedPath));
               }
 
               const nextEntry = await prepareFsAgentsEntry(

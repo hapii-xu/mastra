@@ -1,5 +1,81 @@
 # @mastra/auth-supabase
 
+## 1.1.6
+
+### Patch Changes
+
+- dependencies updates: ([#28417](https://github.com/mastra-ai/mastra/pull/28417))
+  - Updated dependency [`@supabase/supabase-js@^2.118.0` ↗︎](https://www.npmjs.com/package/@supabase/supabase-js/v/2.118.0) (from `^2.110.9`, in `dependencies`)
+  - Updated dependency [`@types/node@22.19.15` ↗︎](https://www.npmjs.com/package/@types/node/v/22.19.15) (from `22.20.5`, in `devDependencies`)
+
+## 1.1.6-alpha.0
+
+### Patch Changes
+
+- dependencies updates: ([#28417](https://github.com/mastra-ai/mastra/pull/28417))
+  - Updated dependency [`@supabase/supabase-js@^2.118.0` ↗︎](https://www.npmjs.com/package/@supabase/supabase-js/v/2.118.0) (from `^2.110.9`, in `dependencies`)
+  - Updated dependency [`@types/node@22.19.15` ↗︎](https://www.npmjs.com/package/@types/node/v/22.19.15) (from `22.20.5`, in `devDependencies`)
+
+## 1.1.5
+
+### Patch Changes
+
+- Bump for npm ([#27221](https://github.com/mastra-ai/mastra/pull/27221))
+
+## 1.1.5-alpha.0
+
+### Patch Changes
+
+- Bump for npm ([#27221](https://github.com/mastra-ai/mastra/pull/27221))
+
+## 1.1.4
+
+### Patch Changes
+
+- Update README to include accurate, up-to-date information ([#22858](https://github.com/mastra-ai/mastra/pull/22858))
+
+- Remove `CHANGELOG.md` from distributed npm files resulting in reduced package size ([#22737](https://github.com/mastra-ai/mastra/pull/22737))
+
+## 1.1.4-alpha.1
+
+### Patch Changes
+
+- Update README to include accurate, up-to-date information ([#22858](https://github.com/mastra-ai/mastra/pull/22858))
+
+## 1.1.4-alpha.0
+
+### Patch Changes
+
+- Remove `CHANGELOG.md` from distributed npm files resulting in reduced package size ([#22737](https://github.com/mastra-ai/mastra/pull/22737))
+
+## 1.1.3
+
+### Patch Changes
+
+- dependencies updates: ([#20500](https://github.com/mastra-ai/mastra/pull/20500))
+  - Updated dependency [`@supabase/supabase-js@^2.110.9` ↗︎](https://www.npmjs.com/package/@supabase/supabase-js/v/2.110.9) (from `^2.110.8`, in `dependencies`)
+
+## 1.1.3-alpha.0
+
+### Patch Changes
+
+- dependencies updates: ([#20500](https://github.com/mastra-ai/mastra/pull/20500))
+  - Updated dependency [`@supabase/supabase-js@^2.110.9` ↗︎](https://www.npmjs.com/package/@supabase/supabase-js/v/2.110.9) (from `^2.110.8`, in `dependencies`)
+
+## 1.1.2
+
+### Patch Changes
+
+- dependencies updates: ([#19779](https://github.com/mastra-ai/mastra/pull/19779))
+  - Updated dependency [`@supabase/supabase-js@^2.110.8` ↗︎](https://www.npmjs.com/package/@supabase/supabase-js/v/2.110.8) (from `^2.108.0`, in `dependencies`)
+
+## 1.1.2-alpha.0
+
+### Patch Changes
+
+- dependencies updates: ([#19779](https://github.com/mastra-ai/mastra/pull/19779))
+  - Updated dependency [`@supabase/supabase-js@^2.110.8` ↗︎](https://www.npmjs.com/package/@supabase/supabase-js/v/2.110.8) (from `^2.108.0`, in `dependencies`)
+
 ## 1.1.1
 
 ### Patch Changes

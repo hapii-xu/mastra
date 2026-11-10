@@ -1,3 +1,4 @@
+import { AsyncLocalStorage } from 'node:async_hooks';
 import { TripWire } from '../agent/trip-wire';
 import type { ActorSignal } from '../auth/ee';
 import { RequestContext } from '../di';
@@ -5,10 +6,14 @@ import { MastraError, MastraNonRetryableError, ErrorDomain, ErrorCategory } from
 import type { SerializedError } from '../error';
 import { getErrorFromUnknown } from '../error/utils.js';
 import type { PubSub } from '../events/pubsub';
-import type { ObservabilityContext, Span, SpanType, TracingPolicy } from '../observability';
-import { createObservabilityContext } from '../observability';
+import type { ObservabilityContext, Span, SpanType, TracingPolicy, SpanOutcomeFields } from '../observability';
+import { createObservabilityContext, getResumeTracingContext } from '../observability';
+import { MASTRA_AUTH_TOKEN_KEY } from '../request-context';
+import { deepEqual } from '../utils/deep-equal';
+import { WORKFLOW_CANCELLED_SYMBOL } from './constants';
 import type { ExecutionGraph } from './execution-engine';
 import { ExecutionEngine } from './execution-engine';
+import { workflowTermination } from './execution-outcome';
 import type {
   ExecuteConditionalParams,
   ExecuteForeachParams,
@@ -22,21 +27,31 @@ import {
   executeParallel as executeParallelHandler,
 } from './handlers/control-flow';
 import type { ExecuteEntryParams, PersistStepUpdateParams } from './handlers/entry';
-import { executeEntry as executeEntryHandler, persistStepUpdate as persistStepUpdateHandler } from './handlers/entry';
+import {
+  executeEntry as executeEntryHandler,
+  isWorkflowRunCanceled,
+  persistStepUpdate as persistStepUpdateHandler,
+} from './handlers/entry';
 import type { ExecuteSleepParams, ExecuteSleepUntilParams } from './handlers/sleep';
 import { executeSleep as executeSleepHandler, executeSleepUntil as executeSleepUntilHandler } from './handlers/sleep';
 import type { ExecuteStepParams } from './handlers/step';
 import { executeStep as executeStepHandler } from './handlers/step';
+import { rebaseNestedState, withoutNestedRunStartState } from './nested-state';
+import { lazyStepResults, RunJournal } from './run-journal';
+import type { StateBase } from './run-journal';
 import type { ConditionFunction, ConditionFunctionParams, Step } from './step';
+import { createMappingStep, createStepFromAgent, createStepFromClassifier, createStepFromTool } from './step-factories';
 import type {
   FormattedWorkflowResult,
   DefaultEngineType,
   EntryExecutionResult,
   ExecutionContext,
   MutableContext,
+  NestedWorkflowParent,
   OutputWriter,
   RestartExecutionParams,
   SerializedStepFlowEntry,
+  SingleStepEntry,
   StepExecutionResult,
   StepFailure,
   StepFlowEntry,
@@ -44,21 +59,53 @@ import type {
   StepTripwireInfo,
   TimeTravelExecutionParams,
   WorkflowRunStatus,
+  WorkflowStateTracingContext,
 } from './types';
+// Used by the per-type execute methods (executeAgent/executeTool/executeMapping)
+// to build a runnable step from a declarative entry.
+import {
+  abortableSleep,
+  getRestartStartIndex,
+  getSingleStepEntryId,
+  omitPriorCompletionFields,
+  getStepIds,
+} from './utils';
 
 // Re-export ExecutionContext for backwards compatibility
 export type { ExecutionContext } from './types';
+
+/** Params for the per-type execute methods: the same context `executeStep` takes,
+ * with the declarative graph entry instead of a pre-built `step`. */
+export type ExecuteAgentParams = Omit<ExecuteStepParams, 'step'> & {
+  entry: Extract<SingleStepEntry, { type: 'agent' }>;
+};
+export type ExecuteToolParams = Omit<ExecuteStepParams, 'step'> & { entry: Extract<SingleStepEntry, { type: 'tool' }> };
+export type ExecuteClassifierParams = Omit<ExecuteStepParams, 'step'> & {
+  entry: Extract<SingleStepEntry, { type: 'classifier' }>;
+};
+export type ExecuteMappingParams = Omit<ExecuteStepParams, 'step'> & {
+  entry: Extract<SingleStepEntry, { type: 'mapping' }>;
+};
+
+const retryCountStorage = new AsyncLocalStorage<number>();
+/** The journal of the storage-v2 execution whose entries run in the current async context. */
+const executionJournal = new AsyncLocalStorage<RunJournal | undefined>();
+
+/** A step result without the `nestedRunId` metadata kept to find its nested run. */
+function withoutNestedRunId(stepResult: any): any {
+  if (!stepResult || typeof stepResult !== 'object' || Array.isArray(stepResult) || !('metadata' in stepResult)) {
+    return stepResult;
+  }
+  const { metadata, ...rest } = stepResult;
+  if (!metadata) return stepResult;
+  const { nestedRunId: _nestedRunId, ...userMetadata } = metadata;
+  return Object.keys(userMetadata).length > 0 ? { ...rest, metadata: userMetadata } : rest;
+}
 
 /**
  * Default implementation of the ExecutionEngine
  */
 export class DefaultExecutionEngine extends ExecutionEngine {
-  /**
-   * The retryCounts map is used to keep track of the retry count for each step.
-   * The step id is used as the key and the retry count is the value.
-   */
-  protected retryCounts = new Map<string, number>();
-
   /**
    * Tracks the last workflow status this engine successfully persisted for a
    * given run. Populated by `persistStepUpdate` after each write.
@@ -72,17 +119,34 @@ export class DefaultExecutionEngine extends ExecutionEngine {
    * was in-flight (`running`) after crash will show `running` in storage
    * because we now persist that status — which is exactly what boot-time
    * recovery relies on.
+   *
+   * `replayingCanceled` marks a run that starts while its stored status is
+   * already `canceled`: a time-travel replay whose claim to flip it to
+   * `running` was skipped, or a fresh `start()` reusing the runId of a canceled
+   * attempt. That status is the run's starting point, not a cancellation of
+   * this execution, so it is not honored until the run writes a status of its own.
    */
-  protected lastPersistedStatusByRun = new Map<string, WorkflowRunStatus>();
+  protected lastPersistedStatusByRun = new Map<string, { status?: WorkflowRunStatus; replayingCanceled: boolean }>();
+
+  /**
+   * @internal Returns the journal of the storage-v2 execution of `runId` this is called from; a run
+   * is on v2 when it has one. Each execution has its own: a restart or resume can start another
+   * execution of the run before a hung one ends, and neither may write through the other's.
+   */
+  getRunJournal(runId: string): RunJournal | undefined {
+    const journal = executionJournal.getStore();
+    return journal?.runId === runId ? journal : undefined;
+  }
 
   /** Returns the last status persisted for a given run in this process, if any. */
   getLastPersistedStatus(runId: string): WorkflowRunStatus | undefined {
-    return this.lastPersistedStatusByRun.get(runId);
+    return this.lastPersistedStatusByRun.get(runId)?.status;
   }
 
   /** Records the last status persisted for a given run in this process. */
   setLastPersistedStatus(runId: string, status: WorkflowRunStatus): void {
-    this.lastPersistedStatusByRun.set(runId, status);
+    const replayingCanceled = status === 'canceled' && this.lastPersistedStatusByRun.get(runId)?.replayingCanceled;
+    this.lastPersistedStatusByRun.set(runId, { status, replayingCanceled: replayingCanceled === true });
   }
 
   /** Clears the last-persisted-status entry for a run (used on run cleanup). */
@@ -90,29 +154,42 @@ export class DefaultExecutionEngine extends ExecutionEngine {
     this.lastPersistedStatusByRun.delete(runId);
   }
 
+  /** Whether stored `canceled` status should stop this run's execution. */
+  honorsStoredCancellation(runId: string): boolean {
+    return this.lastPersistedStatusByRun.get(runId)?.replayingCanceled !== true;
+  }
+
+  /** True when the store refused a non-canceled write because the run was canceled meanwhile. */
+  private writeRejectedByCancellation(runId: string, attemptedStatus: WorkflowRunStatus): boolean {
+    return attemptedStatus !== 'canceled' && this.getLastPersistedStatus(runId) === 'canceled';
+  }
+
+  /** Tail of each run's snapshot-write chain; see `serializeSnapshotWrite`. */
+  #snapshotWriteTails = new Map<string, Promise<void>>();
+
   /**
-   * Get or generate the retry count for a step.
-   * If the step id is not in the map, it will be added and the retry count will be 0.
-   * If the step id is in the map, it will return the retry count.
-   *
-   * @param stepId - The id of the step.
-   * @returns The retry count for the step.
+   * Runs one snapshot write for `runId` after every write already queued for that run
+   * has settled. Snapshot writes are full upserts, so concurrent writes from parallel
+   * arms or foreach items could otherwise land out of order and replace a newer
+   * checkpoint with an older one (#26214).
    */
-  getOrGenerateRetryCount(stepId: Step['id']) {
-    if (this.retryCounts.has(stepId)) {
-      const currentRetryCount = this.retryCounts.get(stepId) as number;
-      const nextRetryCount = currentRetryCount + 1;
-
-      this.retryCounts.set(stepId, nextRetryCount);
-
-      return nextRetryCount;
+  async serializeSnapshotWrite(runId: string, write: () => Promise<void>): Promise<void> {
+    const previous = this.#snapshotWriteTails.get(runId) ?? Promise.resolve();
+    const current = previous.then(write);
+    const tail = current.catch(() => {});
+    this.#snapshotWriteTails.set(runId, tail);
+    try {
+      await current;
+    } finally {
+      if (this.#snapshotWriteTails.get(runId) === tail) {
+        this.#snapshotWriteTails.delete(runId);
+      }
     }
+  }
 
-    const retryCount = 0;
-
-    this.retryCounts.set(stepId, retryCount);
-
-    return retryCount;
+  /** Returns the current step's zero-based retry attempt, or zero outside an attempt. */
+  getOrGenerateRetryCount(_stepId: Step['id']) {
+    return retryCountStorage.getStore() ?? 0;
   }
 
   // =============================================================================
@@ -138,8 +215,13 @@ export class DefaultExecutionEngine extends ExecutionEngine {
    * @param _sleepId - Unique identifier for this sleep operation
    * @param _workflowId - The workflow ID (for constructing platform-specific IDs)
    */
-  async executeSleepDuration(duration: number, _sleepId: string, _workflowId: string): Promise<void> {
-    await new Promise(resolve => setTimeout(resolve, duration < 0 ? 0 : duration));
+  async executeSleepDuration(
+    duration: number,
+    _sleepId: string,
+    _workflowId: string,
+    abortSignal?: AbortSignal,
+  ): Promise<void> {
+    await abortableSleep(duration, abortSignal);
   }
 
   /**
@@ -149,9 +231,13 @@ export class DefaultExecutionEngine extends ExecutionEngine {
    * @param _sleepUntilId - Unique identifier for this sleep operation
    * @param _workflowId - The workflow ID (for constructing platform-specific IDs)
    */
-  async executeSleepUntilDate(date: Date, _sleepUntilId: string, _workflowId: string): Promise<void> {
-    const time = date.getTime() - Date.now();
-    await new Promise(resolve => setTimeout(resolve, time < 0 ? 0 : time));
+  async executeSleepUntilDate(
+    date: Date,
+    _sleepUntilId: string,
+    _workflowId: string,
+    abortSignal?: AbortSignal,
+  ): Promise<void> {
+    await abortableSleep(date.getTime() - Date.now(), abortSignal);
   }
 
   /**
@@ -215,6 +301,10 @@ export class DefaultExecutionEngine extends ExecutionEngine {
     operationId: string;
     skipEmits?: boolean;
   }): Promise<number> {
+    // Nothing to publish, so avoid spending a durable operation on a bare timestamp.
+    if (params.skipEmits) {
+      return Date.now();
+    }
     return this.wrapDurableOperation(params.operationId, async () => {
       const startedAt = Date.now();
       if (!params.skipEmits) {
@@ -226,7 +316,7 @@ export class DefaultExecutionEngine extends ExecutionEngine {
             payload: {
               id: params.step.id,
               stepCallId: params.stepCallId,
-              ...params.stepInfo,
+              ...omitPriorCompletionFields(params.stepInfo),
             },
           },
         });
@@ -292,12 +382,13 @@ export class DefaultExecutionEngine extends ExecutionEngine {
     parentSpan: Span<SpanType> | undefined;
     stepId: string;
     operationId: string;
-    options: {
+    options: SpanOutcomeFields & {
       name: string;
       type: SpanType;
       input?: unknown;
       entityType?: string;
       entityId?: string;
+      attributes?: Record<string, unknown>;
       tracingPolicy?: TracingPolicy;
       requestContext?: RequestContext;
     };
@@ -318,7 +409,7 @@ export class DefaultExecutionEngine extends ExecutionEngine {
   async endStepSpan(params: {
     span: Span<SpanType> | undefined;
     operationId: string;
-    endOptions: {
+    endOptions: SpanOutcomeFields & {
       output?: unknown;
       attributes?: Record<string, unknown>;
     };
@@ -338,7 +429,7 @@ export class DefaultExecutionEngine extends ExecutionEngine {
   async errorStepSpan(params: {
     span: Span<SpanType> | undefined;
     operationId: string;
-    errorOptions: {
+    errorOptions: SpanOutcomeFields & {
       error: Error;
       attributes?: Record<string, unknown>;
     };
@@ -359,7 +450,7 @@ export class DefaultExecutionEngine extends ExecutionEngine {
   async createChildSpan(params: {
     parentSpan: Span<SpanType> | undefined;
     operationId: string;
-    options: {
+    options: SpanOutcomeFields & {
       name: string;
       type: SpanType;
       input?: unknown;
@@ -383,7 +474,7 @@ export class DefaultExecutionEngine extends ExecutionEngine {
   async endChildSpan(params: {
     span: Span<SpanType> | undefined;
     operationId: string;
-    endOptions?: {
+    endOptions?: SpanOutcomeFields & {
       output?: unknown;
       attributes?: Record<string, unknown>;
     };
@@ -403,7 +494,7 @@ export class DefaultExecutionEngine extends ExecutionEngine {
   async errorChildSpan(params: {
     span: Span<SpanType> | undefined;
     operationId: string;
-    errorOptions: {
+    errorOptions: SpanOutcomeFields & {
       error: Error;
       attributes?: Record<string, unknown>;
     };
@@ -443,6 +534,7 @@ export class DefaultExecutionEngine extends ExecutionEngine {
           status: 'failed';
           error: Error;
           endedAt: number;
+          nonRetryable?: true;
           tripwire?: StepTripwireInfo;
         };
       }
@@ -452,7 +544,7 @@ export class DefaultExecutionEngine extends ExecutionEngine {
         await new Promise(resolve => setTimeout(resolve, params.delay));
       }
       try {
-        const result = await this.wrapDurableOperation(stepId, runStep);
+        const result = await retryCountStorage.run(i, () => this.wrapDurableOperation(stepId, runStep));
         return { ok: true, result };
       } catch (e) {
         const isNonRetryable = e instanceof MastraNonRetryableError;
@@ -478,6 +570,11 @@ export class DefaultExecutionEngine extends ExecutionEngine {
           this.logger?.error(`Error executing step ${stepId}: ` + errorInstance?.stack);
 
           params.stepSpan?.error({
+            ...workflowTermination(
+              e instanceof TripWire
+                ? { status: 'tripwire', tripwire: { reason: e.message, processorId: e.processorId } }
+                : { status: 'failed', error: errorInstance },
+            ),
             error: mastraError,
             attributes: { status: 'failed' },
           });
@@ -530,83 +627,52 @@ export class DefaultExecutionEngine extends ExecutionEngine {
     error?: Error | unknown,
     stepExecutionPath?: string[],
   ): Promise<TOutput> {
-    // Strip nestedRunId from metadata (internal tracking for nested workflow retrieval)
-    const cleanStepResults: Record<string, StepResult<any, any, any, any>> = {};
-    for (const [stepId, stepResult] of Object.entries(stepResults)) {
-      if (stepResult && typeof stepResult === 'object' && !Array.isArray(stepResult) && 'metadata' in stepResult) {
-        const { metadata, ...rest } = stepResult as any;
-        if (metadata) {
-          const { nestedRunId: _nestedRunId, ...userMetadata } = metadata;
-          if (Object.keys(userMetadata).length > 0) {
-            cleanStepResults[stepId] = { ...rest, metadata: userMetadata };
-          } else {
-            cleanStepResults[stepId] = rest;
-          }
-        } else {
-          cleanStepResults[stepId] = stepResult;
-        }
-      } else {
-        cleanStepResults[stepId] = stepResult;
-      }
-    }
+    const { status, ...envelope } = this.fmtResultEnvelope(stepResults, lastOutput, error, stepExecutionPath);
+    return { status, steps: this.fmtResultSteps(stepResults, stepExecutionPath), ...envelope } as TOutput;
+  }
 
-    const base: FormattedWorkflowResult = {
+  /**
+   * `fmtReturnValue` for the result `execute` returns. On storage v2 its `steps` is a loader
+   * (`lazyStepResults`), so returning the result reads none of the steps the journal evicted.
+   */
+  async #fmtResult(
+    journal: RunJournal | undefined,
+    pubsub: PubSub,
+    stepResults: Record<string, StepResult<any, any, any, any>>,
+    lastOutput: StepResult<any, any, any, any>,
+    error?: Error | unknown,
+    stepExecutionPath?: string[],
+  ): Promise<any> {
+    if (!journal) return this.fmtReturnValue(pubsub, stepResults, lastOutput, error, stepExecutionPath);
+    const { status, ...envelope } = this.fmtResultEnvelope(stepResults, lastOutput, error, stepExecutionPath);
+    const steps = lazyStepResults(journal, stepResults, results => this.fmtResultSteps(results, stepExecutionPath));
+    return { status, steps, ...envelope };
+  }
+
+  /**
+   * Every field of a result except `steps`. Reads only `input` and results that aren't successful,
+   * which storage v2 never evicts.
+   */
+  protected fmtResultEnvelope(
+    stepResults: Record<string, StepResult<any, any, any, any>>,
+    lastOutput: StepResult<any, any, any, any>,
+    error?: Error | unknown,
+    stepExecutionPath?: string[],
+  ): Omit<FormattedWorkflowResult, 'steps'> {
+    const base: Omit<FormattedWorkflowResult, 'steps'> = {
       status: lastOutput.status,
-      steps: cleanStepResults,
-      input: cleanStepResults.input,
+      input: stepResults.input,
     };
-
     if (stepExecutionPath) {
       base.stepExecutionPath = stepExecutionPath;
-
-      // Create a shallow copy of steps to modify without affecting the original reference
-      const optimizedSteps: Record<string, StepResult<any, any, any, any>> = { ...cleanStepResults };
-
-      let previousOutput: unknown;
-      let hasPreviousOutput = 'input' in cleanStepResults;
-      if (hasPreviousOutput) {
-        previousOutput = cleanStepResults.input;
-      }
-
-      for (const stepId of stepExecutionPath) {
-        const originalStep = cleanStepResults[stepId];
-        if (!originalStep) continue;
-
-        // Clone step result to avoid mutating the original object in memory
-        const optimizedStep = { ...originalStep };
-
-        // Remove payload if it matches the output of the previous step (structural comparison
-        // handles deserialized data where reference equality would fail)
-        let payloadMatchesPrevious = false;
-        if (hasPreviousOutput) {
-          try {
-            payloadMatchesPrevious =
-              optimizedStep.payload === previousOutput ||
-              JSON.stringify(optimizedStep.payload) === JSON.stringify(previousOutput);
-          } catch {
-            // non-serializable payload — treat as not matching
-          }
-        }
-        if (payloadMatchesPrevious) {
-          delete optimizedStep.payload;
-        }
-
-        if (optimizedStep.status === 'success') {
-          previousOutput = optimizedStep.output;
-          hasPreviousOutput = true;
-        }
-
-        optimizedSteps[stepId] = optimizedStep;
-      }
-
-      base.steps = optimizedSteps;
     }
 
     if (lastOutput.status === 'success') {
       base.result = lastOutput.output;
-    } else if (lastOutput.status === 'failed') {
-      // Check if the failure was due to a TripWire
-      const tripwireData = lastOutput?.tripwire;
+    } else if (lastOutput.status === 'failed' || (lastOutput.status as string) === 'tripwire') {
+      // Nested engines can return an already-classified tripwire result. Preserve
+      // its explicit cause as well as tripwires represented by failed leaf steps.
+      const tripwireData = (lastOutput as { tripwire?: StepTripwireInfo | TripWire<Record<string, unknown>> }).tripwire;
       if (tripwireData instanceof TripWire) {
         // Use 'tripwire' status instead of 'failed' for tripwire errors (TripWire instance)
         base.status = 'tripwire';
@@ -639,7 +705,64 @@ export class DefaultExecutionEngine extends ExecutionEngine {
       base.suspendPayload = suspendPayload;
     }
 
-    return base as TOutput;
+    return base;
+  }
+
+  /**
+   * The `steps` of a result: internal metadata stripped and, with an execution path, each payload
+   * that repeats the previous step's output left out. Needs every result in full.
+   */
+  protected fmtResultSteps(
+    stepResults: Record<string, StepResult<any, any, any, any>>,
+    stepExecutionPath?: string[],
+  ): Record<string, StepResult<any, any, any, any>> {
+    const cleanStepResults: Record<string, StepResult<any, any, any, any>> = {};
+    for (const [stepId, stepResult] of Object.entries(stepResults)) {
+      cleanStepResults[stepId] =
+        stepId === 'input' ? stepResult : withoutNestedRunStartState(withoutNestedRunId(stepResult));
+    }
+    if (!stepExecutionPath) return cleanStepResults;
+
+    // Create a shallow copy of steps to modify without affecting the original reference
+    const optimizedSteps: Record<string, StepResult<any, any, any, any>> = { ...cleanStepResults };
+
+    let previousOutput: unknown;
+    let hasPreviousOutput = 'input' in cleanStepResults;
+    if (hasPreviousOutput) {
+      previousOutput = cleanStepResults.input;
+    }
+
+    for (const stepId of stepExecutionPath) {
+      const originalStep = cleanStepResults[stepId];
+      if (!originalStep) continue;
+
+      // Clone step result to avoid mutating the original object in memory
+      const optimizedStep = { ...originalStep };
+
+      // Remove payload if it matches the output of the previous step (structural comparison
+      // handles deserialized data where reference equality would fail)
+      let payloadMatchesPrevious = false;
+      if (hasPreviousOutput) {
+        try {
+          payloadMatchesPrevious =
+            optimizedStep.payload === previousOutput || deepEqual(optimizedStep.payload, previousOutput);
+        } catch {
+          // Values that cannot be structurally compared are treated as not matching.
+        }
+      }
+      if (payloadMatchesPrevious) {
+        delete optimizedStep.payload;
+      }
+
+      if (optimizedStep.status === 'success') {
+        previousOutput = optimizedStep.output;
+        hasPreviousOutput = true;
+      }
+
+      optimizedSteps[stepId] = optimizedStep;
+    }
+
+    return optimizedSteps;
   }
 
   // =============================================================================
@@ -651,13 +774,18 @@ export class DefaultExecutionEngine extends ExecutionEngine {
    * Used by durable execution engines to persist context across step replays.
    */
   serializeRequestContext(requestContext: RequestContext): Record<string, any> {
+    let obj: Record<string, any>;
     if (typeof requestContext.toJSON === 'function') {
-      return requestContext.toJSON();
+      obj = requestContext.toJSON();
+    } else {
+      obj = {};
+      requestContext.forEach((value, key) => {
+        obj[key] = value;
+      });
     }
-    const obj: Record<string, any> = {};
-    requestContext.forEach((value, key) => {
-      obj[key] = value;
-    });
+    // Never persist the framework-managed bearer token in durable snapshots.
+    // A resumed authenticated request supplies its own fresh live token.
+    delete obj[MASTRA_AUTH_TOKEN_KEY];
     return obj;
   }
 
@@ -698,7 +826,14 @@ export class DefaultExecutionEngine extends ExecutionEngine {
    * Apply mutable context changes back to the execution context.
    */
   applyMutableContext(executionContext: ExecutionContext, mutableContext: MutableContext): void {
-    Object.assign(executionContext.state, mutableContext.state);
+    // A nested run's changes are rebased here, not when it finishes: steps running alongside it
+    // may change the state in between.
+    Object.assign(
+      executionContext.state,
+      mutableContext.stateBase
+        ? rebaseNestedState(executionContext.state, mutableContext.stateBase, mutableContext.state)
+        : mutableContext.state,
+    );
     Object.assign(executionContext.suspendedPaths, mutableContext.suspendedPaths);
     Object.assign(executionContext.resumeLabels, mutableContext.resumeLabels);
   }
@@ -712,6 +847,7 @@ export class DefaultExecutionEngine extends ExecutionEngine {
   async execute<TState, TInput, TOutput>(params: {
     workflowId: string;
     runId: string;
+    parentWorkflow?: NestedWorkflowParent;
     resourceId?: string;
     disableScorers?: boolean;
     graph: ExecutionGraph;
@@ -745,6 +881,12 @@ export class DefaultExecutionEngine extends ExecutionEngine {
       includeResumeLabels?: boolean;
     };
     perStep?: boolean;
+    /** @experimental */
+    storageVersion?: 1 | 2;
+    /** @internal */
+    storedState?: { seq: number; patchBytes: number };
+    /** @internal */
+    inheritedState?: StateBase;
     /** Trace IDs for creating child spans in durable execution */
     tracingIds?: {
       traceId: string;
@@ -769,9 +911,6 @@ export class DefaultExecutionEngine extends ExecutionEngine {
     const { attempts = 0, delay = 0 } = retryConfig ?? {};
     const steps = graph.steps;
 
-    //clear retryCounts
-    this.retryCounts.clear();
-
     if (steps.length === 0) {
       const empty_graph_error = new MastraError({
         id: 'WORKFLOW_EXECUTE_EMPTY_GRAPH',
@@ -780,203 +919,216 @@ export class DefaultExecutionEngine extends ExecutionEngine {
         category: ErrorCategory.USER,
       });
 
-      workflowSpan?.error({ error: empty_graph_error });
+      workflowSpan?.error({
+        error: empty_graph_error,
+        ...workflowTermination({ status: 'failed', error: empty_graph_error }),
+      });
       throw empty_graph_error;
     }
 
-    let startIdx = 0;
-    if (timeTravel) {
-      startIdx = timeTravel.executionPath[0]!;
-      timeTravel.executionPath.shift();
-    } else if (restart) {
-      startIdx = restart.activePaths[0]!;
-      restart.activePaths.shift();
-    } else if (resume?.resumePath) {
-      startIdx = resume.resumePath[0]!;
-      resume.resumePath.shift();
+    // Time travel and a fresh start() both own the runId, so a stored `canceled` is where they begin.
+    const startsFromStoredStatus = !!timeTravel || (!resume && !restart);
+    const replayingCanceled = startsFromStoredStatus && (await isWorkflowRunCanceled(this, workflowId, runId));
+    const tracked = this.lastPersistedStatusByRun.get(runId);
+    if (tracked || replayingCanceled) {
+      this.lastPersistedStatusByRun.set(runId, { status: tracked?.status, replayingCanceled });
     }
 
-    const stepResults: Record<string, any> = timeTravel?.stepResults ||
-      restart?.stepResults ||
-      resume?.stepResults || { input };
-    let stepExecutionPath: string[] =
-      timeTravel?.stepExecutionPath || restart?.stepExecutionPath || resume?.stepExecutionPath || [];
-    let lastOutput: any;
-    let lastState: Record<string, any> = timeTravel?.state ?? restart?.state ?? initialState ?? {};
-    let lastExecutionContext: ExecutionContext | undefined;
-    let currentRequestContext = params.requestContext;
-    for (let i = startIdx; i < steps.length; i++) {
-      if (params.abortController.signal.aborted) {
+    let journal: RunJournal | undefined;
+    if (params.storageVersion === 2) {
+      // Resume and restart continue from the stored snapshot; start and time travel write a checkpoint first.
+      let seed: Record<string, unknown> | undefined;
+      if (resume) {
+        seed = { ...resume.stepResults };
+        // A retried nested resume replaces `input` before it gets here, so write it again.
+        delete seed.input;
+      } else if (restart) {
+        seed = restart.stepResults;
+      }
+      journal = new RunJournal({
+        store: await this.mastra?.getStorage()?.getStore('workflows'),
+        workflowName: workflowId,
+        runId,
+        seed,
+        // The loaded state, which the run continues from.
+        state: resume ? initialState : restart?.state,
+        storedState: params.storedState,
+        inherited: params.inheritedState,
+        resumed: !!resume,
+      });
+    }
+
+    try {
+      let startIdx = 0;
+      let entryRestart = restart;
+      if (timeTravel) {
+        startIdx = timeTravel.executionPath[0]!;
+        timeTravel.executionPath.shift();
+      } else if (restart) {
+        startIdx = getRestartStartIndex(steps, restart);
+        if (startIdx === restart.activePaths[0]) {
+          restart.activePaths.shift();
+        } else {
+          // The checkpoint's entry had already finished and nothing is in flight,
+          // so the remaining entries run as a normal run rather than a recovery.
+          entryRestart = undefined;
+        }
+      } else if (resume?.resumePath) {
+        startIdx = resume.resumePath[0]!;
+        resume.resumePath.shift();
+      }
+
+      const stepResults: Record<string, any> = timeTravel?.stepResults ||
+        restart?.stepResults ||
+        resume?.stepResults || { input };
+      let stepExecutionPath: string[] =
+        timeTravel?.stepExecutionPath || restart?.stepExecutionPath || resume?.stepExecutionPath || [];
+      let lastOutput: any;
+      let lastState: Record<string, any> = timeTravel?.state ?? restart?.state ?? initialState ?? {};
+      let lastExecutionContext: ExecutionContext | undefined;
+      let currentRequestContext = params.requestContext;
+
+      if (journal && !resume && !restart) {
+        // The checkpoint replaces everything stored for the run, so it's written before any step
+        // starts: the start writes of a block's steps are in flight together and only append.
+        // A run suspended earlier in this process would block it as a `running` write over a
+        // suspend, but it replaces that run (time travel), so the earlier status no longer applies.
+        // `replayingCanceled` stays: it's about the stored status this write replaces.
+        this.lastPersistedStatusByRun.set(runId, {
+          replayingCanceled: this.lastPersistedStatusByRun.get(runId)?.replayingCanceled === true,
+        });
         await this.persistStepUpdate({
+          journal,
           workflowId,
           runId,
           resourceId,
           stepResults,
           serializedStepGraph: params.serializedStepGraph,
-          executionContext: lastExecutionContext || {
+          executionContext: {
             workflowId,
             runId,
-            executionPath: [i],
+            parentWorkflow: params.parentWorkflow,
+            executionPath: [startIdx],
             stepExecutionPath,
-            activeStepsPath: {},
+            // Time travel's target keeps its earlier result until it runs again, so it's marked
+            // as running: a restart from this checkpoint reruns it instead of skipping it.
+            activeStepsPath: timeTravel ? { [timeTravel.steps[0]!]: [startIdx, ...timeTravel.executionPath] } : {},
             suspendedPaths: {},
             resumeLabels: {},
             retryConfig: { attempts, delay },
             format: params.format,
-            state: lastState ?? initialState,
+            state: lastState,
             tracingIds: params.tracingIds,
           },
-          workflowStatus: 'canceled',
+          workflowStatus: 'running',
           requestContext: currentRequestContext,
+          phase: 'checkpoint',
         });
-
-        workflowSpan?.end({
-          attributes: {
-            status: 'canceled',
-          },
-        });
-
-        const formattedResult = await this.fmtReturnValue<any>(
-          params.pubsub,
-          stepResults,
-          { status: 'canceled' } as any,
-          undefined,
-          stepExecutionPath,
-        );
-
-        await this.invokeLifecycleCallbacks({
-          status: 'canceled',
-          result: undefined,
-          error: undefined,
-          steps: formattedResult.steps,
-          tripwire: undefined,
-          runId,
-          workflowId,
-          resourceId,
-          input,
-          requestContext: currentRequestContext,
-          state: lastState,
-          stepExecutionPath,
-        });
-
-        return {
-          ...formattedResult,
-          runId,
-          ...(params.outputOptions?.includeState ? { state: lastState } : {}),
-        } as any;
       }
 
-      const entry = steps[i]!;
+      for (let i = startIdx; i < steps.length; i++) {
+        if (params.abortController.signal.aborted) {
+          if (params.abortController.signal.reason !== WORKFLOW_CANCELLED_SYMBOL) {
+            const executionContext = lastExecutionContext || {
+              workflowId,
+              runId,
+              executionPath: [i],
+              stepExecutionPath,
+              activeStepsPath: {},
+              suspendedPaths: {},
+              resumeLabels: {},
+              retryConfig: { attempts, delay },
+              format: params.format,
+              state: lastState ?? initialState,
+              tracingIds: params.tracingIds,
+            };
 
-      const executionContext: ExecutionContext = {
-        workflowId,
-        runId,
-        executionPath: [i],
-        stepExecutionPath,
-        activeStepsPath: {},
-        suspendedPaths: {},
-        resumeLabels: {},
-        retryConfig: { attempts, delay },
-        format: params.format,
-        state: lastState ?? initialState,
-        // Tracing IDs for durable span operations (Inngest)
-        tracingIds: params.tracingIds,
-      };
-      lastExecutionContext = executionContext;
+            await this.persistStepUpdate({
+              journal,
+              workflowId,
+              runId,
+              resourceId,
+              stepResults,
+              serializedStepGraph: params.serializedStepGraph,
+              executionContext,
+              workflowStatus: 'waiting',
+              requestContext: currentRequestContext,
+              phase: 'executor-aborted',
+            });
 
-      lastOutput = await this.executeEntry({
-        workflowId,
-        runId,
-        resourceId,
-        entry,
-        executionContext,
-        serializedStepGraph: params.serializedStepGraph,
-        prevStep: steps[i - 1]!,
-        stepResults,
-        resume,
-        timeTravel,
-        restart,
-        ...createObservabilityContext({ currentSpan: workflowSpan }),
-        abortController: params.abortController,
-        pubsub: params.pubsub,
-        requestContext: currentRequestContext,
-        actor: params.actor,
-        outputWriter: params.outputWriter,
-        disableScorers,
-        perStep,
-      });
+            if (!this.writeRejectedByCancellation(runId, 'waiting')) {
+              // The executor stopped; the logical run remains available for another worker.
+              workflowSpan?.end({
+                ...workflowTermination({ status: 'waiting' }, params.abortController.signal),
+                attributes: { status: 'waiting' },
+              });
 
-      // Apply mutable context changes from entry execution
-      this.applyMutableContext(executionContext, lastOutput.mutableContext);
-      lastState = lastOutput.mutableContext.state;
-      // Update requestContext from step result (only for engines that serialize context)
-      // Default engine keeps the original reference, Inngest deserializes from memoized result
-      if (this.requiresDurableContextSerialization() && lastOutput.requestContext) {
-        currentRequestContext = this.deserializeRequestContext(lastOutput.requestContext);
-      }
+              const formattedResult = await this.#fmtResult(
+                journal,
+                params.pubsub,
+                stepResults,
+                { status: 'waiting', payload: undefined, startedAt: Date.now() },
+                undefined,
+                stepExecutionPath,
+              );
 
-      // if step result is not success, stop and return
-      if (lastOutput.result.status !== 'success') {
-        if (lastOutput.result.status === 'bailed') {
-          lastOutput.result.status = 'success';
-        }
+              return {
+                ...formattedResult,
+                runId,
+                ...(params.outputOptions?.includeState ? { state: lastState } : {}),
+              } as any;
+            }
+          }
 
-        const result = (await this.fmtReturnValue(
-          params.pubsub,
-          stepResults,
-          lastOutput.result,
-          undefined,
-          stepExecutionPath,
-        )) as any;
-
-        // Capture tracing context for suspend to enable span linking on resume
-        const persistTracingContext =
-          result.status === 'suspended' && workflowSpan
-            ? {
-                traceId: workflowSpan.traceId,
-                spanId: workflowSpan.id,
-                parentSpanId: workflowSpan.getParentSpanId(),
-              }
-            : {};
-
-        await this.persistStepUpdate({
-          workflowId,
-          runId,
-          resourceId,
-          stepResults: lastOutput.stepResults,
-          serializedStepGraph: params.serializedStepGraph,
-          executionContext,
-          workflowStatus: result.status,
-          result: result.result,
-          error: result.error,
-          requestContext: currentRequestContext,
-          tracingContext: persistTracingContext,
-        });
-
-        if (result.error) {
-          workflowSpan?.error({
-            error: result.error,
-            attributes: {
-              status: result.status,
+          await this.persistStepUpdate({
+            journal,
+            workflowId,
+            runId,
+            resourceId,
+            stepResults,
+            serializedStepGraph: params.serializedStepGraph,
+            executionContext: lastExecutionContext || {
+              workflowId,
+              runId,
+              executionPath: [i],
+              stepExecutionPath,
+              activeStepsPath: {},
+              suspendedPaths: {},
+              resumeLabels: {},
+              retryConfig: { attempts, delay },
+              format: params.format,
+              state: lastState ?? initialState,
+              tracingIds: params.tracingIds,
             },
+            workflowStatus: 'canceled',
+            requestContext: currentRequestContext,
+            phase: 'canceled',
           });
-        } else {
+
           workflowSpan?.end({
-            output: result.result,
+            ...workflowTermination({ status: 'canceled' }),
             attributes: {
-              status: result.status,
+              status: 'canceled',
             },
           });
-        }
 
-        if (lastOutput.result.status !== 'paused') {
-          // Invoke lifecycle callbacks before returning
+          const formattedResult = await this.#fmtResult(
+            journal,
+            params.pubsub,
+            stepResults,
+            { status: 'canceled' },
+            undefined,
+            stepExecutionPath,
+          );
+
+          // The run writes nothing more; a callback awaiting `steps()` waits for the journal to close.
+          journal?.close();
           await this.invokeLifecycleCallbacks({
-            status: result.status,
-            result: result.result,
-            error: result.error,
-            steps: result.steps,
-            tripwire: result.tripwire,
+            status: 'canceled',
+            result: undefined,
+            error: undefined,
+            steps: formattedResult.steps,
+            tripwire: undefined,
             runId,
             workflowId,
             resourceId,
@@ -985,133 +1137,415 @@ export class DefaultExecutionEngine extends ExecutionEngine {
             state: lastState,
             stepExecutionPath,
           });
-        }
 
-        if (lastOutput.result.status === 'paused') {
-          await params.pubsub.publish(`workflow.events.v2.${runId}`, {
-            type: 'watch',
-            runId,
-            data: { type: 'workflow-paused', payload: {} },
-          });
-        }
-
-        // Drop the last-persisted-status tracker for early terminal exits
-        // (failed, canceled, tripwire) so the map does not grow unbounded.
-        // Suspended and paused runs keep their entry so a subsequent resume
-        // in the same process still sees the correct status and refuses to
-        // overwrite it with `running` mid-resume.
-        if (lastOutput.result.status !== 'suspended' && lastOutput.result.status !== 'paused') {
           this.clearLastPersistedStatus(runId);
+
+          return {
+            ...formattedResult,
+            runId,
+            ...(params.outputOptions?.includeState ? { state: lastState } : {}),
+          } as any;
         }
 
-        return {
-          ...result,
-          runId,
-          ...(lastOutput.result.status === 'suspended' && params.outputOptions?.includeResumeLabels
-            ? { resumeLabels: lastOutput.mutableContext.resumeLabels }
-            : {}),
-          ...(params.outputOptions?.includeState ? { state: lastState } : {}),
-        };
-      }
+        const entry = steps[i]!;
 
-      if (perStep) {
-        const result = (await this.fmtReturnValue(
-          params.pubsub,
-          stepResults,
-          lastOutput.result,
-          undefined,
-          stepExecutionPath,
-        )) as any;
-        await this.persistStepUpdate({
+        const executionContext: ExecutionContext = {
           workflowId,
           runId,
-          resourceId,
-          stepResults: lastOutput.stepResults,
-          serializedStepGraph: params.serializedStepGraph,
-          executionContext: lastExecutionContext,
-          workflowStatus: 'paused',
-          requestContext: currentRequestContext,
-        });
+          parentWorkflow: params.parentWorkflow,
+          executionPath: [i],
+          stepExecutionPath,
+          activeStepsPath: {},
+          suspendedPaths: {},
+          resumeLabels: {},
+          retryConfig: { attempts, delay },
+          format: params.format,
+          state: lastState ?? initialState,
+          // Tracing IDs for durable span operations (Inngest)
+          tracingIds: params.tracingIds,
+        };
+        lastExecutionContext = executionContext;
 
-        await params.pubsub.publish(`workflow.events.v2.${runId}`, {
-          type: 'watch',
+        // The entry reads its own earlier results (a resumed block's finished branches, a loop's
+        // previous iteration) and the previous entry's output synchronously.
+        await journal?.hydrate(stepResults, [...getStepIds(entry), ...(i > 0 ? getStepIds(steps[i - 1]!) : [])]);
+
+        try {
+          lastOutput = await executionJournal.run(journal, () =>
+            this.executeEntry({
+              workflowId,
+              runId,
+              resourceId,
+              entry,
+              executionContext,
+              serializedStepGraph: params.serializedStepGraph,
+              prevStep: steps[i - 1]!,
+              stepResults,
+              resume,
+              timeTravel,
+              restart: entryRestart,
+              ...createObservabilityContext({ currentSpan: workflowSpan }),
+              abortController: params.abortController,
+              pubsub: params.pubsub,
+              requestContext: currentRequestContext,
+              actor: params.actor,
+              outputWriter: params.outputWriter,
+              disableScorers,
+              perStep,
+            }),
+          );
+        } catch (error) {
+          // A thrown control-flow error bypasses settled-result finalization. End
+          // this execution and any still-open children without rewriting completed
+          // body spans, then preserve the caller's existing rejection behavior.
+          const termination = workflowTermination({ status: 'failed', error });
+          workflowSpan?.error({ ...termination, error: getErrorFromUnknown(error), endSpan: false });
+          workflowSpan?.end({ ...termination, endTree: true });
+          throw error;
+        }
+
+        // Apply mutable context changes from entry execution
+        this.applyMutableContext(executionContext, lastOutput.mutableContext);
+        lastState = lastOutput.mutableContext.state;
+        // Update requestContext from step result (only for engines that serialize context)
+        // Default engine keeps the original reference, Inngest deserializes from memoized result
+        if (this.requiresDurableContextSerialization() && lastOutput.requestContext) {
+          currentRequestContext = this.deserializeRequestContext(lastOutput.requestContext);
+        }
+
+        // Checked before the next entry is dispatched, so a run canceled from another
+        // process stops here. A step write the store rejected already recorded it.
+        if (
+          this.honorsStoredCancellation(runId) &&
+          (this.getLastPersistedStatus(runId) === 'canceled' || (await isWorkflowRunCanceled(this, workflowId, runId)))
+        ) {
+          lastOutput.result = { status: 'canceled' };
+        }
+
+        if (
+          lastOutput.result.status === 'waiting' &&
+          params.abortController.signal.aborted &&
+          params.abortController.signal.reason !== WORKFLOW_CANCELLED_SYMBOL
+        ) {
+          // The executor stopped; the logical run remains available for another worker.
+          workflowSpan?.end({
+            ...workflowTermination({ status: 'waiting' }, params.abortController.signal),
+            attributes: { status: 'waiting' },
+          });
+
+          const formattedResult = await this.#fmtResult(
+            journal,
+            params.pubsub,
+            stepResults,
+            lastOutput.result,
+            undefined,
+            stepExecutionPath,
+          );
+
+          return {
+            ...formattedResult,
+            runId,
+            ...(params.outputOptions?.includeState ? { state: lastState } : {}),
+          } as any;
+        }
+
+        if (perStep && lastOutput.result.status === 'success') {
+          const result = (await this.#fmtResult(
+            journal,
+            params.pubsub,
+            stepResults,
+            lastOutput.result,
+            undefined,
+            stepExecutionPath,
+          )) as any;
+          await this.persistStepUpdate({
+            journal,
+            workflowId,
+            runId,
+            resourceId,
+            stepResults: lastOutput.stepResults,
+            serializedStepGraph: params.serializedStepGraph,
+            executionContext: lastExecutionContext,
+            workflowStatus: 'paused',
+            requestContext: currentRequestContext,
+            phase: 'per-step',
+          });
+
+          if (!this.writeRejectedByCancellation(runId, 'paused')) {
+            await params.pubsub.publish(`workflow.events.v2.${runId}`, {
+              type: 'watch',
+              runId,
+              data: { type: 'workflow-paused', payload: {} },
+            });
+
+            workflowSpan?.end({
+              ...workflowTermination({ status: 'paused' }),
+              attributes: {
+                status: 'paused',
+              },
+            });
+
+            delete result.result;
+
+            return {
+              ...result,
+              runId,
+              status: 'paused',
+              ...(params.outputOptions?.includeState ? { state: lastState } : {}),
+            };
+          }
+
+          // The store rejected the pause because the run was canceled meanwhile.
+          lastOutput.result = { status: 'canceled' };
+        }
+
+        // if step result is not success, stop and return
+        if (lastOutput.result.status !== 'success') {
+          if (lastOutput.result.status === 'bailed') {
+            if (journal) {
+              // Replace rather than mutate: the bailed result is also this entry's stepResults
+              // value, and storage v2 only rewrites step results whose reference changed.
+              const bailed = lastOutput.result;
+              const succeeded = { ...bailed, status: 'success' } as typeof bailed;
+              for (const id in stepResults) {
+                if (stepResults[id] === bailed) stepResults[id] = succeeded;
+              }
+              lastOutput.result = succeeded;
+            } else {
+              lastOutput.result.status = 'success';
+            }
+          }
+
+          let result = (await this.#fmtResult(
+            journal,
+            params.pubsub,
+            stepResults,
+            lastOutput.result,
+            undefined,
+            stepExecutionPath,
+          )) as any;
+
+          // Capture tracing context for suspend to enable span linking on resume.
+          // On resume this spanId becomes the resumed span's parentSpanId, so it has to
+          // name a span that reached exporters — an internal/excluded workflow span is
+          // never stored, and the resumed span's exported children would inherit it and
+          // land as orphans. Undefined when nothing in the chain is exportable, which
+          // correctly makes those children trace roots instead. An unsampled run saves
+          // nothing: its no-op span has no real trace for a resume to join.
+          let persistTracingContext: WorkflowStateTracingContext = {};
+          if (result.status === 'suspended') {
+            persistTracingContext = this.options.resumeTracingContext ?? getResumeTracingContext(workflowSpan) ?? {};
+          }
+
+          await this.persistStepUpdate({
+            journal,
+            workflowId,
+            runId,
+            resourceId,
+            stepResults: lastOutput.stepResults,
+            serializedStepGraph: params.serializedStepGraph,
+            executionContext,
+            workflowStatus: result.status,
+            result: result.result,
+            error: result.error,
+            requestContext: currentRequestContext,
+            tracingContext: persistTracingContext,
+            phase: 'terminal',
+          });
+
+          if (this.writeRejectedByCancellation(runId, result.status)) {
+            // The store rejected the write because the run was canceled meanwhile.
+            lastOutput.result = { status: 'canceled' };
+            result = await this.#fmtResult(
+              journal,
+              params.pubsub,
+              stepResults,
+              lastOutput.result,
+              undefined,
+              stepExecutionPath,
+            );
+          }
+
+          if (result.error) {
+            workflowSpan?.error({
+              ...workflowTermination(result),
+              error: result.error,
+              attributes: {
+                status: result.status,
+              },
+            });
+          } else {
+            workflowSpan?.end({
+              ...workflowTermination(result),
+              output: result.result,
+              attributes: {
+                status: result.status,
+              },
+            });
+          }
+
+          if (lastOutput.result.status !== 'paused') {
+            // Invoke lifecycle callbacks before returning
+            // The run writes nothing more; a callback awaiting `steps()` waits for the journal to close.
+            journal?.close();
+            await this.invokeLifecycleCallbacks({
+              status: result.status,
+              result: result.result,
+              error: result.error,
+              steps: result.steps,
+              tripwire: result.tripwire,
+              runId,
+              workflowId,
+              resourceId,
+              input,
+              requestContext: currentRequestContext,
+              state: lastState,
+              stepExecutionPath,
+            });
+          }
+
+          if (lastOutput.result.status === 'paused') {
+            await params.pubsub.publish(`workflow.events.v2.${runId}`, {
+              type: 'watch',
+              runId,
+              data: { type: 'workflow-paused', payload: {} },
+            });
+          }
+
+          // Drop the last-persisted-status tracker for early terminal exits
+          // (failed, canceled, tripwire) so the map does not grow unbounded.
+          // Suspended and paused runs keep their entry so a subsequent resume
+          // in the same process still sees the correct status and refuses to
+          // overwrite it with `running` mid-resume.
+          if (lastOutput.result.status !== 'suspended' && lastOutput.result.status !== 'paused') {
+            this.clearLastPersistedStatus(runId);
+          }
+
+          return {
+            ...result,
+            runId,
+            ...(lastOutput.result.status === 'suspended' && params.outputOptions?.includeResumeLabels
+              ? { resumeLabels: lastOutput.mutableContext.resumeLabels }
+              : {}),
+            ...(params.outputOptions?.includeState ? { state: lastState } : {}),
+          };
+        }
+
+        // Every write of this entry has been awaited. Keep this entry: it's the next one's `prevStep`.
+        // The last entry stays too; once the final write settles, the result's `steps()` loader keeps
+        // only stubs of every stored successful result (see `lazyStepResults`).
+        if (i + 1 < steps.length) journal?.evict(stepResults, getStepIds(entry));
+      }
+
+      if (lastOutput === undefined) {
+        // Restarted from a checkpoint written after the final entry finished, so
+        // nothing was left to run. Complete the run with that entry's saved output,
+        // shaped the way the entry returns it: parallel and conditional keep only the
+        // branches that succeeded, like executeParallel and executeConditional.
+        const lastIdx = steps.length - 1;
+        const lastEntry = steps[lastIdx]!;
+        const output =
+          lastEntry.type === 'parallel' || lastEntry.type === 'conditional'
+            ? Object.fromEntries(
+                lastEntry.steps
+                  .map(getSingleStepEntryId)
+                  .filter(id => stepResults[id]?.status === 'success')
+                  .map(id => [id, stepResults[id].output]),
+              )
+            : this.getStepOutput(stepResults, lastEntry);
+        lastOutput = { result: { status: 'success', output }, stepResults };
+        lastExecutionContext = {
+          workflowId,
           runId,
-          data: { type: 'workflow-paused', payload: {} },
-        });
-
-        workflowSpan?.end({
-          attributes: {
-            status: 'paused',
-          },
-        });
-
-        delete result.result;
-
-        return {
-          ...result,
-          runId,
-          status: 'paused',
-          ...(params.outputOptions?.includeState ? { state: lastState } : {}),
+          executionPath: [lastIdx],
+          stepExecutionPath,
+          activeStepsPath: {},
+          suspendedPaths: {},
+          resumeLabels: {},
+          retryConfig: { attempts, delay },
+          format: params.format,
+          state: lastState,
+          tracingIds: params.tracingIds,
         };
       }
-    }
 
-    // after all steps are successful, return result
-    const result = (await this.fmtReturnValue(
-      params.pubsub,
-      stepResults,
-      lastOutput.result,
-      undefined,
-      stepExecutionPath,
-    )) as any;
-    await this.persistStepUpdate({
-      workflowId,
-      runId,
-      resourceId,
-      stepResults: lastOutput.stepResults,
-      serializedStepGraph: params.serializedStepGraph,
-      executionContext: lastExecutionContext!,
-      workflowStatus: result.status,
-      result: result.result,
-      error: result.error,
-      requestContext: currentRequestContext,
-    });
+      // after all steps are successful, return result
+      let result = (await this.#fmtResult(
+        journal,
+        params.pubsub,
+        stepResults,
+        lastOutput.result,
+        undefined,
+        stepExecutionPath,
+      )) as any;
+      await this.persistStepUpdate({
+        journal,
+        workflowId,
+        runId,
+        resourceId,
+        stepResults: lastOutput.stepResults,
+        serializedStepGraph: params.serializedStepGraph,
+        executionContext: lastExecutionContext!,
+        workflowStatus: result.status,
+        result: result.result,
+        error: result.error,
+        requestContext: currentRequestContext,
+        phase: 'workflow-end',
+      });
 
-    workflowSpan?.end({
-      output: result.result,
-      attributes: {
+      if (this.writeRejectedByCancellation(runId, result.status)) {
+        // The store rejected the final write because the run was canceled meanwhile.
+        result = await this.#fmtResult(
+          journal,
+          params.pubsub,
+          stepResults,
+          { status: 'canceled' },
+          undefined,
+          stepExecutionPath,
+        );
+      }
+
+      workflowSpan?.end({
+        ...workflowTermination(result),
+        output: result.result,
+        attributes: {
+          status: result.status,
+        },
+      });
+
+      // The run writes nothing more; a callback awaiting `steps()` waits for the journal to close.
+      journal?.close();
+      await this.invokeLifecycleCallbacks({
         status: result.status,
-      },
-    });
+        result: result.result,
+        error: result.error,
+        steps: result.steps,
+        tripwire: result.tripwire,
+        runId,
+        workflowId,
+        resourceId,
+        input,
+        requestContext: currentRequestContext,
+        state: lastState,
+        stepExecutionPath,
+      });
 
-    await this.invokeLifecycleCallbacks({
-      status: result.status,
-      result: result.result,
-      error: result.error,
-      steps: result.steps,
-      tripwire: result.tripwire,
-      runId,
-      workflowId,
-      resourceId,
-      input,
-      requestContext: currentRequestContext,
-      state: lastState,
-      stepExecutionPath,
-    });
+      // Drop the last-persisted-status tracker for terminal runs so the map
+      // does not grow unbounded across many runs served by the same engine.
+      // Suspended runs keep their entry so a subsequent resume in the same
+      // process still sees `suspended` and refuses to overwrite it with
+      // `running` mid-resume.
+      if (result.status !== 'suspended') {
+        this.clearLastPersistedStatus(runId);
+      }
 
-    // Drop the last-persisted-status tracker for terminal runs so the map
-    // does not grow unbounded across many runs served by the same engine.
-    // Suspended runs keep their entry so a subsequent resume in the same
-    // process still sees `suspended` and refuses to overwrite it with
-    // `running` mid-resume.
-    if (result.status !== 'suspended') {
-      this.clearLastPersistedStatus(runId);
+      if (params.outputOptions?.includeState) {
+        return { ...result, runId, state: lastState };
+      }
+      return { ...result, runId };
+    } finally {
+      journal?.close();
     }
-
-    if (params.outputOptions?.includeState) {
-      return { ...result, runId, state: lastState };
-    }
-    return { ...result, runId };
   }
 
   getStepOutput(stepResults: Record<string, any>, step?: StepFlowEntry): any {
@@ -1119,20 +1553,20 @@ export class DefaultExecutionEngine extends ExecutionEngine {
       return stepResults.input;
     } else if (step.type === 'step') {
       return stepResults[step.step.id]?.output;
+    } else if (step.type === 'agent' || step.type === 'tool' || step.type === 'classifier' || step.type === 'mapping') {
+      return stepResults[step.id]?.output;
     } else if (step.type === 'sleep' || step.type === 'sleepUntil') {
       return stepResults[step.id]?.output;
     } else if (step.type === 'parallel' || step.type === 'conditional') {
-      return step.steps.reduce(
-        (acc, entry) => {
-          acc[entry.step.id] = stepResults[entry.step.id]?.output;
-          return acc;
-        },
-        {} as Record<string, any>,
-      );
+      return step.steps.reduce<Record<string, any>>((acc, entry) => {
+        const id = entry.type === 'step' ? entry.step.id : entry.id;
+        acc[id] = stepResults[id]?.output;
+        return acc;
+      }, {});
     } else if (step.type === 'loop') {
-      return stepResults[step.step.id]?.output;
+      return stepResults[getSingleStepEntryId(step.step)]?.output;
     } else if (step.type === 'foreach') {
-      return stepResults[step.step.id]?.output;
+      return stepResults[getSingleStepEntryId(step.step)]?.output;
     }
   }
 
@@ -1146,6 +1580,78 @@ export class DefaultExecutionEngine extends ExecutionEngine {
 
   async executeStep(params: ExecuteStepParams): Promise<StepExecutionResult> {
     return executeStepHandler(this, params);
+  }
+
+  /**
+   * Executes a declarative `agent` step: resolves the agent (live ref, else
+   * `mastra.getAgentById(agentId)`), builds its runnable step, and runs it through
+   * the shared step runner.
+   */
+  async executeAgent(params: ExecuteAgentParams): Promise<StepExecutionResult> {
+    const { entry, ...rest } = params;
+    const agent = entry.agent ?? this.mastra?.getAgentById(entry.agentId);
+    if (!agent) {
+      throw new Error(
+        `Agent '${entry.agentId}' not found for workflow step '${entry.id}'. Register the agent on the Mastra instance or pass the agent instance directly.`,
+      );
+    }
+    return this.executeStep({ ...rest, step: { ...createStepFromAgent(agent as any, entry.options), id: entry.id } });
+  }
+
+  /**
+   * Executes a declarative `tool` step: resolves the tool (live ref, else
+   * `mastra.getTool(toolId)`), builds its runnable step, and runs it through the
+   * shared step runner.
+   */
+  async executeTool(params: ExecuteToolParams): Promise<StepExecutionResult> {
+    const { entry, ...rest } = params;
+    const tool = entry.tool ?? this.mastra?.getTool(entry.toolId);
+    if (!tool) {
+      throw new Error(
+        `Tool '${entry.toolId}' not found for workflow step '${entry.id}'. Pass the tool instance directly.`,
+      );
+    }
+    return this.executeStep({ ...rest, step: { ...createStepFromTool(tool as any, entry.options), id: entry.id } });
+  }
+
+  async executeClassifier(params: ExecuteClassifierParams): Promise<StepExecutionResult> {
+    const { entry, ...rest } = params;
+    let classifier = entry.classifier;
+    if (!classifier) {
+      try {
+        classifier = this.mastra?.getClassifierById(entry.classifierId);
+      } catch {
+        throw new Error(
+          `Classifier '${entry.classifierId}' not found for workflow step '${entry.id}'. Register it with Mastra or pass the classifier instance directly.`,
+        );
+      }
+    }
+    if (!classifier) {
+      throw new Error(
+        `Classifier '${entry.classifierId}' not found for workflow step '${entry.id}'. Register it with Mastra or pass the classifier instance directly.`,
+      );
+    }
+    return this.executeStep({
+      ...rest,
+      step: createStepFromClassifier(classifier as any, {
+        ...entry.options,
+        id: entry.id,
+      }),
+    });
+  }
+
+  /**
+   * Executes a declarative `mapping` step: builds the mapping step from the
+   * declarative config/fn and runs it through the shared step runner.
+   */
+  async executeMapping(params: ExecuteMappingParams): Promise<StepExecutionResult> {
+    const { entry, ...rest } = params;
+    return this.executeStep({
+      ...rest,
+      step: createMappingStep(entry.id, entry.mapConfig),
+      entryDescription: entry.description,
+      entryMetadata: entry.metadata,
+    });
   }
 
   async executeParallel(params: ExecuteParallelParams): Promise<StepResult<any, any, any, any>> {

@@ -1,8 +1,14 @@
 import { TTLCache } from '@isaacs/ttlcache';
+import type { MastraScorer } from '../../evals/base';
+import { EventEmitterPubSub } from '../../events/event-emitter';
 import type { MastraLanguageModel } from '../../llm/model/shared.types';
+import { executionFailureTermination } from '../../loop/shared/execution-outcome';
+import type { Mastra } from '../../mastra';
+import { unwrapMastraTracingProxy } from '../../observability/context';
 import type { CoreTool } from '../../tools/types';
 import type { MessageList } from '../message-list';
 import type { SaveQueueManager } from '../save-queue';
+import { stopDurableExecutionParticipants } from './evented-execution';
 import type { RunRegistryEntry } from './types';
 
 /**
@@ -13,12 +19,27 @@ import type { RunRegistryEntry } from './types';
  * Entries are keyed by runId (which are unique UUIDs).
  *
  * Uses TTLCache to prevent unbounded memory growth: entries auto-expire
- * after 10 minutes (refreshed on access) and the registry is hard-capped
- * at 1000 concurrent entries.
+ * (refreshed on access) and the registry is hard-capped at 1000 concurrent
+ * entries.
+ *
+ * The TTL is a crash/leak safety net, NOT an activity timeout. A run that is
+ * actively executing — waiting on a tool, a sub-agent, or a model call — can
+ * go arbitrarily long without anything reading its entry, and disposal is
+ * destructive (it force-closes the run's stream and drops the live model and
+ * tools). Such runs hold their entry alive explicitly via `markRunActive`.
  */
+export const RUN_REGISTRY_TTL_MS = 2 * 60 * 60 * 1000;
+
+/**
+ * How often active runs re-read their registry entry to refresh the sliding
+ * TTL. Two orders of magnitude below the TTL, so a single missed tick is
+ * harmless.
+ */
+export const RUN_REGISTRY_HEARTBEAT_MS = 60 * 1000;
+
 export const globalRunRegistry = new TTLCache<string, RunRegistryEntry>({
   max: 1000,
-  ttl: 10 * 60 * 1000,
+  ttl: RUN_REGISTRY_TTL_MS,
   updateAgeOnGet: true,
   dispose: entry => {
     entry?.cleanup?.();
@@ -27,16 +48,233 @@ export const globalRunRegistry = new TTLCache<string, RunRegistryEntry>({
 });
 
 /**
+ * Read a run's registry entry as seen from a workflow step running under `mastra`.
+ *
+ * Entries are keyed only by runId, so when another Mastra instance in this
+ * process reuses the runId, a still-running workflow from the earlier run
+ * would otherwise read (and write its transcript into) the new run's entry.
+ * An entry owned by a different Mastra instance is treated as absent. An
+ * ownerless entry (a placeholder or rehydrated entry) is claimed by the first
+ * scoped reader, so a later instance reusing the runId cannot adopt it.
+ */
+export function getRunRegistryEntry(runId: string, mastra: Mastra | undefined): RunRegistryEntry | undefined {
+  const entry = globalRunRegistry.has(runId) ? globalRunRegistry.get(runId) : undefined;
+  if (!entry || !mastra) return entry;
+  if (!entry.mastra) {
+    entry.mastra = mastra;
+    return entry;
+  }
+  return unwrapMastraTracingProxy(entry.mastra) === unwrapMastraTracingProxy(mastra) ? entry : undefined;
+}
+
+/**
+ * Publish an entry for `runId`, owned by `mastra`, unless the slot holds
+ * another Mastra instance's live run. Returns whether the entry was stored.
+ */
+export function setRunRegistryEntry(runId: string, entry: RunRegistryEntry, mastra: Mastra | undefined): boolean {
+  const current = globalRunRegistry.has(runId) ? globalRunRegistry.get(runId) : undefined;
+  if (current?.mastra && mastra && unwrapMastraTracingProxy(current.mastra) !== unwrapMastraTracingProxy(mastra))
+    return false;
+  if (mastra) entry.mastra ??= mastra;
+  globalRunRegistry.set(runId, entry);
+  return true;
+}
+
+/** Remove `runId`'s entry only if it belongs to `mastra` (or has no owner). */
+export function deleteRunRegistryEntry(runId: string, mastra: Mastra | undefined): void {
+  if (getRunRegistryEntry(runId, mastra)) globalRunRegistry.delete(runId);
+}
+
+/**
+ * Scorer instances a run was configured with, keyed like the serialized
+ * `scorers` workflow input. Workflow input only carries scorer names, so a
+ * scorer passed at call time or via `defaultOptions.scorers` that is not
+ * registered on Mastra can only run in-process through this store (#27579).
+ *
+ * Kept apart from the run registry entry: callers typically `cleanup()` as
+ * soon as the output resolves, which drops that entry before the trailing
+ * scorer step runs. Entries are consumed by the scorer step; the TTL only
+ * bounds runs that never reach it.
+ */
+const runScorerInstances = new TTLCache<string, { mastra?: Mastra; scorers: Record<string, MastraScorer> }>({
+  max: 1000,
+  ttl: RUN_REGISTRY_TTL_MS,
+});
+
+export function setRunScorerInstances(
+  runId: string,
+  scorers: Record<string, MastraScorer>,
+  mastra: Mastra | undefined,
+): void {
+  if (Object.keys(scorers).length === 0) return;
+  runScorerInstances.set(runId, { mastra, scorers });
+}
+
+/** Remove and return the run's scorer instances, unless another Mastra owns them. */
+export function takeRunScorerInstances(
+  runId: string,
+  mastra: Mastra | undefined,
+): Record<string, MastraScorer> | undefined {
+  const entry = runScorerInstances.get(runId);
+  if (!entry) return undefined;
+  if (entry.mastra && mastra && unwrapMastraTracingProxy(entry.mastra) !== unwrapMastraTracingProxy(mastra)) {
+    return undefined;
+  }
+  runScorerInstances.delete(runId);
+  return entry.scorers;
+}
+
+/** runId -> number of in-flight operations holding the entry alive. */
+const activeRuns = new Map<string, number>();
+let activityHeartbeat: ReturnType<typeof setInterval> | undefined;
+
+function runActivityHeartbeat(): void {
+  // The read is the point: `updateAgeOnGet` refreshes the sliding TTL.
+  for (const runId of activeRuns.keys()) {
+    globalRunRegistry.get(runId);
+  }
+}
+
+const inFlightResumes = new Map<string, Map<string, symbol>>();
+
+/**
+ * Marks a resume of `toolCallId` on `runId` as in flight in this process,
+ * synchronously, so a concurrent resume of the same tool call can fail fast
+ * instead of queueing on the execution claim (#27365).
+ *
+ * @returns A release function, or `undefined` when that tool call already has
+ * a resume in flight. Release is idempotent and only clears its own marker.
+ */
+export function markResumeInFlight(runId: string, toolCallId: string): (() => void) | undefined {
+  let byToolCall = inFlightResumes.get(runId);
+  if (byToolCall?.has(toolCallId)) return undefined;
+  if (!byToolCall) inFlightResumes.set(runId, (byToolCall = new Map()));
+  const token = Symbol(toolCallId);
+  byToolCall.set(toolCallId, token);
+  return () => {
+    const current = inFlightResumes.get(runId);
+    if (current?.get(toolCallId) !== token) return;
+    current.delete(toolCallId);
+    if (current.size === 0) inFlightResumes.delete(runId);
+  };
+}
+
+/**
+ * Clears the in-flight marker for a tool call whose resumed segment is
+ * suspending again, so a later resume of it is not treated as a duplicate.
+ */
+export function clearResumeInFlight(runId: string, toolCallId: string): void {
+  const current = inFlightResumes.get(runId);
+  if (!current) return;
+  current.delete(toolCallId);
+  if (current.size === 0) inFlightResumes.delete(runId);
+}
+
+/**
+ * Hold a run's registry entry alive while an operation is in flight.
+ *
+ * Durable steps await work that can outlast the registry TTL (a tool or
+ * sub-agent call, a stalled model call). Nothing reads the entry while that
+ * await is pending, so the sliding TTL would otherwise expire it mid-run and
+ * dispose the live runtime state out from under the still-running workflow.
+ *
+ * Refcounted, so concurrent operations on the same run each hold their own
+ * claim. The returned release is idempotent — calling it twice releases one
+ * claim, not two. Always release in a `finally`; if a release is ever missed
+ * the entry still expires once the heartbeat stops, so this degrades safely.
+ *
+ * @param runId - The unique run identifier
+ * @returns A function that releases this claim
+ */
+export function markRunActive(runId: string): () => void {
+  activeRuns.set(runId, (activeRuns.get(runId) ?? 0) + 1);
+
+  if (!activityHeartbeat) {
+    activityHeartbeat = setInterval(runActivityHeartbeat, RUN_REGISTRY_HEARTBEAT_MS);
+    // Never keep the process alive just to refresh a cache.
+    activityHeartbeat.unref?.();
+  }
+
+  let released = false;
+  return () => {
+    if (released) return;
+    released = true;
+
+    const remaining = (activeRuns.get(runId) ?? 1) - 1;
+    if (remaining > 0) {
+      activeRuns.set(runId, remaining);
+    } else {
+      activeRuns.delete(runId);
+    }
+
+    if (activeRuns.size === 0 && activityHeartbeat) {
+      clearInterval(activityHeartbeat);
+      activityHeartbeat = undefined;
+    }
+  };
+}
+
+/**
+ * Drop all activity claims and stop the heartbeat. Tests only — production
+ * code releases claims through the function returned by `markRunActive`.
+ */
+export function __resetRunRegistryActivityForTests(): void {
+  activeRuns.clear();
+  if (activityHeartbeat) {
+    clearInterval(activityHeartbeat);
+    activityHeartbeat = undefined;
+  }
+}
+
+// `values()` can yield undefined: with `updateAgeOnGet`, `get()` on a missing
+// runId schedules an expiration for a key that has no value.
+function registryEntries(): RunRegistryEntry[] {
+  return Array.from(globalRunRegistry.values()).filter(entry => entry !== undefined);
+}
+
+export function getActiveDurableAgentWorkflowExecutions(mastra: Mastra): Promise<unknown>[] {
+  return registryEntries().flatMap(entry =>
+    entry.mastra === mastra && entry.workflowExecution ? [entry.workflowExecution] : [],
+  );
+}
+
+/**
+ * Abandon the durable-agent executions `mastra` is still running: each stops
+ * without writing and releases its run, so recovery can take it right away.
+ * Executions that already settled are left alone.
+ */
+export async function abandonDurableAgentExecutions(mastra: Mastra): Promise<void> {
+  await stopDurableExecutionParticipants(mastra);
+  const processLocal = mastra.pubsub.__rawBus() instanceof EventEmitterPubSub;
+  await Promise.allSettled(
+    registryEntries().map(async entry => {
+      if (entry.mastra !== mastra || !entry.executionFence) return;
+      // A broker does not prove that this is the only executing process.
+      if (entry.eventedExecution && !processLocal) entry.executionFence.detach();
+      else await entry.executionFence.abandon();
+    }),
+  );
+}
+
+/**
  * End a run's root spans (MODEL_GENERATION then AGENT_RUN) with an error so the trace
  * still exports — stores persist only span-end events. After a resume the fresh resume
  * spans are the active root, so prefer them. Ending an already-ended span is a no-op,
  * so the duplicate error paths (workflow failure + emitError) are safe. Never throws.
  */
-export function endRunSpansWithError(runId: string, error: Error): void {
+export function endRunSpansWithError(runId: string, error: Error, options: { endSpan?: boolean } = {}): void {
   try {
-    const entry = globalRunRegistry.get(runId);
-    (entry?.resumeModelSpan ?? entry?.modelSpan)?.error({ error, endSpan: true });
-    (entry?.resumeAgentSpan ?? entry?.agentSpan)?.error({ error, endSpan: true });
+    const entry = globalRunRegistry.has(runId) ? globalRunRegistry.get(runId) : undefined;
+    (entry?.resumeModelSpan ?? entry?.modelSpan)?.error({
+      error,
+      ...executionFailureTermination(error),
+      endSpan: options.endSpan ?? true,
+    });
+    (entry?.resumeAgentSpan ?? entry?.agentSpan)?.error({
+      error,
+      ...executionFailureTermination(error),
+      endSpan: options.endSpan ?? true,
+    });
   } catch {
     // Span bookkeeping must never break error reporting.
   }

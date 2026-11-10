@@ -1,5 +1,110 @@
 # @mastra/auth-cloud
 
+## 1.2.8
+
+### Patch Changes
+
+- dependencies updates: ([#28417](https://github.com/mastra-ai/mastra/pull/28417))
+  - Updated dependency [`@types/node@22.19.15` ↗︎](https://www.npmjs.com/package/@types/node/v/22.19.15) (from `22.20.5`, in `devDependencies`)
+- Updated dependencies [[`ce5d473`](https://github.com/mastra-ai/mastra/commit/ce5d4731eeeb44779748852618b95c5cb6485bed)]:
+  - @mastra/auth@1.1.5
+
+## 1.2.8-alpha.0
+
+### Patch Changes
+
+- dependencies updates: ([#28417](https://github.com/mastra-ai/mastra/pull/28417))
+  - Updated dependency [`@types/node@22.19.15` ↗︎](https://www.npmjs.com/package/@types/node/v/22.19.15) (from `22.20.5`, in `devDependencies`)
+- Updated dependencies [[`ce5d473`](https://github.com/mastra-ai/mastra/commit/ce5d4731eeeb44779748852618b95c5cb6485bed)]:
+  - @mastra/auth@1.1.5-alpha.0
+
+## 1.2.7
+
+### Patch Changes
+
+- Bump for npm ([#27221](https://github.com/mastra-ai/mastra/pull/27221))
+
+- Updated dependencies [[`fae54c5`](https://github.com/mastra-ai/mastra/commit/fae54c57917cd1f527937ca42b5ab7dfe1d55a2a)]:
+  - @mastra/auth@1.1.4
+
+## 1.2.7-alpha.0
+
+### Patch Changes
+
+- Bump for npm ([#27221](https://github.com/mastra-ai/mastra/pull/27221))
+
+- Updated dependencies [[`fae54c5`](https://github.com/mastra-ai/mastra/commit/fae54c57917cd1f527937ca42b5ab7dfe1d55a2a)]:
+  - @mastra/auth@1.1.4-alpha.0
+
+## 1.2.6
+
+### Patch Changes
+
+- Improved Cloud authentication portability by generating PKCE verifier and state values with Web Crypto while preserving synchronous login APIs. ([#24583](https://github.com/mastra-ai/mastra/pull/24583))
+
+## 1.2.6-alpha.0
+
+### Patch Changes
+
+- Improved Cloud authentication portability by generating PKCE verifier and state values with Web Crypto while preserving synchronous login APIs. ([#24583](https://github.com/mastra-ai/mastra/pull/24583))
+
+## 1.2.5
+
+### Patch Changes
+
+- Update README to include accurate, up-to-date information ([#22858](https://github.com/mastra-ai/mastra/pull/22858))
+
+- Remove `CHANGELOG.md` from distributed npm files resulting in reduced package size ([#22737](https://github.com/mastra-ai/mastra/pull/22737))
+
+- Updated dependencies [[`e983f74`](https://github.com/mastra-ai/mastra/commit/e983f749873189f767f509eb33d1a3596c0f1c74), [`28ce924`](https://github.com/mastra-ai/mastra/commit/28ce924276eeca492e6a360e5482ed20c2785ef6)]:
+  - @mastra/auth@1.1.3
+
+## 1.2.5-alpha.1
+
+### Patch Changes
+
+- Update README to include accurate, up-to-date information ([#22858](https://github.com/mastra-ai/mastra/pull/22858))
+
+- Updated dependencies [[`e983f74`](https://github.com/mastra-ai/mastra/commit/e983f749873189f767f509eb33d1a3596c0f1c74)]:
+  - @mastra/auth@1.1.3-alpha.1
+
+## 1.2.5-alpha.0
+
+### Patch Changes
+
+- Remove `CHANGELOG.md` from distributed npm files resulting in reduced package size ([#22737](https://github.com/mastra-ai/mastra/pull/22737))
+
+- Updated dependencies [[`28ce924`](https://github.com/mastra-ai/mastra/commit/28ce924276eeca492e6a360e5482ed20c2785ef6)]:
+  - @mastra/auth@1.1.3-alpha.0
+
+## 1.2.4
+
+### Patch Changes
+
+- Fixed reading request headers from Express-style plain header objects so cookie-based auth providers no longer throw and fail with a misleading 401. ([#21261](https://github.com/mastra-ai/mastra/pull/21261))
+
+  Related to https://github.com/mastra-ai/mastra/issues/21253
+
+## 1.2.4-alpha.0
+
+### Patch Changes
+
+- Fixed reading request headers from Express-style plain header objects so cookie-based auth providers no longer throw and fail with a misleading 401. ([#21261](https://github.com/mastra-ai/mastra/pull/21261))
+
+  Related to https://github.com/mastra-ai/mastra/issues/21253
+
+## 1.2.3
+
+### Patch Changes
+
+- Fixed a race condition in the Mastra Cloud auth provider where two users signing in with SSO at the same time could receive each other's PKCE verifier cookies. Login state is now tracked per request, keyed by the OAuth state parameter, so concurrent logins can no longer cross-wire cookies. Fixes [#20203](https://github.com/mastra-ai/mastra/issues/20203) ([#20233](https://github.com/mastra-ai/mastra/pull/20233))
+
+## 1.2.3-alpha.0
+
+### Patch Changes
+
+- Fixed a race condition in the Mastra Cloud auth provider where two users signing in with SSO at the same time could receive each other's PKCE verifier cookies. Login state is now tracked per request, keyed by the OAuth state parameter, so concurrent logins can no longer cross-wire cookies. Fixes [#20203](https://github.com/mastra-ai/mastra/issues/20203) ([#20233](https://github.com/mastra-ai/mastra/pull/20233))
+
 ## 1.2.2
 
 ### Patch Changes

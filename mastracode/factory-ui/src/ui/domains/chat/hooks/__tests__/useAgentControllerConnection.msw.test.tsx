@@ -1,0 +1,840 @@
+// @vitest-environment jsdom
+import type { AgentControllerEvent } from '@mastra/client-js';
+import { act, waitFor } from '@testing-library/react';
+import { http, HttpResponse } from 'msw';
+import { useEffect } from 'react';
+import { describe, expect, it, vi } from 'vitest';
+
+import { server } from '../../../../../../e2e/ui/msw-server';
+import { queryKeys } from '../../../../../api/keys';
+import { renderHookWithProviders, TEST_BASE_URL } from '../../../../../../e2e/ui/render';
+import { deriveConnectionStatus, useAgentControllerConnection } from '../useAgentControllerConnection';
+import { reconnectRefetchInterval } from '../../../../../hooks/useAgentControllerSessionSync';
+import { useSwitchAgentControllerThreadMutation } from '../../../../../hooks/useAgentControllerThreadMutations';
+import { HIDDEN_STREAM_GRACE_MS } from '../../../../lib/hooks/useDocumentVisible';
+
+const controllerId = 'code';
+// A Factory session: addressed by its own id, running under its Factory's shared resource.
+const sessionId = 'session-test';
+const resourceId = 'factory-test';
+const sessionUrl = `${TEST_BASE_URL}/api/agent-controller/${controllerId}/sessions/${sessionId}`;
+const hookArgs = { agentControllerId: controllerId, sessionId, resourceId, baseUrl: TEST_BASE_URL, enabled: true };
+
+describe('useAgentControllerConnection', () => {
+  it('given a session, when the connection is established, then status is ready with session state exposed', async () => {
+    const onCreate = vi.fn();
+    const onReadState = vi.fn();
+    const onStream = vi.fn();
+    const onEvent = vi.fn();
+    const observedStatuses: string[] = [];
+    let releaseState: (() => void) | undefined;
+    const stateGate = new Promise<void>(resolve => {
+      releaseState = resolve;
+    });
+
+    server.use(
+      http.post(`${TEST_BASE_URL}/api/agent-controller/${controllerId}/sessions`, () => {
+        onCreate();
+        return HttpResponse.json({ controllerId, resourceId, threadId: 'created-thread' });
+      }),
+      http.get(sessionUrl, async () => {
+        onReadState();
+        await stateGate;
+        return HttpResponse.json({
+          controllerId,
+          resourceId,
+          modeId: 'build',
+          modelId: 'openai/gpt-4o-mini',
+          threadId: 'state-thread',
+          settings: { yolo: false, thinkingLevel: 'medium', notifications: 'bell', smartEditing: true },
+        });
+      }),
+      http.get(`${sessionUrl}/stream`, () => {
+        onStream();
+        return new Response(new ReadableStream<Uint8Array>({ start() {}, cancel() {} }), {
+          headers: { 'content-type': 'text/event-stream' },
+        });
+      }),
+    );
+
+    const { result } = renderHookWithProviders(() => {
+      const connection = useAgentControllerConnection({ ...hookArgs, onEvent });
+
+      useEffect(() => {
+        observedStatuses.push(connection.status);
+      }, [connection.status]);
+
+      return connection;
+    });
+
+    await waitFor(
+      () => {
+        expect(onCreate).toHaveBeenCalled();
+        expect(onReadState).toHaveBeenCalled();
+        expect(result.current.threadId).toBe('created-thread');
+      },
+      { timeout: 2000 },
+    );
+
+    releaseState?.();
+
+    await waitFor(() => expect(result.current.status).toBe('ready'), { timeout: 2000 });
+
+    expect(result.current.threadId).toBe('state-thread');
+    expect(observedStatuses).toContain('connecting');
+    expect(observedStatuses).not.toContain('reconnecting');
+    expect(onCreate).toHaveBeenCalledTimes(1);
+    expect(onReadState).toHaveBeenCalledTimes(1);
+    expect(onStream).toHaveBeenCalledTimes(1);
+  });
+
+  it('given a repository session, when the connection initializes, then its project identity is persisted to controller state', async () => {
+    let receivedState: unknown;
+    const onEvent = vi.fn();
+
+    server.use(
+      http.post(`${TEST_BASE_URL}/api/agent-controller/${controllerId}/sessions`, () =>
+        HttpResponse.json({ controllerId, resourceId, threadId: 'created-thread' }),
+      ),
+      http.put(`${sessionUrl}/state`, async ({ request }) => {
+        receivedState = await request.json();
+        return HttpResponse.json({ ok: true });
+      }),
+      http.get(sessionUrl, () =>
+        HttpResponse.json({
+          controllerId,
+          resourceId,
+          modeId: 'build',
+          modelId: 'openai/gpt-4o-mini',
+          threadId: 'state-thread',
+          settings: { yolo: false, thinkingLevel: 'medium', notifications: 'bell', smartEditing: true },
+        }),
+      ),
+      http.get(
+        `${sessionUrl}/stream`,
+        () =>
+          new Response(new ReadableStream<Uint8Array>({ start() {}, cancel() {} }), {
+            headers: { 'content-type': 'text/event-stream' },
+          }),
+      ),
+    );
+
+    const factorySessionState = {
+      factoryProjectId: 'factory-project-1',
+      projectRepositoryId: 'project-repository-1',
+    };
+    const { result } = renderHookWithProviders(() =>
+      useAgentControllerConnection({
+        ...hookArgs,
+        factorySessionState,
+        onEvent,
+      }),
+    );
+
+    await waitFor(() => expect(result.current.status).toBe('ready'));
+    expect(receivedState).toEqual({ state: factorySessionState });
+  });
+
+  it('given a workspace session with a conventional thread id, when the connection initializes, then session creation binds that exact thread', async () => {
+    // Regression: a factory workspace's thread id is its sessionId (seeded by
+    // FactoryStartCoordinator). If init omits `threadId` and provisioning was
+    // interrupted (or storage was reset), the server binds a fresh random-id
+    // thread and the route's thread lookup 404s forever. Passing the exact id
+    // makes init a get-or-create for the conventional thread.
+    let createBody: unknown;
+    const onEvent = vi.fn();
+
+    server.use(
+      http.post(`${TEST_BASE_URL}/api/agent-controller/${controllerId}/sessions`, async ({ request }) => {
+        createBody = await request.json();
+        return HttpResponse.json({ controllerId, sessionId, resourceId, threadId: sessionId });
+      }),
+      http.get(sessionUrl, () =>
+        HttpResponse.json({
+          controllerId,
+          resourceId,
+          modeId: 'build',
+          modelId: 'openai/gpt-4o-mini',
+          threadId: sessionId,
+          settings: { yolo: false, thinkingLevel: 'medium', notifications: 'bell', smartEditing: true },
+        }),
+      ),
+      http.get(
+        `${sessionUrl}/stream`,
+        () =>
+          new Response(new ReadableStream<Uint8Array>({ start() {}, cancel() {} }), {
+            headers: { 'content-type': 'text/event-stream' },
+          }),
+      ),
+    );
+
+    const { result } = renderHookWithProviders(() =>
+      useAgentControllerConnection({
+        ...hookArgs,
+        sessionThreadId: sessionId,
+        onEvent,
+      }),
+    );
+
+    await waitFor(() => expect(result.current.status).toBe('ready'));
+    expect(createBody).toMatchObject({ resourceId, sessionId, threadId: sessionId });
+  });
+
+  it('given the event callback changes after connection, then the active stream is not resubscribed', async () => {
+    const onStream = vi.fn();
+    const onEvent = vi.fn();
+
+    server.use(
+      http.post(`${TEST_BASE_URL}/api/agent-controller/${controllerId}/sessions`, () =>
+        HttpResponse.json({ controllerId, resourceId, threadId: 'created-thread' }),
+      ),
+      http.get(sessionUrl, () =>
+        HttpResponse.json({
+          controllerId,
+          resourceId,
+          modeId: 'build',
+          modelId: 'openai/gpt-4o-mini',
+          threadId: 'state-thread',
+          settings: { yolo: false, thinkingLevel: 'medium', notifications: 'bell', smartEditing: true },
+        }),
+      ),
+      http.get(`${sessionUrl}/stream`, () => {
+        onStream();
+        return new Response(new ReadableStream<Uint8Array>({ start() {}, cancel() {} }), {
+          headers: { 'content-type': 'text/event-stream' },
+        });
+      }),
+    );
+
+    const { rerender, result } = renderHookWithProviders(() =>
+      useAgentControllerConnection({
+        ...hookArgs,
+        onEvent: event => onEvent(event),
+      }),
+    );
+
+    await waitFor(() => expect(result.current.status).toBe('ready'));
+
+    rerender();
+    rerender();
+
+    await new Promise(resolve => setTimeout(resolve, 50));
+    expect(onStream).toHaveBeenCalledTimes(1);
+  });
+
+  it('given an active stream, when a run event updates connection state, then the stream stays connected', async () => {
+    const encoder = new TextEncoder();
+    const onStream = vi.fn();
+    const onEvent = vi.fn();
+    let emit: (event: AgentControllerEvent) => void = () => {};
+
+    server.use(
+      http.post(`${TEST_BASE_URL}/api/agent-controller/${controllerId}/sessions`, () =>
+        HttpResponse.json({ controllerId, resourceId, threadId: 'created-thread' }),
+      ),
+      http.get(sessionUrl, () =>
+        HttpResponse.json({
+          controllerId,
+          resourceId,
+          modeId: 'build',
+          modelId: 'openai/gpt-4o-mini',
+          threadId: 'state-thread',
+          running: false,
+          tasks: [{ id: 'fix', content: 'Fix the bug', status: 'in_progress', activeForm: 'Fixing the bug' }],
+          settings: { yolo: false, thinkingLevel: 'medium', notifications: 'bell', smartEditing: true },
+        }),
+      ),
+      http.get(`${sessionUrl}/stream`, () => {
+        onStream();
+        return new Response(
+          new ReadableStream<Uint8Array>({
+            start(controller) {
+              emit = event => controller.enqueue(encoder.encode(`data: ${JSON.stringify(event)}\n\n`));
+            },
+            cancel() {},
+          }),
+          { headers: { 'content-type': 'text/event-stream' } },
+        );
+      }),
+    );
+
+    const { result } = renderHookWithProviders(() => useAgentControllerConnection({ ...hookArgs, onEvent }));
+    await waitFor(() => expect(result.current.status).toBe('ready'));
+
+    emit({ type: 'agent_start' });
+
+    await waitFor(() => expect(result.current.state?.running).toBe(true));
+
+    const liveTasks = [
+      { id: 'verify', content: 'Verify the fix', status: 'pending' as const, activeForm: 'Verifying the fix' },
+    ];
+    emit({ type: 'task_updated', tasks: liveTasks });
+
+    await waitFor(() => expect(result.current.state?.tasks).toEqual(liveTasks));
+    expect(result.current.status).toBe('ready');
+    expect(onStream).toHaveBeenCalledTimes(1);
+  });
+
+  it('given a state refetch started before a task event, then the stale response does not replace the live tasks', async () => {
+    const encoder = new TextEncoder();
+    const onEvent = vi.fn();
+    let emit: (event: AgentControllerEvent) => void = () => {};
+    let stateReads = 0;
+    let releaseRefetch: (() => void) | undefined;
+    const refetchGate = new Promise<void>(resolve => {
+      releaseRefetch = resolve;
+    });
+
+    server.use(
+      http.post(`${TEST_BASE_URL}/api/agent-controller/${controllerId}/sessions`, () =>
+        HttpResponse.json({ controllerId, resourceId, threadId: 'thread-1' }),
+      ),
+      http.get(sessionUrl, async ({ request }) => {
+        stateReads += 1;
+        expect(new URL(request.url).searchParams.get('threadId')).toBe('thread-1');
+        if (stateReads > 1) await refetchGate;
+        return HttpResponse.json({
+          controllerId,
+          resourceId,
+          modeId: 'build',
+          modelId: 'openai/gpt-4o-mini',
+          threadId: 'thread-1',
+          tasks: [{ id: 'old', content: 'Old task', status: 'pending', activeForm: 'Working on old task' }],
+        });
+      }),
+      http.get(
+        `${sessionUrl}/stream`,
+        () =>
+          new Response(
+            new ReadableStream<Uint8Array>({
+              start(controller) {
+                emit = event => controller.enqueue(encoder.encode(`data: ${JSON.stringify(event)}\n\n`));
+              },
+              cancel() {},
+            }),
+            { headers: { 'content-type': 'text/event-stream' } },
+          ),
+      ),
+    );
+
+    const { result, client } = renderHookWithProviders(() =>
+      useAgentControllerConnection({ ...hookArgs, sessionThreadId: 'thread-1', onEvent }),
+    );
+    await waitFor(() => expect(result.current.status).toBe('ready'));
+
+    void client.invalidateQueries({
+      queryKey: queryKeys.agentControllerConnectionState(controllerId, sessionId, 'thread-1'),
+      exact: true,
+    });
+    await waitFor(() => expect(stateReads).toBe(2));
+
+    const liveTasks = [
+      { id: 'new', content: 'New task', status: 'in_progress' as const, activeForm: 'Working on new task' },
+    ];
+    emit({ type: 'task_updated', tasks: liveTasks });
+    await waitFor(() => expect(result.current.state?.tasks).toEqual(liveTasks));
+
+    releaseRefetch?.();
+    await waitFor(() => expect(result.current.state?.tasks).toEqual(liveTasks));
+  });
+
+  it('given a state refetch started before the run ends, then the stale response does not revive the running flag', async () => {
+    const encoder = new TextEncoder();
+    const onEvent = vi.fn();
+    let emit: (event: AgentControllerEvent) => void = () => {};
+    let stateReads = 0;
+    let releaseRefetch: (() => void) | undefined;
+    const refetchGate = new Promise<void>(resolve => {
+      releaseRefetch = resolve;
+    });
+
+    server.use(
+      http.post(`${TEST_BASE_URL}/api/agent-controller/${controllerId}/sessions`, () =>
+        HttpResponse.json({ controllerId, resourceId, threadId: 'thread-1' }),
+      ),
+      http.get(sessionUrl, async () => {
+        stateReads += 1;
+        if (stateReads > 1) await refetchGate;
+        return HttpResponse.json({
+          controllerId,
+          resourceId,
+          modeId: 'build',
+          modelId: 'openai/gpt-4o-mini',
+          threadId: 'thread-1',
+          running: true,
+          tasks: [],
+        });
+      }),
+      http.get(
+        `${sessionUrl}/stream`,
+        () =>
+          new Response(
+            new ReadableStream<Uint8Array>({
+              start(controller) {
+                emit = event => controller.enqueue(encoder.encode(`data: ${JSON.stringify(event)}\n\n`));
+              },
+              cancel() {},
+            }),
+            { headers: { 'content-type': 'text/event-stream' } },
+          ),
+      ),
+    );
+
+    const { result, client } = renderHookWithProviders(() =>
+      useAgentControllerConnection({ ...hookArgs, sessionThreadId: 'thread-1', onEvent }),
+    );
+    await waitFor(() => expect(result.current.status).toBe('ready'));
+    expect(result.current.state?.running).toBe(true);
+
+    void client.invalidateQueries({
+      queryKey: queryKeys.agentControllerConnectionState(controllerId, sessionId, 'thread-1'),
+      exact: true,
+    });
+    await waitFor(() => expect(stateReads).toBe(2));
+
+    emit({ type: 'agent_end' });
+    await waitFor(() => expect(result.current.state?.running).toBe(false));
+
+    releaseRefetch?.();
+    await waitFor(() => expect(client.isFetching()).toBe(0));
+    expect(result.current.state?.running).toBe(false);
+  });
+
+  it('given reconnect polling is disconnected, then it backs off and stops at the retry cap', () => {
+    expect(reconnectRefetchInterval(true, 0)).toBe(false);
+    expect(reconnectRefetchInterval(true, 0, true)).toBe(15_000);
+    expect(reconnectRefetchInterval(true, 0, false)).toBe(false);
+    expect(reconnectRefetchInterval(false, 0)).toBe(1000);
+    expect(reconnectRefetchInterval(false, 1)).toBe(2000);
+    expect(reconnectRefetchInterval(false, 5)).toBe(30_000);
+    expect(reconnectRefetchInterval(false, 9)).toBe(30_000);
+    expect(reconnectRefetchInterval(false, 10)).toBe(false);
+  });
+
+  it('given synced state exists before the stream connects, then status remains connecting', () => {
+    expect(
+      deriveConnectionStatus({
+        initIsError: false,
+        syncIsError: false,
+        hasSyncData: true,
+        sseConnected: false,
+        hasEverConnected: false,
+        syncFailureCount: 0,
+      }),
+    ).toBe('connecting');
+  });
+
+  it('given synced state exists after the stream has connected before, then status is reconnecting', () => {
+    expect(
+      deriveConnectionStatus({
+        initIsError: false,
+        syncIsError: false,
+        hasSyncData: true,
+        sseConnected: false,
+        hasEverConnected: true,
+        syncFailureCount: 0,
+      }),
+    ).toBe('reconnecting');
+  });
+
+  it('given synced state exists but reconnect polling reaches the retry cap, then status is error', () => {
+    expect(
+      deriveConnectionStatus({
+        initIsError: false,
+        syncIsError: true,
+        hasSyncData: true,
+        sseConnected: false,
+        hasEverConnected: false,
+        syncFailureCount: 10,
+      }),
+    ).toBe('error');
+  });
+
+  it('given the stream is slow to establish, when the reconnect poll refetches state, then the in-flight stream attempt is not cancelled', async () => {
+    const onReadState = vi.fn();
+    const onStream = vi.fn();
+    const onEvent = vi.fn();
+    const observedStatuses: string[] = [];
+
+    server.use(
+      http.post(`${TEST_BASE_URL}/api/agent-controller/${controllerId}/sessions`, () =>
+        HttpResponse.json({ controllerId, resourceId, threadId: 'created-thread' }),
+      ),
+      http.get(sessionUrl, () => {
+        onReadState();
+        return HttpResponse.json({
+          controllerId,
+          resourceId,
+          modeId: 'build',
+          modelId: 'openai/gpt-4o-mini',
+          threadId: 'state-thread',
+          settings: { yolo: false, thinkingLevel: 'medium', notifications: 'bell', smartEditing: true },
+        });
+      }),
+      http.get(`${sessionUrl}/stream`, async () => {
+        onStream();
+        // Slower than the 1s reconnect poll — the poll fires while this
+        // stream is still connecting.
+        await new Promise(resolve => setTimeout(resolve, 1600));
+        return new Response(new ReadableStream<Uint8Array>({ start() {}, cancel() {} }), {
+          headers: { 'content-type': 'text/event-stream' },
+        });
+      }),
+    );
+
+    const { result } = renderHookWithProviders(() => {
+      const connection = useAgentControllerConnection({ ...hookArgs, onEvent });
+
+      useEffect(() => {
+        observedStatuses.push(connection.status);
+      }, [connection.status]);
+
+      return connection;
+    });
+
+    // The poll refetches state at least once while the stream is connecting…
+    await waitFor(() => expect(onReadState.mock.calls.length).toBeGreaterThanOrEqual(2), { timeout: 2500 });
+    // …and the slow stream still connects instead of being torn down.
+    await waitFor(() => expect(result.current.status).toBe('ready'), { timeout: 3000 });
+
+    expect(onStream).toHaveBeenCalledTimes(1);
+    expect(observedStatuses).not.toContain('reconnecting');
+  });
+
+  it('given an active stream, when the session state is refetched, then the stream is not torn down', async () => {
+    const onStream = vi.fn();
+    const onEvent = vi.fn();
+    const observedStatuses: string[] = [];
+
+    server.use(
+      http.post(`${TEST_BASE_URL}/api/agent-controller/${controllerId}/sessions`, () =>
+        HttpResponse.json({ controllerId, resourceId, threadId: 'created-thread' }),
+      ),
+      http.get(sessionUrl, () =>
+        HttpResponse.json({
+          controllerId,
+          resourceId,
+          modeId: 'build',
+          modelId: 'openai/gpt-4o-mini',
+          threadId: 'state-thread',
+          settings: { yolo: false, thinkingLevel: 'medium', notifications: 'bell', smartEditing: true },
+        }),
+      ),
+      http.get(`${sessionUrl}/stream`, () => {
+        onStream();
+        return new Response(new ReadableStream<Uint8Array>({ start() {}, cancel() {} }), {
+          headers: { 'content-type': 'text/event-stream' },
+        });
+      }),
+    );
+
+    const { client, result } = renderHookWithProviders(() => {
+      const connection = useAgentControllerConnection({ ...hookArgs, onEvent });
+
+      useEffect(() => {
+        observedStatuses.push(connection.status);
+      }, [connection.status]);
+
+      return connection;
+    });
+
+    await waitFor(() => expect(result.current.status).toBe('ready'));
+
+    // A refetch bumps dataUpdatedAt (the subscription epoch) — e.g. a mutation
+    // invalidating controller state. The established stream must survive it.
+    await client.invalidateQueries({
+      queryKey: queryKeys.agentControllerConnectionState(controllerId, sessionId),
+    });
+
+    await new Promise(resolve => setTimeout(resolve, 50));
+    expect(onStream).toHaveBeenCalledTimes(1);
+    expect(result.current.status).toBe('ready');
+    expect(observedStatuses).not.toContain('reconnecting');
+  });
+
+  it('given an active stream, when the tab is hidden briefly, then the stream stays open; when hidden past the grace period, then it is released and reconnects once visible', async () => {
+    const onStream = vi.fn();
+    const onEvent = vi.fn();
+    const observedStatuses: string[] = [];
+
+    const setDocumentVisibility = (state: 'visible' | 'hidden') => {
+      Object.defineProperty(document, 'visibilityState', { value: state, configurable: true });
+      document.dispatchEvent(new Event('visibilitychange'));
+    };
+
+    server.use(
+      http.post(`${TEST_BASE_URL}/api/agent-controller/${controllerId}/sessions`, () =>
+        HttpResponse.json({ controllerId, resourceId, threadId: 'created-thread' }),
+      ),
+      http.get(sessionUrl, () =>
+        HttpResponse.json({
+          controllerId,
+          resourceId,
+          modeId: 'build',
+          modelId: 'openai/gpt-4o-mini',
+          threadId: 'state-thread',
+          settings: { yolo: false, thinkingLevel: 'medium', notifications: 'bell', smartEditing: true },
+        }),
+      ),
+      http.get(`${sessionUrl}/stream`, () => {
+        onStream();
+        return new Response(new ReadableStream<Uint8Array>({ start() {}, cancel() {} }), {
+          headers: { 'content-type': 'text/event-stream' },
+        });
+      }),
+    );
+
+    const { result } = renderHookWithProviders(() => {
+      const connection = useAgentControllerConnection({ ...hookArgs, onEvent });
+      observedStatuses.push(connection.status);
+      return connection;
+    });
+    await waitFor(() => expect(result.current.status).toBe('ready'));
+    vi.useFakeTimers({ shouldAdvanceTime: true });
+
+    try {
+      // A quick tab switch keeps the stream and never reports a reconnect.
+      observedStatuses.length = 0;
+      act(() => setDocumentVisibility('hidden'));
+      act(() => vi.advanceTimersByTime(HIDDEN_STREAM_GRACE_MS - 1_000));
+      act(() => setDocumentVisibility('visible'));
+      await new Promise(resolve => setTimeout(resolve, 50));
+      expect(onStream).toHaveBeenCalledTimes(1);
+      expect(observedStatuses).not.toContain('reconnecting');
+
+      // A tab left hidden releases the stream and nothing reconnects while hidden.
+      act(() => setDocumentVisibility('hidden'));
+      act(() => vi.advanceTimersByTime(HIDDEN_STREAM_GRACE_MS));
+      await new Promise(resolve => setTimeout(resolve, 50));
+      expect(onStream).toHaveBeenCalledTimes(1);
+
+      act(() => setDocumentVisibility('visible'));
+      await waitFor(() => expect(onStream).toHaveBeenCalledTimes(2));
+      await waitFor(() => expect(result.current.status).toBe('ready'));
+    } finally {
+      vi.useRealTimers();
+      setDocumentVisibility('visible');
+    }
+  });
+
+  it('given the stream drops, when the state re-sync succeeds, then the hook resubscribes and returns to ready', async () => {
+    const onReadState = vi.fn();
+    const onStream = vi.fn();
+    const onEvent = vi.fn();
+
+    server.use(
+      http.post(`${TEST_BASE_URL}/api/agent-controller/${controllerId}/sessions`, () =>
+        HttpResponse.json({ controllerId, resourceId, threadId: 'created-thread' }),
+      ),
+      http.get(sessionUrl, () => {
+        onReadState();
+        return HttpResponse.json({
+          controllerId,
+          resourceId,
+          modeId: 'build',
+          modelId: 'openai/gpt-4o-mini',
+          threadId: `state-thread-${onReadState.mock.calls.length}`,
+          settings: { yolo: false, thinkingLevel: 'medium', notifications: 'bell', smartEditing: true },
+        });
+      }),
+      http.get(`${sessionUrl}/stream`, () => {
+        onStream();
+        if (onStream.mock.calls.length === 1) {
+          return new Response(
+            new ReadableStream<Uint8Array>({
+              start(controller) {
+                setTimeout(() => controller.error(new Error('stream dropped')), 0);
+              },
+            }),
+            { headers: { 'content-type': 'text/event-stream' } },
+          );
+        }
+        return new Response(new ReadableStream<Uint8Array>({ start() {}, cancel() {} }), {
+          headers: { 'content-type': 'text/event-stream' },
+        });
+      }),
+    );
+
+    const { result } = renderHookWithProviders(() => useAgentControllerConnection({ ...hookArgs, onEvent }));
+
+    await waitFor(() => expect(onStream).toHaveBeenCalledTimes(1));
+    await waitFor(() => expect(onReadState.mock.calls.length).toBeGreaterThanOrEqual(2), { timeout: 2500 });
+    await waitFor(() => expect(onStream).toHaveBeenCalledTimes(2));
+    await waitFor(() => expect(result.current.status).toBe('ready'));
+
+    await waitFor(() => expect(result.current.state?.threadId).toBe(`state-thread-${onReadState.mock.calls.length}`));
+  });
+
+  it('given the stream drops and recovers, then the resource message windows are invalidated to close the event gap', async () => {
+    const onStream = vi.fn();
+    const onEvent = vi.fn();
+
+    server.use(
+      http.post(`${TEST_BASE_URL}/api/agent-controller/${controllerId}/sessions`, () =>
+        HttpResponse.json({ controllerId, resourceId, threadId: 'created-thread' }),
+      ),
+      http.get(sessionUrl, () =>
+        HttpResponse.json({
+          controllerId,
+          resourceId,
+          modeId: 'build',
+          modelId: 'openai/gpt-4o-mini',
+          threadId: 'state-thread',
+          settings: { yolo: false, thinkingLevel: 'medium', notifications: 'bell', smartEditing: true },
+        }),
+      ),
+      http.get(`${sessionUrl}/stream`, () => {
+        onStream();
+        if (onStream.mock.calls.length === 1) {
+          return new Response(
+            new ReadableStream<Uint8Array>({
+              start(controller) {
+                setTimeout(() => controller.error(new Error('stream dropped')), 0);
+              },
+            }),
+            { headers: { 'content-type': 'text/event-stream' } },
+          );
+        }
+        return new Response(new ReadableStream<Uint8Array>({ start() {}, cancel() {} }), {
+          headers: { 'content-type': 'text/event-stream' },
+        });
+      }),
+    );
+
+    const { client, result } = renderHookWithProviders(() => useAgentControllerConnection({ ...hookArgs, onEvent }));
+
+    const messagesKey = queryKeys.agentControllerThreadMessages(controllerId, sessionId, 'thread-x', 100);
+    const otherResourceKey = queryKeys.agentControllerThreadMessages(controllerId, 'other-resource', 'thread-y', 100);
+    client.setQueryData(messagesKey, []);
+    client.setQueryData(otherResourceKey, []);
+
+    await waitFor(() => expect(onStream).toHaveBeenCalledTimes(2), { timeout: 2500 });
+    await waitFor(() => expect(result.current.status).toBe('ready'));
+
+    await waitFor(() => expect(client.getQueryState(messagesKey)?.isInvalidated).toBe(true));
+    expect(client.getQueryState(otherResourceKey)?.isInvalidated).toBe(false);
+  });
+  it('given the stream drops and recovers, then the session state is refetched to close the event gap', async () => {
+    const onStream = vi.fn();
+    const onEvent = vi.fn();
+
+    server.use(
+      http.post(`${TEST_BASE_URL}/api/agent-controller/${controllerId}/sessions`, () =>
+        HttpResponse.json({ controllerId, resourceId, threadId: 'created-thread' }),
+      ),
+      http.get(sessionUrl, () => {
+        const afterReconnect = onStream.mock.calls.length >= 2;
+        return HttpResponse.json({
+          controllerId,
+          resourceId,
+          modeId: 'build',
+          modelId: 'openai/gpt-4o-mini',
+          threadId: afterReconnect ? 'state-thread-after-gap' : 'state-thread',
+          running: false,
+          settings: { yolo: false, thinkingLevel: 'medium', notifications: 'bell', smartEditing: true },
+        });
+      }),
+      http.get(`${sessionUrl}/stream`, () => {
+        onStream();
+        if (onStream.mock.calls.length === 1) {
+          return new Response(
+            new ReadableStream<Uint8Array>({
+              start(controller) {
+                setTimeout(() => controller.error(new Error('stream dropped')), 0);
+              },
+            }),
+            { headers: { 'content-type': 'text/event-stream' } },
+          );
+        }
+        return new Response(new ReadableStream<Uint8Array>({ start() {}, cancel() {} }), {
+          headers: { 'content-type': 'text/event-stream' },
+        });
+      }),
+    );
+
+    const { result } = renderHookWithProviders(() => useAgentControllerConnection({ ...hookArgs, onEvent }));
+
+    await waitFor(() => expect(onStream).toHaveBeenCalledTimes(2), { timeout: 2500 });
+    await waitFor(() => expect(result.current.status).toBe('ready'));
+
+    await waitFor(() => expect(result.current.state?.threadId).toBe('state-thread-after-gap'), { timeout: 3000 });
+  });
+
+  it('refetches the visible message window when server state completes a run without an end event', async () => {
+    const onEvent = vi.fn();
+    let running = true;
+    server.use(
+      http.post(`${TEST_BASE_URL}/api/agent-controller/${controllerId}/sessions`, () =>
+        HttpResponse.json({ controllerId, resourceId, threadId: 'created-thread' }),
+      ),
+      http.get(sessionUrl, () =>
+        HttpResponse.json({
+          controllerId,
+          resourceId,
+          threadId: 'state-thread',
+          running,
+          settings: { yolo: false, thinkingLevel: 'medium', notifications: 'bell', smartEditing: true },
+        }),
+      ),
+      http.get(
+        `${sessionUrl}/stream`,
+        () =>
+          new Response(new ReadableStream<Uint8Array>({ start() {}, cancel() {} }), {
+            headers: { 'content-type': 'text/event-stream' },
+          }),
+      ),
+    );
+
+    const { client, result } = renderHookWithProviders(() => useAgentControllerConnection({ ...hookArgs, onEvent }));
+    await waitFor(() => expect(result.current.state?.running).toBe(true));
+    const messagesKey = queryKeys.agentControllerThreadMessages(controllerId, sessionId, 'state-thread', 100);
+    client.setQueryData(messagesKey, []);
+    const stateKey = queryKeys.agentControllerConnectionState(controllerId, sessionId);
+    running = false;
+    await client.invalidateQueries({ queryKey: stateKey, exact: true });
+
+    await waitFor(() => expect(result.current.state?.running).toBe(false));
+    await waitFor(() => expect(client.getQueryState(messagesKey)?.isInvalidated).toBe(true));
+  });
+
+  it('reports the thread a switch bound the session to, not the thread its state is read for', async () => {
+    let activeThreadId = 'primary-thread';
+    server.use(
+      http.post(`${TEST_BASE_URL}/api/agent-controller/${controllerId}/sessions`, () =>
+        HttpResponse.json({ controllerId, resourceId, threadId: activeThreadId }),
+      ),
+      http.get(sessionUrl, ({ request }) =>
+        HttpResponse.json({
+          controllerId,
+          resourceId,
+          threadId: new URL(request.url).searchParams.get('threadId') ?? activeThreadId,
+          settings: { yolo: false, thinkingLevel: 'medium', notifications: 'bell', smartEditing: true },
+        }),
+      ),
+      http.post(`${sessionUrl}/thread`, async ({ request }) => {
+        activeThreadId = ((await request.json()) as { threadId: string }).threadId;
+        return HttpResponse.json({ ok: true });
+      }),
+      http.get(
+        `${sessionUrl}/stream`,
+        () =>
+          new Response(new ReadableStream<Uint8Array>({ start() {}, cancel() {} }), {
+            headers: { 'content-type': 'text/event-stream' },
+          }),
+      ),
+    );
+
+    const { result } = renderHookWithProviders(() => ({
+      connection: useAgentControllerConnection({ ...hookArgs, sessionThreadId: 'primary-thread', onEvent: vi.fn() }),
+      switchThread: useSwitchAgentControllerThreadMutation(hookArgs),
+    }));
+    await waitFor(() => expect(result.current.connection.status).toBe('ready'), { timeout: 2000 });
+    expect(result.current.connection.threadId).toBe('primary-thread');
+
+    await result.current.switchThread.mutateAsync('secondary-thread');
+    await waitFor(() => expect(result.current.connection.threadId).toBe('secondary-thread'));
+
+    await result.current.switchThread.mutateAsync('primary-thread');
+    await waitFor(() => expect(result.current.connection.threadId).toBe('primary-thread'));
+  });
+});

@@ -1,5 +1,6 @@
 // @vitest-environment jsdom
 import { cleanup, fireEvent, render, screen, within } from '@testing-library/react';
+import userEvent from '@testing-library/user-event';
 import type { ComponentProps } from 'react';
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import { AskUser } from './ask-user';
@@ -13,7 +14,246 @@ const renderAskUser = (payload: AskUserPayload, overrides: Partial<ComponentProp
 
 afterEach(cleanup);
 
+// Base UI's Radio synthesizes a PointerEvent on click, which jsdom does not
+// implement. Polyfill it with the available MouseEvent constructor.
+
 describe('AskUser', () => {
+  describe.each(['single_select', 'multi_select'] as const)('when a %s custom answer loses focus', selectionMode => {
+    const payload: AskUserPayload = {
+      question: 'Pick a fruit',
+      options: [{ label: 'Apple' }, { label: 'Banana' }],
+      selectionMode,
+    };
+    const selectionControlRole = selectionMode === 'multi_select' ? 'checkbox' : 'radio';
+
+    it.each(['', ' \t  '])('unselects Other when the draft is %j without submitting', answerText => {
+      const { onSubmit } = renderAskUser(payload);
+      const customAnswerChoice = screen.getByRole(selectionControlRole, { name: 'Other…' });
+      fireEvent.click(customAnswerChoice);
+      const input = screen.getByRole('textbox', { name: 'Your answer' });
+      fireEvent.change(input, { target: { value: answerText } });
+      fireEvent.blur(input);
+
+      expect(customAnswerChoice.getAttribute('aria-checked')).toBe('false');
+      expect(screen.queryByRole('textbox')).toBeNull();
+      expect(onSubmit).not.toHaveBeenCalled();
+    });
+
+    it('keeps a non-empty custom answer selected without submitting', () => {
+      const { onSubmit } = renderAskUser(payload);
+      fireEvent.click(screen.getByRole(selectionControlRole, { name: 'Other…' }));
+      const input = screen.getByRole<HTMLInputElement>('textbox', { name: 'Your answer' });
+      fireEvent.change(input, { target: { value: '  Pear  ' } });
+      fireEvent.blur(input);
+
+      expect(screen.getByRole(selectionControlRole, { name: 'Other…' }).getAttribute('aria-checked')).toBe('true');
+      expect(input.value).toBe('  Pear  ');
+      expect(onSubmit).not.toHaveBeenCalled();
+    });
+
+    it('unselects an empty custom answer when keyboard focus moves away', async () => {
+      const { onSubmit } = renderAskUser(payload);
+      const user = userEvent.setup();
+      await user.click(screen.getByRole(selectionControlRole, { name: 'Other…' }));
+      await user.tab({ shift: true });
+
+      expect(screen.getByRole(selectionControlRole, { name: 'Other…' }).getAttribute('aria-checked')).toBe('false');
+      expect(screen.queryByRole('textbox')).toBeNull();
+      expect(onSubmit).not.toHaveBeenCalled();
+    });
+  });
+
+  describe('when Other is selected for a single-select question', () => {
+    const payload: AskUserPayload = { question: 'Pick a fruit', options: [{ label: 'Apple' }, { label: 'Banana' }] };
+
+    it('focuses the input inside the Other row without submitting the UI choice', () => {
+      const { onSubmit } = renderAskUser(payload);
+      fireEvent.click(screen.getByRole('group', { name: 'Custom answer' }));
+
+      const customAnswerRow = screen.getByRole('group', { name: 'Custom answer' });
+      expect(document.activeElement).toBe(within(customAnswerRow).getByRole('textbox', { name: 'Your answer' }));
+      expect(within(customAnswerRow).getByRole('radio', { name: 'Other…' })).toBeTruthy();
+      expect(screen.queryByText('Your answer')).toBeNull();
+      expect(onSubmit).not.toHaveBeenCalled();
+    });
+
+    it.each(['Enter', 'button'])('submits trimmed custom text using %s', submissionMethod => {
+      const { onSubmit } = renderAskUser(payload);
+      fireEvent.click(screen.getByRole('radio', { name: 'Other…' }));
+      const input = screen.getByRole('textbox', { name: 'Your answer' });
+      fireEvent.change(input, { target: { value: '  Pear, locally grown  ' } });
+
+      if (submissionMethod === 'Enter') fireEvent.keyDown(input, { key: 'Enter' });
+      else fireEvent.click(screen.getByRole('button', { name: 'Submit answer' }));
+
+      expect(onSubmit).toHaveBeenCalledExactlyOnceWith('Pear, locally grown');
+    });
+
+    it('rejects whitespace-only custom text', () => {
+      const { onSubmit } = renderAskUser(payload);
+      fireEvent.click(screen.getByRole('radio', { name: 'Other…' }));
+      const input = screen.getByRole('textbox', { name: 'Your answer' });
+      fireEvent.change(input, { target: { value: '   ' } });
+      fireEvent.keyDown(input, { key: 'Enter' });
+
+      expect(screen.getByRole<HTMLButtonElement>('button', { name: 'Submit answer' }).disabled).toBe(true);
+      expect(onSubmit).not.toHaveBeenCalled();
+    });
+
+    it('submits only the suggested option when the user switches back', () => {
+      const { onSubmit } = renderAskUser(payload);
+      fireEvent.click(screen.getByRole('radio', { name: 'Other…' }));
+      fireEvent.change(screen.getByRole('textbox'), { target: { value: 'Pear' } });
+      fireEvent.click(screen.getByRole('radio', { name: 'Apple' }));
+
+      expect(onSubmit).toHaveBeenCalledExactlyOnceWith('Apple');
+      expect(screen.queryByRole('textbox')).toBeNull();
+    });
+
+    it('retains the draft while blocking submission during a pending response', () => {
+      const { onSubmit, rerender } = renderAskUser(payload);
+      fireEvent.click(screen.getByRole('radio', { name: 'Other…' }));
+      fireEvent.change(screen.getByRole('textbox'), { target: { value: 'Pear' } });
+      rerender(<AskUser payload={payload} isSubmitting onSubmit={onSubmit} />);
+      fireEvent.keyDown(screen.getByRole('textbox'), { key: 'Enter' });
+
+      expect(screen.getByRole<HTMLInputElement>('textbox').disabled).toBe(true);
+      expect(screen.getByRole<HTMLButtonElement>('button', { name: 'Submit answer' }).disabled).toBe(true);
+      expect(onSubmit).not.toHaveBeenCalled();
+
+      rerender(<AskUser payload={payload} onSubmit={onSubmit} />);
+      fireEvent.click(screen.getByRole('button', { name: 'Submit answer' }));
+      expect(onSubmit).toHaveBeenCalledExactlyOnceWith('Pear');
+    });
+
+    it('resets the custom choice and draft when the question changes', () => {
+      const { onSubmit, rerender } = renderAskUser(payload);
+      fireEvent.click(screen.getByRole('radio', { name: 'Other…' }));
+      fireEvent.change(screen.getByRole('textbox'), { target: { value: 'Pear' } });
+      rerender(<AskUser payload={{ ...payload, question: 'Pick another fruit' }} onSubmit={onSubmit} />);
+      expect(screen.queryByRole('textbox')).toBeNull();
+      fireEvent.click(screen.getByRole('radio', { name: 'Other…' }));
+
+      expect(screen.getByRole<HTMLInputElement>('textbox').value).toBe('');
+    });
+
+    it('does not submit an Enter key used to compose text', () => {
+      const { onSubmit } = renderAskUser(payload);
+      fireEvent.click(screen.getByRole('radio', { name: 'Other…' }));
+      const input = screen.getByRole('textbox');
+      fireEvent.change(input, { target: { value: '梨' } });
+      fireEvent.keyDown(input, { key: 'Enter', isComposing: true });
+
+      expect(onSubmit).not.toHaveBeenCalled();
+    });
+  });
+
+  describe('when an option label matches the internal custom choice', () => {
+    it('submits the real label as an ordinary option', () => {
+      const { onSubmit } = renderAskUser({ question: 'Choose a value', options: [{ label: 'custom' }] });
+      fireEvent.click(screen.getByRole('radio', { name: 'custom' }));
+
+      expect(onSubmit).toHaveBeenCalledExactlyOnceWith('custom');
+      expect(screen.queryByRole('textbox')).toBeNull();
+    });
+  });
+
+  describe('when Other is checked for a multi-select question', () => {
+    const payload: AskUserPayload = {
+      question: 'Pick toppings',
+      options: [{ label: 'Cheese' }, { label: 'Olives' }],
+      selectionMode: 'multi_select',
+    };
+
+    it.each(['Enter', 'button'])('submits selected labels plus trimmed custom text using %s', submissionMethod => {
+      const { onSubmit } = renderAskUser(payload);
+      fireEvent.click(screen.getByRole('checkbox', { name: 'Cheese' }));
+      fireEvent.click(screen.getByRole('checkbox', { name: 'Other…' }));
+      const input = screen.getByRole('textbox', { name: 'Your answer' });
+      fireEvent.change(input, { target: { value: '  Roasted peppers  ' } });
+      expect(onSubmit).not.toHaveBeenCalled();
+
+      if (submissionMethod === 'Enter') fireEvent.keyDown(input, { key: 'Enter' });
+      else fireEvent.click(screen.getByRole('button', { name: 'Submit answer' }));
+
+      expect(onSubmit).toHaveBeenCalledExactlyOnceWith(['Cheese', 'Roasted peppers']);
+    });
+
+    it('allows a custom answer without suggested selections', () => {
+      const { onSubmit } = renderAskUser(payload);
+      fireEvent.click(screen.getByRole('checkbox', { name: 'Other…' }));
+      fireEvent.change(screen.getByRole('textbox'), { target: { value: 'Roasted peppers' } });
+      fireEvent.click(screen.getByRole('button', { name: 'Submit answer' }));
+
+      expect(onSubmit).toHaveBeenCalledExactlyOnceWith(['Roasted peppers']);
+    });
+
+    it('preserves suggested selections and allows submission after an empty custom answer loses focus', async () => {
+      const { onSubmit } = renderAskUser(payload);
+      const user = userEvent.setup();
+      await user.click(screen.getByRole('checkbox', { name: 'Cheese' }));
+      await user.click(screen.getByRole('checkbox', { name: 'Other…' }));
+      await user.type(screen.getByRole('textbox', { name: 'Your answer' }), '   ');
+      await user.click(screen.getByText('Pick toppings'));
+
+      expect(screen.getByRole('checkbox', { name: 'Cheese' }).getAttribute('aria-checked')).toBe('true');
+      expect(screen.getByRole('checkbox', { name: 'Other…' }).getAttribute('aria-checked')).toBe('false');
+      expect(screen.queryByRole('textbox')).toBeNull();
+      await user.click(screen.getByRole('button', { name: 'Submit answer' }));
+      expect(onSubmit).toHaveBeenCalledExactlyOnceWith(['Cheese']);
+    });
+
+    it('stays unchecked when the user clicks the checkbox while the custom answer is empty', async () => {
+      const { onSubmit } = renderAskUser(payload);
+      const user = userEvent.setup();
+      const customAnswerCheckbox = screen.getByRole('checkbox', { name: 'Other…' });
+      await user.click(customAnswerCheckbox);
+      await user.click(customAnswerCheckbox);
+
+      expect(customAnswerCheckbox.getAttribute('aria-checked')).toBe('false');
+      expect(screen.queryByRole('textbox')).toBeNull();
+      expect(onSubmit).not.toHaveBeenCalled();
+    });
+
+    it('requires custom text when Other is checked even if an option is selected', () => {
+      const { onSubmit } = renderAskUser(payload);
+      fireEvent.click(screen.getByRole('checkbox', { name: 'Cheese' }));
+      fireEvent.click(screen.getByRole('checkbox', { name: 'Other…' }));
+      const input = screen.getByRole('textbox');
+      fireEvent.change(input, { target: { value: '   ' } });
+      fireEvent.keyDown(input, { key: 'Enter' });
+
+      expect(screen.getByRole<HTMLButtonElement>('button', { name: 'Submit answer' }).disabled).toBe(true);
+      expect(onSubmit).not.toHaveBeenCalled();
+    });
+
+    it('excludes the custom draft when Other is unchecked', () => {
+      const { onSubmit } = renderAskUser(payload);
+      fireEvent.click(screen.getByRole('checkbox', { name: 'Cheese' }));
+      fireEvent.click(screen.getByRole('checkbox', { name: 'Other…' }));
+      fireEvent.change(screen.getByRole('textbox'), { target: { value: 'Roasted peppers' } });
+      fireEvent.click(screen.getByRole('checkbox', { name: 'Other…' }));
+      fireEvent.click(screen.getByRole('button', { name: 'Submit answer' }));
+
+      expect(onSubmit).toHaveBeenCalledExactlyOnceWith(['Cheese']);
+    });
+
+    it('keeps the checkbox mounted and restores the draft when Other is checked again', () => {
+      renderAskUser(payload);
+      const customAnswerCheckbox = screen.getByRole('checkbox', { name: 'Other…' });
+      fireEvent.click(customAnswerCheckbox);
+      const customAnswerRow = screen.getByRole('group', { name: 'Custom answer' });
+      fireEvent.change(within(customAnswerRow).getByRole('textbox'), { target: { value: 'Roasted peppers' } });
+      fireEvent.click(customAnswerCheckbox);
+
+      expect(screen.getByRole('checkbox', { name: 'Other…' })).toBe(customAnswerCheckbox);
+      expect(within(customAnswerRow).queryByRole('textbox')).toBeNull();
+      fireEvent.click(customAnswerCheckbox);
+      expect(within(customAnswerRow).getByRole<HTMLInputElement>('textbox').value).toBe('Roasted peppers');
+      expect(document.activeElement).toBe(within(customAnswerRow).getByRole('textbox'));
+    });
+  });
+
   describe('when free text is submitted with Enter', () => {
     it('submits the trimmed answer', () => {
       const { onSubmit } = renderAskUser({ question: 'What is your name?' });
@@ -78,7 +318,7 @@ describe('AskUser', () => {
     });
   });
 
-  describe('when a single selection is chosen', () => {
+  describe('when a single-select option is clicked', () => {
     it('submits the chosen label immediately', () => {
       const { onSubmit } = renderAskUser({
         question: 'Pick a fruit',
@@ -86,7 +326,7 @@ describe('AskUser', () => {
         selectionMode: 'single_select',
       });
 
-      fireEvent.click(screen.getByRole<HTMLInputElement>('radio', { name: 'Apple' }));
+      fireEvent.click(screen.getByRole('radio', { name: 'Apple' }));
 
       expect(onSubmit).toHaveBeenCalledWith('Apple');
     });
@@ -112,10 +352,74 @@ describe('AskUser', () => {
         selectionMode: 'multi_select',
       });
 
-      fireEvent.click(screen.getByRole<HTMLInputElement>('checkbox', { name: 'Cheese' }));
-      fireEvent.click(screen.getByRole<HTMLInputElement>('checkbox', { name: 'Olives' }));
+      fireEvent.click(screen.getByRole('checkbox', { name: 'Cheese' }));
+      fireEvent.click(screen.getByRole('checkbox', { name: 'Olives' }));
 
       expect(onSubmit).not.toHaveBeenCalled();
+    });
+  });
+
+  describe('when a multiple selection is unticked', () => {
+    it('submits only what is left ticked', () => {
+      const { onSubmit } = renderAskUser({
+        question: 'Pick toppings',
+        options: [{ label: 'Cheese' }, { label: 'Olives' }],
+        selectionMode: 'multi_select',
+      });
+
+      fireEvent.click(screen.getByRole('checkbox', { name: 'Cheese' }));
+      fireEvent.click(screen.getByRole('checkbox', { name: 'Olives' }));
+      fireEvent.click(screen.getByRole('checkbox', { name: 'Cheese' }));
+
+      expect(screen.getByRole('checkbox', { name: 'Cheese' }).getAttribute('aria-checked')).toBe('false');
+      expect(screen.getByRole('checkbox', { name: 'Olives' }).getAttribute('aria-checked')).toBe('true');
+
+      fireEvent.click(screen.getByRole('button', { name: /confirm|submit/i }));
+
+      expect(onSubmit).toHaveBeenCalledWith(['Olives']);
+    });
+  });
+
+  describe('when a single-select option is clicked without an explicit selection mode', () => {
+    it('shows the choice as made', () => {
+      renderAskUser({ question: 'Pick a fruit', options: [{ label: 'Apple' }, { label: 'Pear' }] });
+
+      fireEvent.click(screen.getByRole('radio', { name: /Apple/ }));
+
+      expect(screen.getByRole('radio', { name: /Apple/ }).getAttribute('aria-checked')).toBe('true');
+    });
+  });
+
+  describe('when the options change under the same question', () => {
+    it('starts the choice over', () => {
+      const { rerender } = render(
+        <AskUser
+          payload={{ question: 'Pick a fruit', options: [{ label: 'Apple' }], selectionMode: 'multi_select' }}
+          onSubmit={vi.fn()}
+        />,
+      );
+      fireEvent.click(screen.getByRole('checkbox', { name: 'Apple' }));
+      expect(screen.getByRole('checkbox', { name: 'Apple' }).getAttribute('aria-checked')).toBe('true');
+
+      rerender(
+        <AskUser
+          payload={{ question: 'Pick a fruit', options: [{ label: 'Pear' }], selectionMode: 'multi_select' }}
+          onSubmit={vi.fn()}
+        />,
+      );
+
+      expect(screen.getByRole('checkbox', { name: 'Pear' }).getAttribute('aria-checked')).toBe('false');
+    });
+  });
+
+  describe('when free text holds nothing but spaces', () => {
+    it('keeps the submit button out of reach', () => {
+      renderAskUser({ question: 'What is your name?' });
+      const input = screen.getByRole<HTMLInputElement>('textbox', { name: 'What is your name?' });
+
+      fireEvent.change(input, { target: { value: '   ' } });
+
+      expect(screen.getByRole<HTMLButtonElement>('button', { name: 'Submit answer' }).disabled).toBe(true);
     });
   });
 
@@ -127,8 +431,8 @@ describe('AskUser', () => {
         selectionMode: 'multi_select',
       });
       const group = screen.getByRole('group', { name: 'Pick toppings' });
-      fireEvent.click(within(group).getByRole<HTMLInputElement>('checkbox', { name: 'Cheese' }));
-      fireEvent.click(within(group).getByRole<HTMLInputElement>('checkbox', { name: 'Olives' }));
+      fireEvent.click(within(group).getByRole('checkbox', { name: 'Cheese' }));
+      fireEvent.click(within(group).getByRole('checkbox', { name: 'Olives' }));
 
       fireEvent.click(within(group).getByRole<HTMLButtonElement>('button', { name: 'Submit answer' }));
 
@@ -146,7 +450,7 @@ describe('AskUser', () => {
     it('disables the option controls', () => {
       renderAskUser(payload, { isSubmitting: true });
 
-      expect(screen.getByRole<HTMLInputElement>('radio', { name: 'Apple' }).disabled).toBe(true);
+      expect(screen.getByRole('radio', { name: 'Apple' }).getAttribute('aria-disabled')).toBe('true');
     });
 
     it('announces the pending state', () => {
@@ -158,13 +462,15 @@ describe('AskUser', () => {
 
   describe('when an answer result exists', () => {
     it('renders the answer without option controls', () => {
-      renderAskUser(
+      const { container } = renderAskUser(
         { question: 'Pick a fruit', options: [{ label: 'Apple' }] },
         { result: { content: 'User answered: Apple', isError: false } },
       );
 
+      const status = screen.getByRole('status');
       expect(screen.queryByRole('radio')).toBeNull();
-      expect(screen.getByRole('status').textContent).toContain('User answered: Apple');
+      expect(status.textContent).toContain('User answered: Apple');
+      expect(container.textContent).not.toContain('Error');
     });
   });
 
@@ -172,7 +478,56 @@ describe('AskUser', () => {
     it('renders the error as an alert', () => {
       renderAskUser({ question: 'Pick a fruit' }, { result: { content: 'Unable to resume', isError: true } });
 
-      expect(screen.getByRole('alert').textContent).toContain('Unable to resume');
+      const alert = screen.getByRole('alert');
+      expect(alert.textContent).toContain('Unable to resume');
+    });
+  });
+
+  describe('when an option is malformed', () => {
+    it('keeps the ones that are usable and falls back when none are', () => {
+      renderAskUser({
+        question: 'Pick a fruit',
+        options: [null as unknown as { label: string }, { label: 'Apple' }, { label: 42 as unknown as string }],
+      });
+
+      expect(screen.getAllByRole('radio')).toHaveLength(2);
+      expect(screen.getByRole('radio', { name: /Apple/ })).toBeTruthy();
+      expect(screen.getByRole('radio', { name: 'Other…' })).toBeTruthy();
+    });
+  });
+
+  describe('when a key other than Enter is pressed in free text', () => {
+    it('leaves it to the input', () => {
+      const { onSubmit } = renderAskUser({ question: 'What is your name?' });
+      const input = screen.getByRole<HTMLInputElement>('textbox', { name: 'What is your name?' });
+
+      fireEvent.change(input, { target: { value: 'Ada' } });
+      expect(fireEvent.keyDown(input, { key: 'a' })).toBe(true);
+
+      expect(onSubmit).not.toHaveBeenCalled();
+    });
+
+    it('takes Enter for itself', () => {
+      const { onSubmit } = renderAskUser({ question: 'What is your name?' });
+      const input = screen.getByRole<HTMLInputElement>('textbox', { name: 'What is your name?' });
+
+      fireEvent.change(input, { target: { value: 'Ada' } });
+
+      expect(fireEvent.keyDown(input, { key: 'Enter' })).toBe(false);
+      expect(onSubmit).toHaveBeenCalledWith('Ada');
+    });
+  });
+
+  describe('when a single selection is chosen while a submission is pending', () => {
+    it('says nothing more', () => {
+      const { onSubmit } = renderAskUser(
+        { question: 'Pick a fruit', options: [{ label: 'Apple' }, { label: 'Pear' }] },
+        { isSubmitting: true },
+      );
+
+      fireEvent.click(screen.getByRole('radio', { name: /Apple/ }));
+
+      expect(onSubmit).not.toHaveBeenCalled();
     });
   });
 

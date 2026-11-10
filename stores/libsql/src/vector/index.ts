@@ -17,9 +17,13 @@ import type {
   UpdateVectorParams,
   DeleteVectorsParams,
 } from '@mastra/core/vector';
+import { gateIfLocalFile } from '../shared/file-transaction-gate';
+import { resetConnectionsAfterBusy } from '../shared/reset-after-busy-client';
+import { gateSingleConnectionClient, isSingleConnectionDatabase } from '../shared/single-connection-client';
 import type { LibSQLVectorFilter } from './filter';
 import { LibSQLFilterTranslator } from './filter';
 import { buildFilterQuery } from './sql-builder';
+import { getLocalFileDatabaseKey, withLocalFileDatabaseWriteLock } from './write-lock';
 
 interface LibSQLQueryVectorParams extends QueryVectorParams<LibSQLVectorFilter> {
   minScore?: number;
@@ -60,7 +64,9 @@ export class LibSQLVector extends MastraVector<LibSQLVectorFilter> {
   private readonly initialBackoffMs: number;
   private readonly overFetchMultiplier: number;
   private readonly isMemoryDb: boolean;
-  private vectorIndexes: Promise<Set<string>>;
+  private readonly initialization: Promise<void>;
+  private databaseKey: string | undefined;
+  private vectorIndexes = new Set<string>();
 
   constructor({
     url,
@@ -74,32 +80,77 @@ export class LibSQLVector extends MastraVector<LibSQLVectorFilter> {
   }: LibSQLVectorConfig & { id: string }) {
     super({ id });
 
-    this.turso = createClient({
+    this.isMemoryDb = url.includes(':memory:');
+    const isLocalDb = (url.startsWith('file:') || this.isMemoryDb) && !syncUrl;
+    const cwd = process.cwd();
+
+    const client = createClient({
       url,
       syncUrl,
       authToken,
       syncInterval,
+      ...(isLocalDb ? { timeout: 5000 } : {}),
     });
+    this.turso = isSingleConnectionDatabase({ url, syncUrl })
+      ? gateSingleConnectionClient(client)
+      : isLocalDb
+        ? gateIfLocalFile(resetConnectionsAfterBusy(client, { maxWaitMs: 5000 }), url, { maxWaitMs: 5000 })
+        : client;
     this.maxRetries = maxRetries;
     this.initialBackoffMs = initialBackoffMs;
     if (!Number.isInteger(vectorTopKOverFetchMultiplier) || vectorTopKOverFetchMultiplier < 1) {
       throw new Error('vectorTopKOverFetchMultiplier must be a positive integer');
     }
     this.overFetchMultiplier = vectorTopKOverFetchMultiplier;
-    this.isMemoryDb = url.includes(':memory:');
+    this.initialization = this.initialize({ url, syncUrl, cwd, isLocalDb });
+  }
 
-    if (url.includes(`file:`) || this.isMemoryDb) {
-      this.turso
-        .execute('PRAGMA journal_mode=WAL;')
-        .then(() => this.logger.debug('LibSQLStore: PRAGMA journal_mode=WAL set.'))
-        .catch(err => this.logger.warn('LibSQLStore: Failed to set PRAGMA journal_mode=WAL.', err));
-      this.turso
-        .execute('PRAGMA busy_timeout = 5000;')
-        .then(() => this.logger.debug('LibSQLStore: PRAGMA busy_timeout=5000 set.'))
-        .catch(err => this.logger.warn('LibSQLStore: Failed to set PRAGMA busy_timeout=5000.', err));
+  private async initialize({
+    url,
+    syncUrl,
+    cwd,
+    isLocalDb,
+  }: {
+    url: string;
+    syncUrl?: string;
+    cwd: string;
+    isLocalDb: boolean;
+  }): Promise<void> {
+    if (isLocalDb) {
+      await this.applyLocalPragmas();
+      this.databaseKey = await getLocalFileDatabaseKey({ url, syncUrl, cwd });
     }
 
-    this.vectorIndexes = this.isMemoryDb ? Promise.resolve(new Set<string>()) : this.discoverVectorIndexes();
+    if (!this.isMemoryDb) {
+      this.vectorIndexes = await this.discoverVectorIndexes();
+    }
+  }
+
+  private async applyLocalPragmas(): Promise<void> {
+    const pragmas = [
+      ['journal_mode=WAL', 'PRAGMA journal_mode=WAL;'],
+      ['busy_timeout=5000', 'PRAGMA busy_timeout = 5000;'],
+    ] as const;
+
+    for (const [label, sql] of pragmas) {
+      try {
+        await this.turso.execute(sql);
+        this.logger.debug(`LibSQLStore: PRAGMA ${label} set.`);
+      } catch (err) {
+        this.logger.warn(`LibSQLStore: Failed to set PRAGMA ${label}.`, err);
+      }
+    }
+  }
+
+  private async ensureInitialized(): Promise<void> {
+    await this.initialization;
+  }
+
+  private async executeMutation<T>(operation: () => Promise<T>, isTransaction = false): Promise<T> {
+    await this.ensureInitialized();
+    return withLocalFileDatabaseWriteLock(this.databaseKey, () =>
+      this.executeWriteOperationWithRetry(operation, isTransaction),
+    );
   }
 
   /**
@@ -108,6 +159,7 @@ export class LibSQLVector extends MastraVector<LibSQLVectorFilter> {
    * Safe to call more than once; subsequent calls are no-ops.
    */
   async close(): Promise<void> {
+    await this.ensureInitialized();
     if (!this.turso.closed) {
       this.turso.close();
     }
@@ -165,9 +217,8 @@ export class LibSQLVector extends MastraVector<LibSQLVectorFilter> {
     return translator.translate(filter);
   }
 
-  private async hasVectorIndex(parsedIndexName: string): Promise<boolean> {
-    const indexes = await this.vectorIndexes;
-    return indexes.has(`${parsedIndexName}_vector_idx`);
+  private hasVectorIndex(parsedIndexName: string): boolean {
+    return this.vectorIndexes.has(`${parsedIndexName}_vector_idx`);
   }
 
   private async queryWithIndex(
@@ -243,11 +294,12 @@ export class LibSQLVector extends MastraVector<LibSQLVectorFilter> {
     }
 
     try {
+      await this.ensureInitialized();
       const parsedIndexName = parseSqlIdentifier(indexName, 'index name');
 
       const vectorStr = `[${queryVector.join(',')}]`;
 
-      if (!this.isMemoryDb && (await this.hasVectorIndex(parsedIndexName))) {
+      if (!this.isMemoryDb && this.hasVectorIndex(parsedIndexName)) {
         try {
           const indexedResults = await this.queryWithIndex(
             parsedIndexName,
@@ -267,14 +319,13 @@ export class LibSQLVector extends MastraVector<LibSQLVectorFilter> {
 
       const translatedFilter = this.transformFilter(filter);
       const { sql: filterQuery, values: filterValues } = buildFilterQuery(translatedFilter);
-      filterValues.push(minScore);
-      filterValues.push(topK);
 
+      // Bind the query vector as vector32(?) so libSQL parses it once, not once per scanned row.
       const query = `
       WITH vector_scores AS (
         SELECT
           vector_id as id,
-          (1-vector_distance_cos(embedding, '${vectorStr}')) as score,
+          (1-vector_distance_cos(embedding, vector32(?))) as score,
           metadata
           ${includeVector ? ', vector_extract(embedding) as embedding' : ''}
         FROM ${parsedIndexName}
@@ -288,7 +339,7 @@ export class LibSQLVector extends MastraVector<LibSQLVectorFilter> {
 
       const result = await this.turso.execute({
         sql: query,
-        args: filterValues,
+        args: [vectorStr, ...filterValues, minScore, topK],
       });
 
       return result.rows.map(({ id, score, metadata, embedding }) => ({
@@ -309,9 +360,9 @@ export class LibSQLVector extends MastraVector<LibSQLVectorFilter> {
     }
   }
 
-  public upsert(args: UpsertVectorParams): Promise<string[]> {
+  public async upsert(args: UpsertVectorParams): Promise<string[]> {
     try {
-      return this.executeWriteOperationWithRetry(() => this.doUpsert(args), true);
+      return await this.executeMutation(() => this.doUpsert(args), true);
     } catch (error) {
       throw new MastraError(
         {
@@ -370,9 +421,9 @@ export class LibSQLVector extends MastraVector<LibSQLVectorFilter> {
     }
   }
 
-  public createIndex(args: CreateIndexParams): Promise<void> {
+  public async createIndex(args: CreateIndexParams): Promise<void> {
     try {
-      return this.executeWriteOperationWithRetry(() => this.doCreateIndex(args));
+      return await this.executeMutation(() => this.doCreateIndex(args));
     } catch (error) {
       throw new MastraError(
         {
@@ -409,12 +460,12 @@ export class LibSQLVector extends MastraVector<LibSQLVectorFilter> {
         `,
       args: [],
     });
-    void this.vectorIndexes.then(indexes => indexes.add(`${parsedIndexName}_vector_idx`));
+    this.vectorIndexes.add(`${parsedIndexName}_vector_idx`);
   }
 
-  public deleteIndex(args: DeleteIndexParams): Promise<void> {
+  public async deleteIndex(args: DeleteIndexParams): Promise<void> {
     try {
-      return this.executeWriteOperationWithRetry(() => this.doDeleteIndex(args));
+      return await this.executeMutation(() => this.doDeleteIndex(args));
     } catch (error) {
       throw new MastraError(
         {
@@ -434,11 +485,12 @@ export class LibSQLVector extends MastraVector<LibSQLVectorFilter> {
       sql: `DROP TABLE IF EXISTS ${parsedIndexName}`,
       args: [],
     });
-    void this.vectorIndexes.then(indexes => indexes.delete(`${parsedIndexName}_vector_idx`));
+    this.vectorIndexes.delete(`${parsedIndexName}_vector_idx`);
   }
 
   async listIndexes(): Promise<string[]> {
     try {
+      await this.ensureInitialized();
       const vectorTablesQuery = `
         SELECT name FROM sqlite_master 
         WHERE type='table' 
@@ -469,6 +521,7 @@ export class LibSQLVector extends MastraVector<LibSQLVectorFilter> {
    */
   async describeIndex({ indexName }: DescribeIndexParams): Promise<IndexStats> {
     try {
+      await this.ensureInitialized();
       const parsedIndexName = parseSqlIdentifier(indexName, 'index name');
       // Get table info including column info
       const tableInfoQuery = `
@@ -532,7 +585,7 @@ export class LibSQLVector extends MastraVector<LibSQLVectorFilter> {
    * @throws Will throw an error if no updates are provided or if the update operation fails.
    */
   public updateVector(args: UpdateVectorParams<LibSQLVectorFilter>): Promise<void> {
-    return this.executeWriteOperationWithRetry(() => this.doUpdateVector(args));
+    return this.executeMutation(() => this.doUpdateVector(args));
   }
 
   private async doUpdateVector(params: UpdateVectorParams<LibSQLVectorFilter>): Promise<void> {
@@ -684,9 +737,9 @@ export class LibSQLVector extends MastraVector<LibSQLVectorFilter> {
    * @returns A promise that resolves when the deletion is complete.
    * @throws Will throw an error if the deletion operation fails.
    */
-  public deleteVector(args: DeleteVectorParams): Promise<void> {
+  public async deleteVector(args: DeleteVectorParams): Promise<void> {
     try {
-      return this.executeWriteOperationWithRetry(() => this.doDeleteVector(args));
+      return await this.executeMutation(() => this.doDeleteVector(args));
     } catch (error) {
       throw new MastraError(
         {
@@ -712,7 +765,7 @@ export class LibSQLVector extends MastraVector<LibSQLVectorFilter> {
   }
 
   public deleteVectors(args: DeleteVectorsParams<LibSQLVectorFilter>): Promise<void> {
-    return this.executeWriteOperationWithRetry(() => this.doDeleteVectors(args));
+    return this.executeMutation(() => this.doDeleteVectors(args));
   }
 
   private async doDeleteVectors({ indexName, filter, ids }: DeleteVectorsParams<LibSQLVectorFilter>): Promise<void> {
@@ -828,9 +881,9 @@ export class LibSQLVector extends MastraVector<LibSQLVectorFilter> {
     }
   }
 
-  public truncateIndex(args: DeleteIndexParams): Promise<void> {
+  public async truncateIndex(args: DeleteIndexParams): Promise<void> {
     try {
-      return this.executeWriteOperationWithRetry(() => this._doTruncateIndex(args));
+      return await this.executeMutation(() => this._doTruncateIndex(args));
     } catch (error) {
       throw new MastraError(
         {

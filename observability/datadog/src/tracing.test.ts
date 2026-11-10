@@ -26,6 +26,7 @@ const {
   capturedSpans,
 } = vi.hoisted(() => {
   let currentScopeSpan: any = undefined;
+  let currentLlmObsSpan: any = undefined;
   const parents: any[] = [];
   const spans: any[] = [];
 
@@ -45,9 +46,11 @@ const {
     traceParents: parents,
     capturedSpans: spans,
     mockAnnotate: vi.fn(),
-    // Simulate dd-trace behavior: llmobs.trace() activates the span in scope for the callback duration
+    // Simulate dd-trace behavior: LLMObs derives a span's parent ONLY from an
+    // enclosing llmobs.trace() callback (its own storage). tracer.scope().activate()
+    // affects the APM scope but does NOT link LLMObs parents.
     mockTrace: vi.fn((options: any, fn: (span: any) => void) => {
-      parents.push(currentScopeSpan);
+      parents.push(currentLlmObsSpan);
       const ddSpan = {
         id: `mock-dd-span-${parents.length}`,
         options,
@@ -55,14 +58,14 @@ const {
         finish: vi.fn(),
       };
       spans.push(ddSpan);
-      // Activate this span in scope for the duration of the callback
-      // This simulates how dd-trace automatically activates spans during trace()
-      const previous = currentScopeSpan;
-      currentScopeSpan = ddSpan;
+      // The span is the LLMObs parent for nested llmobs.trace() calls only
+      // for the duration of the callback
+      const previous = currentLlmObsSpan;
+      currentLlmObsSpan = ddSpan;
       try {
         return fn(ddSpan);
       } finally {
-        currentScopeSpan = previous;
+        currentLlmObsSpan = previous;
       }
     }),
     mockFlush: vi.fn().mockResolvedValue(undefined),
@@ -90,6 +93,7 @@ vi.mock('dd-trace', () => {
         exportSpan: (span: any) => ({ traceId: 'dd-trace-id', spanId: span?.id || 'dd-span-id' }),
       },
       _tracer: { started: false },
+      extract: (_format: string, carrier: { traceparent: string }) => ({ fromTraceparent: carrier.traceparent }),
       scope: () => ({
         activate: mockScopeActivate,
         active: mockScopeActive,
@@ -623,7 +627,12 @@ describe('DatadogExporter', () => {
 
       expect(mockTrace).toHaveBeenCalledTimes(2);
       expect(traceParents[0]).toBeUndefined();
-      expect(traceParents[1]).toEqual(expect.objectContaining({ id: 'mock-dd-span-1' }));
+      // LLMObs cannot re-parent onto the already-emitted root, but APM trace
+      // continuity is established by activating the buffered root context
+      expect(mockScopeActivate).toHaveBeenCalledWith(
+        expect.objectContaining({ id: 'mock-dd-span-1' }),
+        expect.any(Function),
+      );
     });
 
     it('buffers child spans until the parent context exists', async () => {
@@ -645,6 +654,71 @@ describe('DatadogExporter', () => {
       expect(mockTrace).toHaveBeenCalledTimes(2);
       expect(traceParents[0]).toBeUndefined();
       expect(traceParents[1]).toEqual(expect.objectContaining({ id: 'mock-dd-span-1' }));
+    });
+
+    it('emits a late-arriving span chain as a nested sub-tree (#19203)', async () => {
+      const exporter = new DatadogExporter({ mlApp: 'test', apiKey: 'test-key' });
+
+      const rootSpan = createMockSpan({
+        id: 'agent-run',
+        traceId: 'trace-title',
+        isRootSpan: true,
+        name: "agent run: 'title-agent'",
+        type: SpanType.AGENT_RUN,
+      });
+      await exporter.exportTracingEvent(createTracingEvent(TracingEventType.SPAN_STARTED, rootSpan));
+      await exporter.exportTracingEvent(createTracingEvent(TracingEventType.SPAN_ENDED, rootSpan));
+      expect(mockTrace).toHaveBeenCalledTimes(1);
+
+      // Fire-and-forget work (e.g. Memory.generateTitle) starts after the root
+      // ended and its spans end leaf-first: chunk-level spans close before the
+      // MODEL_GENERATION span that owns the chain.
+      const titleLlm = createMockSpan({
+        id: 'title-llm',
+        traceId: 'trace-title',
+        isRootSpan: false,
+        parentSpanId: 'agent-run',
+        name: "llm: 'mock-model'",
+        type: SpanType.MODEL_GENERATION,
+      });
+      const titleStep = createMockSpan({
+        id: 'title-step',
+        traceId: 'trace-title',
+        isRootSpan: false,
+        parentSpanId: 'title-llm',
+        name: 'step: 0',
+        type: SpanType.MODEL_STEP,
+      });
+      const titleInference = createMockSpan({
+        id: 'title-inference',
+        traceId: 'trace-title',
+        isRootSpan: false,
+        parentSpanId: 'title-step',
+        name: 'inference: 0',
+        type: SpanType.MODEL_INFERENCE,
+      });
+
+      for (const span of [titleLlm, titleStep, titleInference]) {
+        await exporter.exportTracingEvent(createTracingEvent(TracingEventType.SPAN_STARTED, span));
+      }
+
+      // Leaf-first end order: the chain stays buffered until its local root ends
+      await exporter.exportTracingEvent(createTracingEvent(TracingEventType.SPAN_ENDED, titleInference));
+      await exporter.exportTracingEvent(createTracingEvent(TracingEventType.SPAN_ENDED, titleStep));
+      expect(mockTrace).toHaveBeenCalledTimes(1);
+
+      await exporter.exportTracingEvent(createTracingEvent(TracingEventType.SPAN_ENDED, titleLlm));
+      expect(mockTrace).toHaveBeenCalledTimes(4);
+
+      // The chain root cannot be re-parented onto the already-emitted agent root
+      // (LLMObs limitation), but its descendants must nest beneath it instead of
+      // flattening into disconnected root spans.
+      expect(traceParents[1]).toBeUndefined();
+      expect(traceParents[2]).toBe(capturedSpans[1]); // step: 0 under llm
+      expect(traceParents[3]).toBe(capturedSpans[2]); // inference: 0 under step: 0
+
+      // APM trace continuity is still established via the buffered root context
+      expect(mockScopeActivate).toHaveBeenCalledWith(capturedSpans[0], expect.any(Function));
     });
   });
 
@@ -868,13 +942,21 @@ describe('DatadogExporter', () => {
       expect(emittedNames).toContain('trace2-root');
       expect(emittedNames).toContain('trace2-child');
 
-      // Verify parent-child relationships are correct per trace
-      // trace1-child should have trace1-root as parent (traceParents[2] should be mock-dd-span-1)
-      // trace2-child should have trace2-root as parent (traceParents[3] should be mock-dd-span-2)
+      // Verify each late child was emitted under its own trace's root context
+      // (APM continuity via scope activation; LLMObs cannot re-parent onto
+      // already-emitted spans)
       expect(traceParents[0]).toBeUndefined(); // trace1-root has no parent
       expect(traceParents[1]).toBeUndefined(); // trace2-root has no parent
-      expect(traceParents[2]).toEqual(expect.objectContaining({ id: 'mock-dd-span-1' })); // trace1-child under trace1-root
-      expect(traceParents[3]).toEqual(expect.objectContaining({ id: 'mock-dd-span-2' })); // trace2-child under trace2-root
+      expect(mockScopeActivate).toHaveBeenNthCalledWith(
+        1,
+        expect.objectContaining({ id: 'mock-dd-span-1' }), // trace1-child under trace1-root
+        expect.any(Function),
+      );
+      expect(mockScopeActivate).toHaveBeenNthCalledWith(
+        2,
+        expect.objectContaining({ id: 'mock-dd-span-2' }), // trace2-child under trace2-root
+        expect.any(Function),
+      );
     });
   });
 
@@ -1004,7 +1086,7 @@ describe('DatadogExporter', () => {
     });
 
     it('cancels max lifetime timer when normal cleanup runs', async () => {
-      const exporter = new DatadogExporter({ mlApp: 'test', apiKey: 'test-key' });
+      const exporter = new DatadogExporter({ mlApp: 'test', apiKey: 'test-key', flushGraceMs: 0 });
 
       const rootSpan = createMockSpan({
         id: 'root',
@@ -1035,7 +1117,7 @@ describe('DatadogExporter', () => {
 
   describe('shutdown', () => {
     it('flushes and disables llmobs on shutdown', async () => {
-      const exporter = new DatadogExporter({ mlApp: 'test', apiKey: 'test-key' });
+      const exporter = new DatadogExporter({ mlApp: 'test', apiKey: 'test-key', flushGraceMs: 0 });
 
       await exporter.shutdown();
 
@@ -1044,7 +1126,7 @@ describe('DatadogExporter', () => {
     });
 
     it('clears traceState on shutdown', async () => {
-      const exporter = new DatadogExporter({ mlApp: 'test', apiKey: 'test-key' });
+      const exporter = new DatadogExporter({ mlApp: 'test', apiKey: 'test-key', flushGraceMs: 0 });
       const span = createMockSpan({ traceId: 'trace-shutdown', isRootSpan: true });
 
       // Create some trace state
@@ -1071,8 +1153,10 @@ describe('DatadogExporter', () => {
       const state = (exporter as any).traceState.get('trace-timer');
       expect(state?.cleanupTimer).toBeDefined();
 
-      // Shutdown should cancel the timer
-      await exporter.shutdown();
+      // Shutdown should cancel the timer (shutdown itself waits flushGraceMs for dd-trace's background send)
+      const shuttingDown = exporter.shutdown();
+      await vi.advanceTimersByTimeAsync(2000);
+      await shuttingDown;
 
       // traceState should be cleared immediately, not waiting for timer
       expect((exporter as any).traceState.size).toBe(0);
@@ -1081,7 +1165,7 @@ describe('DatadogExporter', () => {
     });
 
     it('logs warning when shutdown has pending buffered spans', async () => {
-      const exporter = new DatadogExporter({ mlApp: 'test', apiKey: 'test-key' });
+      const exporter = new DatadogExporter({ mlApp: 'test', apiKey: 'test-key', flushGraceMs: 0 });
       const loggerSpy = vi.spyOn((exporter as any).logger, 'warn');
 
       const parentSpan = createMockSpan({
@@ -1114,6 +1198,116 @@ describe('DatadogExporter', () => {
           pendingCount: 1,
         }),
       );
+    });
+  });
+
+  describe('flush grace wait', () => {
+    beforeEach(() => {
+      vi.useFakeTimers();
+    });
+
+    afterEach(() => {
+      vi.useRealTimers();
+    });
+
+    async function settled(promise: Promise<void>): Promise<boolean> {
+      let done = false;
+      void promise.then(() => {
+        done = true;
+      });
+      await vi.advanceTimersByTimeAsync(0);
+      return done;
+    }
+
+    it('waits the grace period after spans were handed to dd-trace', async () => {
+      const exporter = new DatadogExporter({ mlApp: 'test', apiKey: 'test-key' });
+      const span = createMockSpan({ traceId: 'trace-grace', isRootSpan: true });
+      await exporter.exportTracingEvent(createTracingEvent(TracingEventType.SPAN_STARTED, span));
+      await exporter.exportTracingEvent(createTracingEvent(TracingEventType.SPAN_ENDED, span));
+      expect(mockTrace).toHaveBeenCalled();
+
+      const flushing = exporter.flush();
+      expect(mockFlush).toHaveBeenCalled();
+      await vi.advanceTimersByTimeAsync(1999);
+      expect(await settled(flushing)).toBe(false);
+
+      await vi.advanceTimersByTimeAsync(1);
+      expect(await settled(flushing)).toBe(true);
+    });
+
+    it('does not wait when nothing new was sent since the last flush', async () => {
+      const exporter = new DatadogExporter({ mlApp: 'test', apiKey: 'test-key' });
+      const span = createMockSpan({ traceId: 'trace-grace', isRootSpan: true });
+      await exporter.exportTracingEvent(createTracingEvent(TracingEventType.SPAN_STARTED, span));
+      await exporter.exportTracingEvent(createTracingEvent(TracingEventType.SPAN_ENDED, span));
+
+      const first = exporter.flush();
+      await vi.advanceTimersByTimeAsync(2000);
+      expect(await settled(first)).toBe(true);
+
+      expect(await settled(exporter.flush())).toBe(true);
+    });
+
+    it('honors flushGraceMs, including 0 to disable the wait', async () => {
+      const exporter = new DatadogExporter({ mlApp: 'test', apiKey: 'test-key', flushGraceMs: 0 });
+      const span = createMockSpan({ traceId: 'trace-grace', isRootSpan: true });
+      await exporter.exportTracingEvent(createTracingEvent(TracingEventType.SPAN_STARTED, span));
+      await exporter.exportTracingEvent(createTracingEvent(TracingEventType.SPAN_ENDED, span));
+
+      expect(await settled(exporter.flush())).toBe(true);
+    });
+
+    it('waits once during shutdown, before llmobs is disabled', async () => {
+      const exporter = new DatadogExporter({ mlApp: 'test', apiKey: 'test-key', flushGraceMs: 500 });
+      const span = createMockSpan({ traceId: 'trace-grace', isRootSpan: true });
+      await exporter.exportTracingEvent(createTracingEvent(TracingEventType.SPAN_STARTED, span));
+      await exporter.exportTracingEvent(createTracingEvent(TracingEventType.SPAN_ENDED, span));
+
+      const shuttingDown = exporter.shutdown();
+      await vi.advanceTimersByTimeAsync(499);
+      expect(await settled(shuttingDown)).toBe(false);
+      expect(mockDisable).not.toHaveBeenCalled();
+
+      await vi.advanceTimersByTimeAsync(1);
+      expect(await settled(shuttingDown)).toBe(true);
+      expect(mockDisable).toHaveBeenCalled();
+    });
+
+    it('makes an overlapping flush join the running grace wait instead of resolving early', async () => {
+      const exporter = new DatadogExporter({ mlApp: 'test', apiKey: 'test-key', flushGraceMs: 500 });
+      const span = createMockSpan({ traceId: 'trace-grace', isRootSpan: true });
+      await exporter.exportTracingEvent(createTracingEvent(TracingEventType.SPAN_STARTED, span));
+      await exporter.exportTracingEvent(createTracingEvent(TracingEventType.SPAN_ENDED, span));
+
+      const first = exporter.flush();
+      await vi.advanceTimersByTimeAsync(100);
+      const second = exporter.flush();
+      await vi.advanceTimersByTimeAsync(399);
+      expect(await settled(first)).toBe(false);
+      expect(await settled(second)).toBe(false);
+
+      await vi.advanceTimersByTimeAsync(1);
+      expect(await settled(first)).toBe(true);
+      expect(await settled(second)).toBe(true);
+    });
+
+    it('does not disable llmobs when shutdown overlaps a running grace wait', async () => {
+      const exporter = new DatadogExporter({ mlApp: 'test', apiKey: 'test-key', flushGraceMs: 500 });
+      const span = createMockSpan({ traceId: 'trace-grace', isRootSpan: true });
+      await exporter.exportTracingEvent(createTracingEvent(TracingEventType.SPAN_STARTED, span));
+      await exporter.exportTracingEvent(createTracingEvent(TracingEventType.SPAN_ENDED, span));
+
+      const flushing = exporter.flush();
+      await vi.advanceTimersByTimeAsync(100);
+      const shuttingDown = exporter.shutdown();
+      await vi.advanceTimersByTimeAsync(399);
+      expect(await settled(shuttingDown)).toBe(false);
+      expect(mockDisable).not.toHaveBeenCalled();
+
+      await vi.advanceTimersByTimeAsync(1);
+      expect(await settled(flushing)).toBe(true);
+      expect(await settled(shuttingDown)).toBe(true);
+      expect(mockDisable).toHaveBeenCalled();
     });
   });
 
@@ -1673,7 +1867,7 @@ describe('DatadogExporter', () => {
     let exporter: DatadogExporter;
 
     beforeEach(() => {
-      exporter = new DatadogExporter({ mlApp: 'test-app', apiKey: 'test-key' });
+      exporter = new DatadogExporter({ mlApp: 'test-app', apiKey: 'test-key', flushGraceMs: 0 });
     });
 
     afterEach(async () => {
@@ -1746,6 +1940,38 @@ describe('DatadogExporter', () => {
       } as any);
 
       expect(mockSubmitEvaluation).not.toHaveBeenCalled();
+    });
+  });
+
+  describe('DatadogExporter span links', () => {
+    beforeEach(() => {
+      vi.clearAllMocks();
+    });
+
+    it('passes links to llmobs.trace as Datadog contexts resolved from W3C traceparents', async () => {
+      const exporter = new DatadogExporter({ mlApp: 'test', apiKey: 'test-key' });
+      const span = createMockSpan({
+        links: [
+          { traceId: '0af7651916cd43dd8448eb211c80319c', spanId: 'b7ad6b7169203331' },
+          { traceId: 'abc', spanId: 'def' },
+        ],
+      } as Partial<AnyExportedSpan>);
+
+      await exporter.exportTracingEvent(createTracingEvent(TracingEventType.SPAN_ENDED, span));
+
+      expect(mockTrace.mock.calls[0]![0].links).toEqual([
+        { context: { fromTraceparent: '00-0af7651916cd43dd8448eb211c80319c-b7ad6b7169203331-01' } },
+      ]);
+      await exporter.shutdown();
+    });
+
+    it('passes no links for a span without links', async () => {
+      const exporter = new DatadogExporter({ mlApp: 'test', apiKey: 'test-key' });
+
+      await exporter.exportTracingEvent(createTracingEvent(TracingEventType.SPAN_ENDED, createMockSpan()));
+
+      expect(mockTrace.mock.calls[0]![0]).not.toHaveProperty('links');
+      await exporter.shutdown();
     });
   });
 });

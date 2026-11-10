@@ -11,20 +11,74 @@ import type {
   CreateSpanOptions,
   ObservabilityInstance,
   ExportedSpan,
+  SpanSnapshot,
   TraceState,
   IModelSpanTracker,
+  ModelSpanTrackerOptions,
   AIModelGenerationSpan,
   EntityType,
   TracingPolicy,
   CorrelationContext,
+  SpanLink,
+  SpanOutcomeFields,
 } from '@mastra/core/observability';
 
 import { ModelSpanTracker } from '../model-tracing';
+import { isPlainRecord, mergeMetadata as mergeSpanMetadata } from './metadata';
 import { deepClean, mergeSerializationOptions } from './serialization';
 import type { DeepCleanOptions } from './serialization';
 
 /** Extended span type that includes getParentSpan method available on BaseSpan instances */
-type AnyBaseSpan = AnySpan & { getParentSpan(includeInternalSpans?: boolean): AnySpan | undefined };
+type AnyBaseSpan = AnySpan & {
+  getParentSpan(includeInternalSpans?: boolean): AnySpan | undefined;
+  /** True when the span is dropped before export (excludeSpanTypes / internal / alwaysExcluded) */
+  readonly isExcluded?: boolean;
+};
+
+/** Parent and root entity fields shared by exported spans and correlation context */
+type SpanEntityLineage = Pick<
+  ExportedSpan<SpanType>,
+  | 'parentEntityType'
+  | 'parentEntityId'
+  | 'parentEntityName'
+  | 'parentEntityVersionId'
+  | 'rootEntityType'
+  | 'rootEntityId'
+  | 'rootEntityName'
+  | 'rootEntityVersionId'
+>;
+
+const LINEAGE_KEYS = [
+  'parentEntityType',
+  'parentEntityId',
+  'parentEntityName',
+  'parentEntityVersionId',
+  'rootEntityType',
+  'rootEntityId',
+  'rootEntityName',
+  'rootEntityVersionId',
+] as const satisfies readonly (keyof SpanEntityLineage)[];
+
+function ownEntityVersionId(span: AnySpan): string | undefined {
+  return span instanceof BaseSpan ? span.ownEntityVersionId : undefined;
+}
+
+/** Copy only the lineage fields that have values, so spans don't carry undefined keys */
+function definedLineage(source: SpanEntityLineage): SpanEntityLineage {
+  const lineage: SpanEntityLineage = {};
+  for (const key of LINEAGE_KEYS) {
+    const value = source[key];
+    if (value !== undefined && value !== null) {
+      (lineage as Record<string, unknown>)[key] = value;
+    }
+  }
+  return lineage;
+}
+
+function modelPair(attributes: unknown): { model?: string; provider?: string } {
+  const { model, provider } = (attributes ?? {}) as { model?: unknown; provider?: unknown };
+  return typeof model === 'string' && model && typeof provider === 'string' && provider ? { model, provider } : {};
+}
 
 /**
  * Determines if a span type should be considered internal based on flags.
@@ -71,14 +125,25 @@ function isSpanInternal(spanType: SpanType, flags?: InternalSpans): boolean {
 }
 
 /**
+ * Copies the links whose IDs are valid W3C trace and span IDs (32 and 16 lowercase
+ * hex characters, not all zeros); `undefined` when none remain.
+ */
+function validLinks(links: SpanLink[] | undefined): SpanLink[] | undefined {
+  const valid = links?.filter(
+    link => /^(?!0+$)[0-9a-f]{32}$/.test(link?.traceId ?? '') && /^(?!0+$)[0-9a-f]{16}$/.test(link?.spanId ?? ''),
+  );
+  return valid?.length ? valid.map(({ traceId, spanId }) => ({ traceId, spanId })) : undefined;
+}
+
+/**
  * Get the external parent span ID from CreateSpanOptions.
  *
- * If the parent is internal, walks up the parent chain to find
- * the closest external ancestor. If the parent is already external,
- * returns its ID directly.
+ * If the parent is internal or excluded from export (`excludeSpanTypes`),
+ * walks up the parent chain to find the closest exported ancestor.
+ * If the parent is already exportable, returns its ID directly.
  *
  * This is useful when exporting spans to external observability systems
- * that shouldn't include internal framework spans.
+ * that shouldn't include internal framework spans or excluded types.
  *
  * @param options - Span creation options
  * @returns The external parent span ID, or undefined if no external parent exists
@@ -102,12 +167,25 @@ export function getExternalParentId(options: CreateSpanOptions<any>): string | u
     return undefined;
   }
 
-  if (options.parent.isInternal) {
-    // Parent is internal, find its external ancestor
-    return options.parent.getParentSpanId(false);
-  } else {
-    // Parent is already external, use it directly
-    return options.parent.id;
+  const parent = options.parent as AnyBaseSpan;
+  if (parent.isInternal || parent.isExcluded) {
+    // Parent won't reach exporters — walk to the closest exported ancestor
+    return parent.getParentSpanId(false);
+  }
+  return parent.id;
+}
+
+/**
+ * Vercel AI Gateway reports which provider served a step, and any provider
+ * attempts that failed first, only in `providerMetadata.gateway.routing`.
+ * Read it defensively so a throwing getter never skips the strip below.
+ */
+function readGatewayRouting(providerMetadata: unknown): unknown {
+  try {
+    const gateway = isPlainRecord(providerMetadata) ? providerMetadata.gateway : undefined;
+    return isPlainRecord(gateway) ? gateway.routing : undefined;
+  } catch {
+    return undefined;
   }
 }
 
@@ -127,6 +205,9 @@ export abstract class BaseSpan<TType extends SpanType = any> implements Span<TTy
   public observabilityInstance: ObservabilityInstance;
   public input?: any;
   public output?: any;
+  public outcome?: SpanOutcomeFields['outcome'];
+  public stopReason?: SpanOutcomeFields['stopReason'];
+  public stopReasonContext?: SpanOutcomeFields['stopReasonContext'];
   public errorInfo?: {
     message: string;
     id?: string;
@@ -139,6 +220,7 @@ export abstract class BaseSpan<TType extends SpanType = any> implements Span<TTy
   public metadata?: Record<string, any>;
   public requestContext?: Record<string, any>;
   public tags?: string[];
+  public links?: SpanLink[];
   public traceState?: TraceState;
   /** Entity type that created the span (e.g., agent, workflow) */
   public entityType?: EntityType;
@@ -146,8 +228,11 @@ export abstract class BaseSpan<TType extends SpanType = any> implements Span<TTy
   public entityId?: string;
   /** Entity name that created the span */
   public entityName?: string;
-  /** Parent span ID (for root spans that are children of external spans) */
+  /** Parent span within this Mastra trace: a span Mastra created (the span-tree parent, or a prior Mastra span such as the suspended run a resume links back to) */
   protected parentSpanId?: string;
+  /** Parent from an external tracing system (ambient OTel / dd-trace span) that Mastra did not create; carried for external correlation, not part of Mastra's own parent/child linkage */
+  public externalParentSpanId?: string;
+  public resumedFromSpanId?: string;
   /** Deep clean options for serialization */
   protected deepCleanOptions: DeepCleanOptions;
   /**
@@ -159,13 +244,33 @@ export abstract class BaseSpan<TType extends SpanType = any> implements Span<TTy
    * when the span is internal and includeInternalSpans is false, or when
    * the subclass is always excluded (e.g., NoOpSpan).
    *
+   * Public so parent-chain walks (`getParentSpan`) can skip ancestors that
+   * exporters will never receive — otherwise descendants export a
+   * `parentSpanId` pointing at a dropped span and become orphans.
+   *
    * Note: metadata is still attached and deepCleaned because it is read in
    * process by getCorrelationContext() and by getLoggerContext() /
    * getMetricsContext() (which structuredClone it).
    */
-  protected isExcluded: boolean;
+  public isExcluded: boolean;
   /** Cached canonical correlation context for this live span */
   protected correlationContext?: CorrelationContext;
+  /**
+   * Parent and root entity restored by `rebuildSpan()`. A rebuilt span has no
+   * live `parent`, so its original ancestors are only known from the cached export.
+   */
+  protected restoredLineage?: SpanEntityLineage;
+  private restoredIsRootSpan?: boolean;
+  /**
+   * Version declared for this span's own entity, or inherited from a parent span
+   * of the same entity. Unlike `metadata.entityVersionId`, never an ancestor's
+   * version for a different entity.
+   */
+  public ownEntityVersionId?: string;
+  /** Child spans that have started but not yet ended */
+  #openChildren?: Set<BaseSpan<any>>;
+  /** The span whose open-child set currently tracks this span: the parent, or a live ancestor after promotion */
+  #openChildrenOwner?: BaseSpan<any>;
 
   /**
    * Subclasses can override to unconditionally mark the span as excluded.
@@ -179,6 +284,7 @@ export abstract class BaseSpan<TType extends SpanType = any> implements Span<TTy
     // Get serialization options from observability instance config
     const observabilityConfig = observabilityInstance.getConfig();
     this.deepCleanOptions = mergeSerializationOptions(observabilityConfig.serializationOptions);
+    this.applyOutcome(options);
 
     this.name = options.name;
     this.type = options.type;
@@ -199,27 +305,46 @@ export abstract class BaseSpan<TType extends SpanType = any> implements Span<TTy
     // getMetricsContext() (which structuredClone it), and non-filtered
     // child spans inherit it via options.parent?.metadata.
     this.metadata = deepClean(
-      options.parent?.metadata || options.metadata ? { ...options.parent?.metadata, ...options.metadata } : undefined,
+      this.prepareSpanMetadata(mergeSpanMetadata(options.parent?.metadata, options.metadata)),
       this.deepCleanOptions,
     );
-
-    if (options.requestContext && options.requestContext.size() > 0) {
-      this.requestContext = deepClean(options.requestContext.all, this.deepCleanOptions);
-    }
 
     this.parent = options.parent;
     this.startTime = options.startTime ?? new Date();
     this.observabilityInstance = observabilityInstance;
     this.isEvent = options.isEvent ?? false;
+    if (this.isEvent) {
+      // Event spans are point-in-time and never go through end(), so they end
+      // at the instant they start (zero duration).
+      this.endTime = this.startTime;
+    }
     this.tracingPolicy = options.tracingPolicy;
     this.traceState = options.traceState;
+    const parent = options.parent;
+    if (!this.isEvent && parent instanceof BaseSpan && parent.isValid) {
+      (parent.#openChildren ??= new Set()).add(this);
+      this.#openChildrenOwner = parent;
+    }
     // Tags are only set for root spans (spans without a parent)
     this.tags = !options.parent && options.tags?.length ? options.tags : undefined;
+    this.links = validLinks(options.links);
+    this.resumedFromSpanId = options.resumedFromSpanId;
     // Entity identification - inherit from closest non-internal parent if not explicitly provided
     const entityParent = this.getParentSpan(false);
     this.entityType = options.entityType ?? entityParent?.entityType;
     this.entityId = options.entityId ?? entityParent?.entityId;
     this.entityName = options.entityName ?? entityParent?.entityName;
+    const declaredVersion = options.metadata?.entityVersionId;
+    const sameEntityParent =
+      entityParent instanceof BaseSpan &&
+      entityParent.entityType === this.entityType &&
+      entityParent.entityId === this.entityId;
+    this.ownEntityVersionId =
+      typeof declaredVersion === 'string'
+        ? declaredVersion
+        : sameEntityParent
+          ? entityParent.ownEntityVersionId
+          : undefined;
 
     if (this.isExcluded) {
       // Keep the shape of attributes stable for any live-span reader.
@@ -230,21 +355,142 @@ export abstract class BaseSpan<TType extends SpanType = any> implements Span<TTy
 
     this.attributes = deepClean(options.attributes, this.deepCleanOptions) || ({} as SpanTypeMap[TType]);
     if (options.requestContext && options.requestContext.size() > 0) {
-      this.requestContext = deepClean(options.requestContext.all, this.deepCleanOptions);
+      this.requestContext = deepClean(options.requestContext, this.deepCleanOptions);
     }
 
     if (this.isEvent) {
-      // Event spans don't have endTime or input.
+      // Event spans have no input; their endTime equals startTime (set above).
       // Event spans are immediately emitted by the BaseObservability class via the end() event.
-      this.output = deepClean(options.output, this.deepCleanOptions);
+      this.output = deepClean(this.prepareSpanOutput(options.output), this.deepCleanOptions);
     } else {
       this.input = deepClean(options.input, this.deepCleanOptions);
     }
   }
 
+  protected prepareSpanOutput<T>(value: T): T {
+    if (!isPlainRecord(value)) {
+      return value;
+    }
+
+    if (this.type !== SpanType.MODEL_STEP && this.type !== SpanType.MODEL_INFERENCE) {
+      return value;
+    }
+
+    try {
+      const prepared = { ...value };
+      delete prepared.steps;
+      return prepared as T;
+    } catch {
+      return value;
+    }
+  }
+
+  protected prepareSpanMetadata<T>(value: T): T {
+    if (!isPlainRecord(value)) {
+      return value;
+    }
+
+    if (this.type !== SpanType.MODEL_STEP) {
+      return value;
+    }
+
+    try {
+      const prepared: Record<string, unknown> = { ...value };
+      const gatewayRouting = readGatewayRouting(prepared.providerMetadata);
+      delete prepared.providerMetadata;
+      delete prepared.experimental_providerMetadata;
+      if (gatewayRouting !== undefined) {
+        prepared.providerMetadata = { gateway: { routing: gatewayRouting } };
+      }
+      return prepared as T;
+    } catch {
+      return value;
+    }
+  }
+
   // Methods for span lifecycle
+  /** Preserve explicitly supplied native fields; never derive results from payloads/errors. */
+  protected applyOutcome(options: SpanOutcomeFields): void {
+    if (this.endTime) return;
+    if (options.outcome !== undefined) {
+      this.outcome = options.outcome;
+      this.stopReason = options.stopReason ?? null;
+      this.stopReasonContext =
+        options.stopReasonContext == null ? null : deepClean(options.stopReasonContext, this.deepCleanOptions);
+      return;
+    }
+    if (options.stopReason !== undefined && options.stopReason !== this.stopReason) this.stopReasonContext = null;
+    if (options.stopReason !== undefined) this.stopReason = options.stopReason;
+    if (options.stopReasonContext !== undefined) {
+      this.stopReasonContext =
+        options.stopReasonContext == null ? null : deepClean(options.stopReasonContext, this.deepCleanOptions);
+    }
+  }
+
   /** End the span */
   abstract end(options?: EndSpanOptions<TType>): void;
+
+  /** Forward options to open descendants, with interruption outcomes for cascading termination. */
+  endTree(options?: EndSpanOptions<TType>): void {
+    this.endOpenDescendants(options, true);
+    this.end(options);
+  }
+
+  /** Preserve completed children; only known cascading termination interrupts open work. */
+  protected endOpenDescendants(options?: EndSpanOptions<TType>, forwardOptions = false): void {
+    const outcome = options?.outcome !== undefined ? options.outcome : this.outcome;
+    const stopReason = options?.stopReason !== undefined ? options.stopReason : this.stopReason;
+    const stopReasonContext =
+      options?.stopReasonContext !== undefined ? options.stopReasonContext : this.stopReasonContext;
+    const interrupts =
+      outcome === 'abort' || outcome === 'interrupted' || (outcome === 'limit' && stopReason === 'timeout');
+    // endTree(options) forwards payload/attributes; end({ endTree: true }) does not.
+    // Native outcomes follow their own rules: generic cleanup never copies a parent's result.
+    const forwarded = forwardOptions ? { ...options } : {};
+    delete forwarded.outcome;
+    delete forwarded.stopReason;
+    delete forwarded.stopReasonContext;
+    if (this.#openChildren) {
+      for (const child of [...this.#openChildren]) {
+        const childOptions = {
+          ...forwarded,
+          ...(interrupts ? { outcome: 'interrupted', stopReason, stopReasonContext } : {}),
+        } as EndSpanOptions<SpanType>;
+        if (forwardOptions) child.endTree(childOptions);
+        else child.end({ ...childOptions, endTree: true });
+      }
+    }
+  }
+
+  /**
+   * Release this span from its parent's open-child set once it has ended.
+   * Children still open at that moment are handed to the nearest ancestor
+   * that has not ended, so a later endTree() on that ancestor can still
+   * reach them (e.g. a model span that finalizes on abort before the
+   * agent run's terminal handler closes the tree).
+   */
+  protected detachFromParent(): void {
+    const owner = this.#openChildrenOwner;
+    if (owner) {
+      owner.#openChildren?.delete(this);
+      this.#openChildrenOwner = undefined;
+    }
+    if (this.#openChildren?.size) {
+      let ancestor: AnySpan | undefined = this.parent;
+      while (ancestor instanceof BaseSpan && ancestor.endTime) {
+        ancestor = ancestor.parent;
+      }
+      if (ancestor instanceof BaseSpan) {
+        for (const child of this.#openChildren) {
+          (ancestor.#openChildren ??= new Set()).add(child);
+          child.#openChildrenOwner = ancestor;
+        }
+        this.#openChildren.clear();
+      }
+      // No live ancestor to promote to: keep tracking our own open children
+      // so a later endTree() on this span can still close them.
+    }
+  }
 
   /** Record an error for the span, optionally end the span as well */
   abstract error(options: ErrorSpanOptions<TType>): void;
@@ -265,34 +511,62 @@ export abstract class BaseSpan<TType extends SpanType = any> implements Span<TTy
    * Create a ModelSpanTracker for this span (only works if this is a MODEL_GENERATION span)
    * Returns undefined for non-MODEL_GENERATION spans
    */
-  createTracker(): IModelSpanTracker | undefined {
+  createTracker(options?: ModelSpanTrackerOptions): IModelSpanTracker | undefined {
     // Only create tracker for MODEL_GENERATION spans
     if (this.type !== SpanType.MODEL_GENERATION) {
       return undefined;
     }
 
-    return new ModelSpanTracker(this as Span<SpanType.MODEL_GENERATION>);
+    return new ModelSpanTracker(this as Span<SpanType.MODEL_GENERATION>, options);
   }
 
   /** Returns `TRUE` if the span is the root span of a trace */
   get isRootSpan(): boolean {
-    return !this.parent;
+    return this.restoredIsRootSpan ?? !this.parent;
   }
 
   /** Returns `TRUE` if the span is a valid span (not a NO-OP Span) */
   abstract get isValid(): boolean;
 
-  /** Get the closest parent span, optionally skipping internal spans */
+  /**
+   * Get the closest parent span.
+   * Always skips ancestors dropped by `excludeSpanTypes` (`isExcluded`), so
+   * exported `parentSpanId` values never point at spans exporters omit.
+   * When `includeInternalSpans` is false/undefined, also skips `isInternal`
+   * ancestors.
+   */
   public getParentSpan(includeInternalSpans?: boolean): AnySpan | undefined {
     if (!this.parent) {
       return undefined;
     }
-    if (includeInternalSpans) return this.parent;
-    if (this.parent.isInternal) return (this.parent as AnyBaseSpan).getParentSpan(includeInternalSpans);
+    const parent = this.parent as AnyBaseSpan;
+    if (parent.isExcluded || (!includeInternalSpans && parent.isInternal)) {
+      return parent.getParentSpan(includeInternalSpans);
+    }
     return this.parent;
   }
 
-  /** Get the closest parent spanId that isn't an internal span */
+  /**
+   * Get the spanId that observability signals (logs, metrics, scores) should
+   * reference for this span. If this span itself reaches exporters, that is
+   * its own id. If it is excluded from export (internal span, excludeSpanTypes,
+   * or NoOpSpan), resolves to the nearest exportable ancestor instead.
+   * Returns undefined when no exportable ancestor exists.
+   *
+   * Only covers exclusions known when the span is created (`isExcluded`). A
+   * `spanFilter` or a span output processor can still drop a span at export
+   * time — both run on the exported span data after the span ends, so their
+   * verdict isn't knowable while signals are being stamped. Signals emitted
+   * inside a span dropped that way still reference its own id.
+   */
+  public getExportedSpanId(): string | undefined {
+    if (!this.isExcluded) {
+      return this.id;
+    }
+    return this.getParentSpanId(this.observabilityInstance.getConfig().includeInternalSpans);
+  }
+
+  /** Get the closest parent spanId that will reach exporters (unless includeInternalSpans) */
   public getParentSpanId(includeInternalSpans?: boolean): string | undefined {
     if (!this.parent) {
       // Return parent span ID if available (for root spans with external parent)
@@ -302,8 +576,24 @@ export abstract class BaseSpan<TType extends SpanType = any> implements Span<TTy
     if (parentSpan) {
       return parentSpan.id;
     }
-    // All ancestors are internal, recurse to get root's parentSpanId
+    // All ancestors are internal/excluded, recurse to get root's parentSpanId
     return this.parent.getParentSpanId(includeInternalSpans);
+  }
+
+  /**
+   * External (foreign tracing-system) parent id to export alongside
+   * {@link getParentSpanId}. When every Mastra ancestor is dropped from
+   * export, the span is exported at the root's position, so the root's
+   * external parent must travel with it.
+   */
+  protected getExportedExternalParentSpanId(includeInternalSpans?: boolean): string | undefined {
+    if (!this.parent) {
+      return this.externalParentSpanId;
+    }
+    if (this.getParentSpan(includeInternalSpans)) {
+      return this.externalParentSpanId;
+    }
+    return (this.parent as unknown as BaseSpan).getExportedExternalParentSpanId(includeInternalSpans);
   }
 
   /** Find the closest parent span of a specific type by walking up the parent chain */
@@ -320,7 +610,44 @@ export abstract class BaseSpan<TType extends SpanType = any> implements Span<TTy
     return undefined;
   }
 
-  /** Build and cache the canonical correlation context for this live span. */
+  /**
+   * Restore the parent and root entity a span had before it was exported and
+   * rebuilt (durable execution), so it and its new children keep their lineage.
+   */
+  public restoreEntityLineage(
+    cached: SpanEntityLineage & Pick<SpanSnapshot<SpanType>, 'ownEntityVersionId'> & { isRootSpan?: boolean },
+  ): void {
+    // Snapshots from older versions lack this. Their metadata version may belong to an
+    // ancestor entity, so treat ownership as unknown rather than guess.
+    this.ownEntityVersionId = cached.ownEntityVersionId ?? undefined;
+    this.restoredIsRootSpan = cached.isRootSpan;
+    const lineage = definedLineage(cached);
+    if (Object.keys(lineage).length > 0) {
+      this.restoredLineage = lineage;
+      this.correlationContext = undefined;
+    }
+  }
+
+  /** Read at export time, not from the cached correlation context, so a service name set on update or end wins over the config. */
+  private resolveServiceName(): string | undefined {
+    const value = this.metadata?.serviceName;
+    return typeof value === 'string' ? value : this.observabilityInstance.getConfig().serviceName;
+  }
+
+  /**
+   * Build and cache the canonical correlation context for this live span.
+   *
+   * Parent entity: the nearest ancestor that is not internal or excluded, the
+   * same rule used for entity inheritance. Root entity: the top of the
+   * in-process parent chain, which is not necessarily the distributed trace's
+   * root when the trace continues from another service. The root walk does not
+   * skip internal spans, so the root can name an entity whose span is not
+   * exported. Logs, metrics, scores and feedback share these values.
+   *
+   * When the top of the live chain was rebuilt, its original ancestors only
+   * survive in the restored lineage, so it supplies the root and, when no live
+   * ancestor qualifies, the parent.
+   */
   public getCorrelationContext(): CorrelationContext {
     if (this.correlationContext) {
       return this.correlationContext;
@@ -329,35 +656,56 @@ export abstract class BaseSpan<TType extends SpanType = any> implements Span<TTy
     const metadata = this.metadata ?? {};
     const getMetadataString = (key: string): string | undefined =>
       typeof metadata[key] === 'string' ? metadata[key] : undefined;
-    const getSpanMetadataString = (span: AnySpan | null | undefined, key: string): string | undefined => {
-      const m = span?.metadata;
-      return m && typeof m[key] === 'string' ? m[key] : undefined;
-    };
     const parentSpan = this.getParentSpan(false);
 
     let rootSpan: AnySpan = this;
     while (rootSpan.parent) {
       rootSpan = rootSpan.parent;
     }
+    const restored = rootSpan instanceof BaseSpan ? rootSpan.restoredLineage : undefined;
+    const parentLineage: SpanEntityLineage = parentSpan
+      ? {
+          parentEntityType: parentSpan.entityType,
+          parentEntityId: parentSpan.entityId,
+          parentEntityName: parentSpan.entityName,
+          parentEntityVersionId: ownEntityVersionId(parentSpan),
+        }
+      : {
+          parentEntityType: restored?.parentEntityType,
+          parentEntityId: restored?.parentEntityId,
+          parentEntityName: restored?.parentEntityName,
+          parentEntityVersionId: restored?.parentEntityVersionId,
+        };
+    const rootLineage: SpanEntityLineage = restored
+      ? {
+          rootEntityType: restored.rootEntityType,
+          rootEntityId: restored.rootEntityId,
+          rootEntityName: restored.rootEntityName,
+          rootEntityVersionId: restored.rootEntityVersionId,
+        }
+      : {
+          rootEntityType: rootSpan.entityType,
+          rootEntityId: rootSpan.entityId,
+          rootEntityName: rootSpan.entityName,
+          rootEntityVersionId: ownEntityVersionId(rootSpan),
+        };
 
     const rootTags = rootSpan.tags?.length ? [...rootSpan.tags] : undefined;
 
     this.correlationContext = {
       traceId: this.traceId,
-      spanId: this.id,
+      // Signals correlate against exported spans (storage record-builders and
+      // score/feedback targeting fall back to this field), so reference the
+      // nearest exportable spanId rather than an id that never reaches
+      // exporters when this span is internal/excluded.
+      spanId: this.getExportedSpanId(),
       tags: rootTags,
       entityType: this.entityType,
       entityId: this.entityId,
       entityName: this.entityName,
-      entityVersionId: getMetadataString('entityVersionId'),
-      parentEntityType: parentSpan?.entityType,
-      parentEntityId: parentSpan?.entityId,
-      parentEntityName: parentSpan?.entityName,
-      parentEntityVersionId: getSpanMetadataString(parentSpan, 'entityVersionId'),
-      rootEntityType: rootSpan.entityType,
-      rootEntityId: rootSpan.entityId,
-      rootEntityName: rootSpan.entityName,
-      rootEntityVersionId: getSpanMetadataString(rootSpan, 'entityVersionId'),
+      entityVersionId: this.ownEntityVersionId,
+      ...parentLineage,
+      ...rootLineage,
       userId: getMetadataString('userId'),
       organizationId: getMetadataString('organizationId'),
       resourceId: getMetadataString('resourceId'),
@@ -367,7 +715,7 @@ export abstract class BaseSpan<TType extends SpanType = any> implements Span<TTy
       requestId: getMetadataString('requestId'),
       environment: getMetadataString('environment') ?? this.observabilityInstance.getMastraEnvironment?.(),
       source: getMetadataString('source'),
-      serviceName: getMetadataString('serviceName') ?? this.observabilityInstance.getConfig().serviceName,
+      serviceName: this.resolveServiceName(),
       experimentId: getMetadataString('experimentId'),
     };
 
@@ -379,6 +727,13 @@ export abstract class BaseSpan<TType extends SpanType = any> implements Span<TTy
     // Check if input/output should be hidden based on traceState
     const hideInput = this.traceState?.hideInput ?? false;
     const hideOutput = this.traceState?.hideOutput ?? false;
+    const nestedUnderParent = this.traceState?.nestedUnderParent ?? false;
+    // Checked again here because links can be set on the span after it starts
+    const links = validLinks(this.links);
+    const correlation = this.getCorrelationContext();
+    const serviceName = this.resolveServiceName();
+    // Measured once on the inference that streamed the first chunk and copied up as an attribute.
+    const timeToFirstTokenMs = (this.attributes as { timeToFirstTokenMs?: unknown } | undefined)?.timeToFirstTokenMs;
 
     return {
       id: this.id,
@@ -395,12 +750,34 @@ export abstract class BaseSpan<TType extends SpanType = any> implements Span<TTy
       input: hideInput ? undefined : this.input,
       output: hideOutput ? undefined : this.output,
       errorInfo: this.errorInfo,
+      ...(this.outcome !== undefined ? { outcome: this.outcome } : {}),
+      ...(this.stopReason !== undefined ? { stopReason: this.stopReason } : {}),
+      ...(this.stopReasonContext !== undefined ? { stopReasonContext: this.stopReasonContext } : {}),
       requestContext: this.requestContext,
       isEvent: this.isEvent,
       isRootSpan: this.isRootSpan,
+      ...(this.isInternal ? { isInternal: true } : {}),
+      ...(correlation.entityVersionId ? { entityVersionId: correlation.entityVersionId } : {}),
+      ...(serviceName ? { serviceName } : {}),
+      ...definedLineage(correlation),
       parentSpanId: this.getParentSpanId(includeInternalSpans),
-      // Tags are only included for root spans
-      ...(this.isRootSpan && this.tags?.length ? { tags: this.tags } : {}),
+      externalParentSpanId: this.getExportedExternalParentSpanId(includeInternalSpans),
+      ...(this.resumedFromSpanId !== undefined ? { resumedFromSpanId: this.resumedFromSpanId } : {}),
+      ...modelPair(this.attributes),
+      ...(typeof timeToFirstTokenMs === 'number' ? { timeToFirstTokenMs } : {}),
+      ...(nestedUnderParent ? { nestedUnderParent: true } : {}),
+      ...(links ? { links } : {}),
+      // Tags are only included for root spans, and a nested run does not own the trace
+      ...(this.isRootSpan && !nestedUnderParent && this.tags?.length ? { tags: this.tags } : {}),
+    };
+  }
+
+  /** Returns the span saved for a later `rebuildSpan()`, with its trace state */
+  public snapshot(): SpanSnapshot<TType> {
+    return {
+      ...this.exportSpan(this.observabilityInstance.getConfig().includeInternalSpans),
+      ownEntityVersionId: this.ownEntityVersionId ?? null,
+      ...(this.traceState ? { traceState: this.traceState } : {}),
     };
   }
 
@@ -416,7 +793,7 @@ export abstract class BaseSpan<TType extends SpanType = any> implements Span<TTy
     const bridge = this.observabilityInstance.getBridge();
 
     if (bridge?.executeInContext) {
-      const bridgeContextSpan = this.isInternal ? this.getParentSpan(false) : this;
+      const bridgeContextSpan = this.isInternal || this.isExcluded ? this.getParentSpan(false) : this;
       return bridge.executeInContext(bridgeContextSpan?.id ?? this.id, fn);
     }
 
@@ -431,7 +808,7 @@ export abstract class BaseSpan<TType extends SpanType = any> implements Span<TTy
     const bridge = this.observabilityInstance.getBridge();
 
     if (bridge?.executeInContextSync) {
-      const bridgeContextSpan = this.isInternal ? this.getParentSpan(false) : this;
+      const bridgeContextSpan = this.isInternal || this.isExcluded ? this.getParentSpan(false) : this;
       return bridge.executeInContextSync(bridgeContextSpan?.id ?? this.id, fn);
     }
 

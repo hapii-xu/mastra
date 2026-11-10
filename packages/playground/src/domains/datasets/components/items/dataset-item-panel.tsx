@@ -1,30 +1,18 @@
 'use client';
 
-import type { DatasetItem, DatasetItemToolMock } from '@mastra/client-js';
+import type { DatasetItem, DatasetItemToolMock, UpdateDatasetItemParams } from '@mastra/client-js';
 import { AlertDialog } from '@mastra/playground-ui/components/AlertDialog';
 import { Button } from '@mastra/playground-ui/components/Button';
-import { ButtonsGroup } from '@mastra/playground-ui/components/ButtonsGroup';
-import { DataKeysAndValues } from '@mastra/playground-ui/components/DataKeysAndValues';
 import { DataPanel } from '@mastra/playground-ui/components/DataPanel';
 import { DropdownMenu } from '@mastra/playground-ui/components/DropdownMenu';
+import { useLinkComponent } from '@mastra/playground-ui/lib/framework';
 import { toast } from '@mastra/playground-ui/utils/toast';
-import { format } from 'date-fns/format';
-import {
-  BracesIcon,
-  EllipsisVerticalIcon,
-  FileInputIcon,
-  FileOutputIcon,
-  History,
-  Pencil,
-  RouteIcon,
-  TagIcon,
-  Trash2,
-  WrenchIcon,
-} from 'lucide-react';
+import { useDatasetMutations } from '@mastra/react/hooks/datasets';
+import { EllipsisVerticalIcon, History, Pencil, Trash2 } from 'lucide-react';
+import type { ReactNode } from 'react';
 import { useEffect, useState } from 'react';
-import { useDatasetMutations } from '../../hooks/use-dataset-mutations';
 import { EditModeContent } from '../dataset-detail/dataset-item-form';
-import { useLinkComponent } from '@/lib/framework';
+import { DatasetItemDetails } from './dataset-item-details';
 
 /** Schema validation error from API */
 interface SchemaValidationError {
@@ -53,18 +41,73 @@ function parseValidationError(error: unknown): SchemaValidationError | null {
 
 export interface DatasetItemPanelProps {
   datasetId: string;
-  item: DatasetItem;
+  /** Keep the panel mounted and pass `undefined` to close it, so the drawer animates out. */
+  item?: DatasetItem;
+  /** Item the panel is opened for while `item` is not available yet; keeps the panel open showing `fallback`. */
+  itemId?: string;
+  /** Rendered instead of the item body while `itemId` is set but `item` is missing (loading / not found). */
+  fallback?: ReactNode;
   items: DatasetItem[];
   onItemChange: (itemId: string) => void;
   onClose: () => void;
+  /**
+   * `drawer` (default) portals the panel over the app. `inline` renders it in the document flow
+   * (e.g. inside the route side panel) and renders nothing while there is no `item`/`itemId`.
+   */
+  variant?: 'drawer' | 'inline';
 }
 
 /**
- * Inline panel showing full details of a single dataset item.
+ * Full details of a single dataset item, as a drawer or an inline card.
  * Includes navigation to next/previous items and sections for Input, Ground Truth, and Metadata.
  */
-export function DatasetItemPanel({ datasetId, item, items, onItemChange, onClose }: DatasetItemPanelProps) {
-  const { Link } = useLinkComponent();
+export function DatasetItemPanel({
+  item,
+  itemId,
+  fallback,
+  onClose,
+  variant = 'drawer',
+  ...bodyProps
+}: DatasetItemPanelProps) {
+  const id = item?.id ?? itemId;
+  const title = `Dataset item ${id ?? ''}`;
+  const content = item ? (
+    // Keyed so form state never leaks between items while the panel stays mounted.
+    <DatasetItemPanelBody key={item.id} item={item} onClose={onClose} {...bodyProps} />
+  ) : itemId ? (
+    <>
+      <DataPanel.Header>
+        <DataPanel.Heading>Dataset item</DataPanel.Heading>
+        <DataPanel.HeaderActions>
+          <DataPanel.CloseButton icon="x" onClick={onClose} tooltip="Close detail panel" />
+        </DataPanel.HeaderActions>
+      </DataPanel.Header>
+      {fallback}
+    </>
+  ) : null;
+
+  if (variant === 'inline') {
+    if (!content) return null;
+    return (
+      <DataPanel variant="inline" title={title}>
+        {content}
+      </DataPanel>
+    );
+  }
+
+  return (
+    <DataPanel open={!!id} onClose={onClose} title={title}>
+      {content}
+    </DataPanel>
+  );
+}
+
+type DatasetItemPanelBodyProps = Omit<DatasetItemPanelProps, 'item' | 'itemId' | 'fallback' | 'variant'> & {
+  item: DatasetItem;
+};
+
+function DatasetItemPanelBody({ datasetId, item, items, onItemChange, onClose }: DatasetItemPanelBodyProps) {
+  const { navigate } = useLinkComponent();
   const { updateItem, deleteItem } = useDatasetMutations();
 
   // Edit mode state
@@ -139,7 +182,7 @@ export function DatasetItemPanel({ datasetId, item, items, onItemChange, onClose
     }
 
     // Parse expectedTrajectory: empty string means explicitly clear (null), omitted means keep existing
-    let parsedTrajectory: unknown | null = null;
+    let parsedTrajectory: UpdateDatasetItemParams['expectedTrajectory'] = null;
     if (trajectoryValue.trim()) {
       try {
         parsedTrajectory = JSON.parse(trajectoryValue);
@@ -244,142 +287,70 @@ export function DatasetItemPanel({ datasetId, item, items, onItemChange, onClose
 
   return (
     <>
-      <DataPanel>
-        <DataPanel.Header>
-          <DataPanel.Heading>
-            Item <b># {item.id.length > 12 ? `${item.id.slice(0, 12)}…` : item.id}</b>
-          </DataPanel.Heading>
-          <ButtonsGroup className="ml-auto shrink-0">
-            <DataPanel.NextPrevNav
-              onPrevious={onPrevious}
-              onNext={onNext}
-              previousLabel="Previous item"
-              nextLabel="Next item"
-            />
-            {!isEditing && (
-              <>
-                <Button
-                  as={Link}
-                  href={`/datasets/${datasetId}/items/${item.id}`}
-                  size="md"
-                  tooltip="Go to item versions history"
-                  aria-label="Go to item versions history"
+      <DataPanel.Header>
+        <DataPanel.Heading>Dataset item</DataPanel.Heading>
+        <DataPanel.HeaderActions>
+          {!isEditing && (
+            <DropdownMenu>
+              <DropdownMenu.Trigger asChild>
+                <Button size="icon-sm" variant="ghost" tooltip="Open actions menu" aria-label="Open actions menu">
+                  <EllipsisVerticalIcon />
+                </Button>
+              </DropdownMenu.Trigger>
+              <DropdownMenu.Content align="end" className="w-48">
+                <DropdownMenu.Item
+                  onSelect={() =>
+                    navigate(`/datasets/${datasetId}/items/${item.id}/versions?version=${item.datasetVersion}`)
+                  }
                 >
                   <History />
-                </Button>
-
-                <DropdownMenu>
-                  <DropdownMenu.Trigger asChild>
-                    <Button size="md" aria-label="Actions menu">
-                      <EllipsisVerticalIcon />
-                    </Button>
-                  </DropdownMenu.Trigger>
-                  <DropdownMenu.Content align="end" className="w-48">
-                    <DropdownMenu.Item onSelect={() => setIsEditing(true)}>
-                      <Pencil />
-                      Edit
-                    </DropdownMenu.Item>
-                    <DropdownMenu.Item
-                      onSelect={() => setShowDeleteConfirm(true)}
-                      className="text-red-500 focus:text-red-400"
-                    >
-                      <Trash2 />
-                      Delete Item
-                    </DropdownMenu.Item>
-                  </DropdownMenu.Content>
-                </DropdownMenu>
-              </>
-            )}
-            <DataPanel.CloseButton onClick={onClose} tooltip="Close detail panel" />
-          </ButtonsGroup>
-        </DataPanel.Header>
-
-        <DataPanel.Content>
-          {isEditing ? (
-            <EditModeContent
-              inputValue={inputValue}
-              setInputValue={handleInputValueChange}
-              groundTruthValue={groundTruthValue}
-              setGroundTruthValue={handleGroundTruthValueChange}
-              metadataValue={metadataValue}
-              setMetadataValue={setMetadataValue}
-              trajectoryValue={trajectoryValue}
-              setTrajectoryValue={setTrajectoryValue}
-              toolMocksValue={toolMocksValue}
-              setToolMocksValue={setToolMocksValue}
-              requestContextValue={requestContextValue}
-              setRequestContextValue={setRequestContextValue}
-              validationErrors={validationErrors}
-              onSave={handleSave}
-              onCancel={handleCancel}
-              isSaving={updateItem.isPending}
-            />
-          ) : (
-            <>
-              <DataKeysAndValues>
-                <DataKeysAndValues.Key>Dataset Id</DataKeysAndValues.Key>
-                <DataKeysAndValues.ValueWithCopyBtn
-                  copyTooltip="Copy Dataset Id to clipboard"
-                  copyValue={item.datasetId}
-                >
-                  {item.datasetId}
-                </DataKeysAndValues.ValueWithCopyBtn>
-                <DataKeysAndValues.Key>Version</DataKeysAndValues.Key>
-                <DataKeysAndValues.Value>v{item.datasetVersion}</DataKeysAndValues.Value>
-                <DataKeysAndValues.Key>Created</DataKeysAndValues.Key>
-                <DataKeysAndValues.Value>
-                  {format(new Date(item.createdAt), 'MMM d, yyyy h:mm aaa')}
-                </DataKeysAndValues.Value>
-                {item.updatedAt && new Date(item.updatedAt).getTime() !== new Date(item.createdAt).getTime() && (
-                  <>
-                    <DataKeysAndValues.Key>Updated</DataKeysAndValues.Key>
-                    <DataKeysAndValues.Value>
-                      {format(new Date(item.updatedAt), 'MMM d, yyyy h:mm aaa')}
-                    </DataKeysAndValues.Value>
-                  </>
-                )}
-              </DataKeysAndValues>
-
-              <div className="mt-3 grid gap-3">
-                <DataPanel.CodeSection
-                  title="Input"
-                  icon={<FileInputIcon />}
-                  codeStr={JSON.stringify(item.input ?? null, null, 2)}
-                />
-                <DataPanel.CodeSection
-                  title="Ground Truth"
-                  icon={<FileOutputIcon />}
-                  codeStr={JSON.stringify(item.groundTruth ?? null, null, 2)}
-                />
-                {item.expectedTrajectory != null && (
-                  <DataPanel.CodeSection
-                    title="Expected Trajectory"
-                    icon={<RouteIcon />}
-                    codeStr={JSON.stringify(item.expectedTrajectory, null, 2)}
-                  />
-                )}
-                <DataPanel.CodeSection
-                  title="Tool Mocks"
-                  icon={<WrenchIcon />}
-                  codeStr={JSON.stringify(item.toolMocks ?? [], null, 2)}
-                />
-                {item.requestContext != null && (
-                  <DataPanel.CodeSection
-                    title="Request Context"
-                    icon={<BracesIcon />}
-                    codeStr={JSON.stringify(item.requestContext, null, 2)}
-                  />
-                )}
-                <DataPanel.CodeSection
-                  title="Metadata"
-                  icon={<TagIcon />}
-                  codeStr={JSON.stringify(item.metadata ?? null, null, 2)}
-                />
-              </div>
-            </>
+                  Item versions
+                </DropdownMenu.Item>
+                <DropdownMenu.Item onSelect={() => setIsEditing(true)}>
+                  <Pencil />
+                  Edit
+                </DropdownMenu.Item>
+                <DropdownMenu.Item onSelect={() => setShowDeleteConfirm(true)} variant="destructive">
+                  <Trash2 />
+                  Delete item
+                </DropdownMenu.Item>
+              </DropdownMenu.Content>
+            </DropdownMenu>
           )}
-        </DataPanel.Content>
-      </DataPanel>
+          <DataPanel.NextPrevNav
+            onPrevious={onPrevious}
+            onNext={onNext}
+            previousLabel="Go to previous item"
+            nextLabel="Go to next item"
+          />
+          <DataPanel.CloseButton icon="x" onClick={onClose} tooltip="Close detail panel" />
+        </DataPanel.HeaderActions>
+      </DataPanel.Header>
+
+      <DataPanel.Content>
+        {isEditing ? (
+          <EditModeContent
+            inputValue={inputValue}
+            setInputValue={handleInputValueChange}
+            groundTruthValue={groundTruthValue}
+            setGroundTruthValue={handleGroundTruthValueChange}
+            metadataValue={metadataValue}
+            setMetadataValue={setMetadataValue}
+            trajectoryValue={trajectoryValue}
+            setTrajectoryValue={setTrajectoryValue}
+            toolMocksValue={toolMocksValue}
+            setToolMocksValue={setToolMocksValue}
+            requestContextValue={requestContextValue}
+            setRequestContextValue={setRequestContextValue}
+            validationErrors={validationErrors}
+            onSave={handleSave}
+            onCancel={handleCancel}
+            isSaving={updateItem.isPending}
+          />
+        ) : (
+          <DatasetItemDetails item={item} />
+        )}
+      </DataPanel.Content>
 
       {/* Delete confirmation - uses portal, renders above panel */}
       <AlertDialog open={showDeleteConfirm} onOpenChange={setShowDeleteConfirm}>
@@ -393,7 +364,7 @@ export function DatasetItemPanel({ datasetId, item, items, onItemChange, onClose
           <AlertDialog.Footer>
             <AlertDialog.Cancel>Cancel</AlertDialog.Cancel>
             <AlertDialog.Action onClick={handleDeleteConfirm}>
-              {deleteItem.isPending ? 'Deleting...' : 'Yes, Delete'}
+              {deleteItem.isPending ? 'Deleting...' : 'Yes, delete'}
             </AlertDialog.Action>
           </AlertDialog.Footer>
         </AlertDialog.Content>

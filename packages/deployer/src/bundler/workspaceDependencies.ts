@@ -1,16 +1,40 @@
 import { join, dirname } from 'node:path';
-import type { IMastraLogger } from '@mastra/core/logger';
-import slugify from '@sindresorhus/slugify';
+import type { IMastraLogger } from '@internal/core/logger';
+import { findWorkspaces, findWorkspacesRoot, createWorkspacesCache } from '@internal/find-workspaces';
 import * as pkg from 'empathic/package';
-import { findWorkspaces, findWorkspacesRoot, createWorkspacesCache } from 'find-workspaces';
 import { ensureDir } from 'fs-extra';
 import { slash } from '../build/utils';
 import { DepsService } from '../services';
+import { WORKSPACE_PLACEHOLDER_VERSION, withPlaceholderVersions } from '../services/deps';
 
 export type WorkspacePackageInfo = {
   location: string;
   dependencies: Record<string, string> | undefined;
   version: string | undefined;
+  exports?: unknown;
+};
+
+const isExportTargetImportable = (target: unknown): boolean => {
+  if (!target) return false;
+  if (typeof target === 'string') return true;
+  if (Array.isArray(target)) return target.some(isExportTargetImportable);
+  if (typeof target !== 'object') return false;
+
+  return Object.values(target).some(isExportTargetImportable);
+};
+
+export const hasRootExport = (exportsField: unknown): boolean => {
+  if (exportsField === undefined) return true;
+  if (typeof exportsField === 'string' || Array.isArray(exportsField)) return isExportTargetImportable(exportsField);
+  if (!exportsField || typeof exportsField !== 'object') return false;
+
+  const exportMap = exportsField as Record<string, unknown>;
+  const exportKeys = Object.keys(exportMap);
+  if (exportKeys.length === 0) return false;
+  if (Object.prototype.hasOwnProperty.call(exportMap, '.')) return isExportTargetImportable(exportMap['.']);
+  if (exportKeys.some(key => key.startsWith('./'))) return false;
+
+  return isExportTargetImportable(exportMap);
 };
 
 type TransitiveDependencyResult = {
@@ -54,6 +78,7 @@ export async function getWorkspaceInformation({
         location: workspace.location,
         dependencies: workspace.package.dependencies,
         version: workspace.package.version,
+        exports: workspace.package.exports,
       },
     ]) ?? [],
   );
@@ -75,7 +100,7 @@ export async function getWorkspaceInformation({
 /**
  * Collects all transitive workspace dependencies and their TGZ paths
  */
-export const collectTransitiveWorkspaceDependencies = ({
+export const collectTransitiveWorkspaceDependencies = async ({
   workspaceMap,
   initialDependencies,
   logger,
@@ -83,7 +108,7 @@ export const collectTransitiveWorkspaceDependencies = ({
   workspaceMap: Map<string, WorkspacePackageInfo>;
   initialDependencies: Set<string>;
   logger: IMastraLogger;
-}): TransitiveDependencyResult => {
+}): Promise<TransitiveDependencyResult> => {
   const usedWorkspacePackages = new Set<string>();
   const queue: string[] = Array.from(initialDependencies);
   const resolutions: Record<string, string> = {};
@@ -106,11 +131,13 @@ export const collectTransitiveWorkspaceDependencies = ({
 
       const depsService = new DepsService(root.location);
       depsService.__setLogger(logger);
+
+      const slugify = (await import('@sindresorhus/slugify')).default;
       const sanitizedName = slugify(pkgName);
 
       const tgzPath = depsService.getWorkspaceDependencyPath({
         pkgName: sanitizedName,
-        version: dep.version!,
+        version: dep.version ?? WORKSPACE_PLACEHOLDER_VERSION,
       });
       resolutions[pkgName] = tgzPath;
       usedWorkspacePackages.add(pkgName);
@@ -150,6 +177,7 @@ export const packWorkspaceDependencies = async ({
 
   // package all workspace dependencies
   if (usedWorkspacePackages.size > 0) {
+    const slugify = (await import('@sindresorhus/slugify')).default;
     const workspaceDirPath = join(bundleOutputDir, 'workspace-module');
     await ensureDir(workspaceDirPath);
 
@@ -157,22 +185,33 @@ export const packWorkspaceDependencies = async ({
 
     const batchSize = 5;
     const packages = Array.from(usedWorkspacePackages.values());
+    const packageDirs = packages.flatMap(pkgName => {
+      const location = workspaceMap.get(pkgName)?.location;
+      return location ? [location] : [];
+    });
 
-    for (let i = 0; i < packages.length; i += batchSize) {
-      const batch = packages.slice(i, i + batchSize);
-      logger.info(
-        `Packaging batch ${Math.floor(i / batchSize) + 1}/${Math.ceil(packages.length / batchSize)}: ${batch.join(', ')}`,
-      );
-      await Promise.all(
-        batch.map(async pkgName => {
-          const dep = workspaceMap.get(pkgName);
-          const sanitizedName = slugify(pkgName);
-          if (!dep) return;
+    await withPlaceholderVersions(packageDirs, async () => {
+      for (let i = 0; i < packages.length; i += batchSize) {
+        const batch = packages.slice(i, i + batchSize);
+        logger.info(
+          `Packaging batch ${Math.floor(i / batchSize) + 1}/${Math.ceil(packages.length / batchSize)}: ${batch.join(', ')}`,
+        );
+        await Promise.all(
+          batch.map(async pkgName => {
+            const dep = workspaceMap.get(pkgName);
+            const sanitizedName = slugify(pkgName);
+            if (!dep) return;
 
-          await depsService.pack({ dir: dep.location, destination: workspaceDirPath, sanitizedName: sanitizedName });
-        }),
-      );
-    }
+            await depsService.pack({
+              dir: dep.location,
+              destination: workspaceDirPath,
+              sanitizedName,
+              version: dep.version ?? WORKSPACE_PLACEHOLDER_VERSION,
+            });
+          }),
+        );
+      }
+    });
 
     logger.info('Successfully packaged workspace dependencies', { count: usedWorkspacePackages.size });
   }

@@ -10,6 +10,18 @@ export const MASTRA_RESOURCE_ID_KEY = 'mastra__resourceId';
 
 export const MASTRA_THREAD_ID_KEY = 'mastra__threadId';
 
+/**
+ * Agent scopes set by trusted middleware. Never accepted from a request body.
+ */
+export const MASTRA_SCOPES_KEY = 'mastra__scopes';
+
+/**
+ * The Knowledge principals the signed-in caller holds, for the Studio Knowledge routes: a `string[]` of
+ * principal addresses, or `'all'` for an admin who may read the whole instance. Set it in
+ * `auth.authorize` (after authentication). With auth configured, a caller without it is refused.
+ */
+export const MASTRA_KNOWLEDGE_PRINCIPALS_KEY = 'mastra__knowledgePrincipals';
+
 export const MASTRA_USER_KEY = 'mastra__user';
 
 export const MASTRA_USER_PERMISSIONS_KEY = 'mastra__userPermissions';
@@ -19,6 +31,12 @@ export const MASTRA_USER_ROLES_KEY = 'mastra__userRoles';
 export const MASTRA_AUTH_TOKEN_KEY = 'mastra__authToken';
 
 export const MASTRA_IS_STUDIO_KEY = 'mastra__isStudio';
+
+/**
+ * Carries a delegating agent's memory into a delegated sub-agent run. Set only
+ * by the delegation path inside a single process.
+ */
+export const MASTRA_INHERITED_MEMORY_KEY = 'mastra__inheritedMemory';
 
 /**
  * Tracks which auth mode was used for the current request.
@@ -31,22 +49,50 @@ export type MastraAuthMode = 'studio' | 'server';
 
 export const MASTRA_CLIENT_TYPE_HEADER = 'x-mastra-client-type';
 
+/**
+ * Browser-facing host, set by a trusted proxy whose own `X-Forwarded-Host` does
+ * not survive the hop to the app. Railway's gateway, for example, overwrites
+ * `X-Forwarded-Host` with its internal domain, so an edge in front of it has no
+ * other way to tell the app which hostname the user actually typed.
+ *
+ * Read by `getPublicOrigin()` ahead of `X-Forwarded-Host`. Carries the same
+ * trust assumption as the other forwarded headers: meaningful only behind a
+ * proxy that sets it, and it must be stripped from untrusted client requests.
+ */
+export const MASTRA_PUBLIC_HOST_HEADER = 'x-mastra-public-host';
+
 export const MASTRA_STUDIO_CLIENT_TYPE = 'studio';
 
-const RESERVED_CONTEXT_KEYS = new Set([
+/**
+ * RequestContext keys only trusted server code may set. Request bodies and query
+ * params can never supply them.
+ */
+export const RESERVED_REQUEST_CONTEXT_KEYS = [
   MASTRA_RESOURCE_ID_KEY,
   MASTRA_THREAD_ID_KEY,
+  // Agent scopes decide memory identity and what the agent acts as; only
+  // server middleware may set them.
+  MASTRA_SCOPES_KEY,
+  MASTRA_KNOWLEDGE_PRINCIPALS_KEY,
   MASTRA_USER_KEY,
   MASTRA_USER_PERMISSIONS_KEY,
   MASTRA_USER_ROLES_KEY,
   MASTRA_AUTH_TOKEN_KEY,
   MASTRA_IS_STUDIO_KEY,
   MASTRA_AUTH_MODE_KEY,
+  // Delegation stores a live memory instance here. A body-supplied value would
+  // be handed to the agent as its memory and throw on the first memory call.
+  MASTRA_INHERITED_MEMORY_KEY,
+  // Factory stores the authoritative per-caller OM settings result here before
+  // model-driven memory processors run. Client input must not spoof that result.
+  'mastra__factoryMemorySettings',
   // Tenant scope must be established server-side, never self-asserted by a
   // client. The trusted-actor FGA gate keys off `organizationId`, so a
   // body-supplied value must not be merged into the request context.
   'organizationId',
-]);
+] as const;
+
+const RESERVED_CONTEXT_KEYS: ReadonlySet<string> = new Set(RESERVED_REQUEST_CONTEXT_KEYS);
 
 export function isReservedRequestContextKey(key: string): boolean {
   return RESERVED_CONTEXT_KEYS.has(key);

@@ -4,7 +4,8 @@ import { jsonSchemaToZod } from '@mastra/schema-compat/json-to-zod';
 import { z } from 'zod/v4';
 import type { MastraPrimitives } from './action';
 import type { ToolsInput } from './agent';
-import type { ToolBackgroundConfig } from './background-tasks';
+import type { FGACheckContext, MastraFGAPermissionInput } from './auth/ee';
+import type { AgentBackgroundConfig, ToolBackgroundConfig } from './background-tasks';
 import type { MastraBrowser } from './browser/browser';
 import { ErrorCategory, ErrorDomain, MastraError } from './error';
 import type { MastraLanguageModel, MastraLegacyLanguageModel } from './llm/model/shared.types';
@@ -26,9 +27,34 @@ export { getZodTypeName, getZodDef, isZodArray, isZodObject } from './utils/zod-
 export { fetchWithRetry } from './utils/fetchWithRetry';
 export type { FetchWithRetryOptions } from './utils/fetchWithRetry';
 
-export { ensureSerializable, safeStringify } from './utils/safe-stringify';
+export { boundedStringify, ensureSerializable, isBoundedSerializable, safeStringify } from './utils/safe-stringify';
+export { deepEqual } from './utils/deep-equal';
 
-export const delay = (ms: number) => new Promise(resolve => setTimeout(resolve, ms));
+/** Resolves after `ms`, or as soon as `signal` aborts. */
+export const delay = (ms: number, signal?: AbortSignal) =>
+  new Promise<void>(resolve => {
+    if (signal?.aborted) return resolve();
+    const onAbort = () => {
+      clearTimeout(timer);
+      resolve();
+    };
+    const timer = setTimeout(() => {
+      signal?.removeEventListener('abort', onAbort);
+      resolve();
+    }, ms);
+    signal?.addEventListener('abort', onAbort, { once: true });
+  });
+
+/**
+ * Read a positive-integer environment variable (e.g. a TTL in ms). Unset, empty,
+ * non-numeric, fractional, or non-positive values fall back to `fallback`.
+ */
+export function readPositiveIntEnv(name: string, fallback: number): number {
+  const raw = process.env[name];
+  if (!raw) return fallback;
+  const parsed = Number(raw);
+  return Number.isInteger(parsed) && parsed > 0 ? parsed : fallback;
+}
 
 /**
  * Checks if a value is a plain object (not an array, function, Date, RegExp, etc.)
@@ -62,47 +88,6 @@ export function deepMerge<T extends object = object>(target: T, source: Partial<
   });
 
   return output;
-}
-
-/**
- * Deep equality comparison for comparing two values.
- * Handles primitives, arrays, objects, and Date instances.
- */
-export function deepEqual(a: unknown, b: unknown): boolean {
-  // Handle identical references and primitives
-  if (a === b) return true;
-
-  // Handle null/undefined
-  if (a == null || b == null) return a === b;
-
-  // Handle different types
-  if (typeof a !== typeof b) return false;
-
-  // Handle arrays
-  if (Array.isArray(a) && Array.isArray(b)) {
-    if (a.length !== b.length) return false;
-    return a.every((item, index) => deepEqual(item, b[index]));
-  }
-
-  // Handle dates (must check before generic objects since Date is also an object)
-  if (a instanceof Date && b instanceof Date) {
-    return a.getTime() === b.getTime();
-  }
-
-  // Handle objects (after Date check to avoid treating Dates as plain objects)
-  if (typeof a === 'object' && typeof b === 'object') {
-    const aObj = a as Record<string, unknown>;
-    const bObj = b as Record<string, unknown>;
-    const aKeys = Object.keys(aObj);
-    const bKeys = Object.keys(bObj);
-
-    if (aKeys.length !== bKeys.length) return false;
-
-    // Verify that bObj has the same keys as aObj before comparing values
-    return aKeys.every(key => Object.prototype.hasOwnProperty.call(bObj, key) && deepEqual(aObj[key], bObj[key]));
-  }
-
-  return false;
 }
 
 /**
@@ -327,10 +312,36 @@ export interface ToolOptions extends Partial<ObservabilityContext> {
   workspace?: Workspace;
   backgroundConfig?: ToolBackgroundConfig;
   /**
+   * Agent-level backgroundTasks config. Combined with `backgroundConfig` (the
+   * tool-level config) to decide whether the `_background` override schema is
+   * injected for this specific tool. See `isToolBackgroundEligible`.
+   */
+  agentBackgroundConfig?: AgentBackgroundConfig;
+  /**
    * Browser available for tool execution. When provided, tools can access
    * browser capabilities for web automation, screenshots, and data extraction.
    */
   browser?: MastraBrowser;
+  /**
+   * Resolves what this tool's `tools:execute` check authorizes against, when the tool's owner has its
+   * own rule (`MCPServer` checks its tools against its own resource and `fga` mapping). Without it,
+   * the check uses the standalone or agent tool resource.
+   * @internal
+   */
+  resolveExecuteFGA?: (ctx: { user: unknown; requestContext?: RequestContext }) => Promise<ToolExecuteFGACheck>;
+}
+
+/**
+ * The FGA check a tool runs before each execution, as returned by `ToolOptions.resolveExecuteFGA`.
+ * @internal
+ */
+export interface ToolExecuteFGACheck {
+  resource: { type: string; id: string };
+  permission: MastraFGAPermissionInput;
+  /** Merged into the check context the FGA provider receives. */
+  context?: FGACheckContext;
+  /** Merged into the check metadata the FGA provider receives. */
+  metadata?: Record<string, unknown>;
 }
 
 /**
@@ -449,6 +460,39 @@ export function makeCoreTool(
     autoResumeSuspendedTools,
     backgroundTaskEnabled,
   }).build();
+}
+
+const rebindToRequestContext = Symbol('rebindToRequestContext');
+
+/**
+ * Converts a raw tool an input processor added during a step. The processor does not run
+ * again before a suspended call resumes, so the converted tool remembers how to rebuild
+ * itself for the resuming call's request context (see {@link rebindProcessorTools}).
+ */
+export function makeProcessorCoreTool(...args: Parameters<typeof makeCoreTool>): CoreTool {
+  const [originalTool, options, ...rest] = args;
+  const tool = makeCoreTool(originalTool, options, ...rest);
+  Object.defineProperty(tool, rebindToRequestContext, {
+    value: (requestContext: RequestContext) =>
+      makeProcessorCoreTool(originalTool, { ...options, requestContext }, ...rest),
+  });
+  return tool;
+}
+
+/**
+ * Rebuilds the processor-added tools in `tools` for `requestContext`, the way request tools
+ * are rebuilt when a suspended run resumes, so an approved processor tool runs with the
+ * approver's request context like a statically defined tool does.
+ */
+export function rebindProcessorTools<T extends Record<string, unknown>>(tools: T, requestContext: RequestContext): T {
+  const rebound: Record<string, unknown> = { ...tools };
+  for (const [name, tool] of Object.entries(tools)) {
+    const rebind = (tool as { [rebindToRequestContext]?: (rc: RequestContext) => CoreTool } | undefined)?.[
+      rebindToRequestContext
+    ];
+    if (rebind) rebound[name] = rebind(requestContext);
+  }
+  return rebound as T;
 }
 
 export function makeCoreToolV5(
@@ -584,9 +628,8 @@ function detectSingleMessageCharacteristics(
     ['system', 'user', 'assistant', 'tool'].includes(message.role)
   ) {
     return 'message';
-  } else {
-    return 'other';
   }
+  return 'other';
 }
 
 export function isUiMessage(message: CoreMessage | AiMessageType): message is AiMessageType {

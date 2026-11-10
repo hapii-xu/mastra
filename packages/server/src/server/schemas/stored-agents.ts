@@ -1,7 +1,7 @@
 import { z } from 'zod/v4';
 import { paginationInfoSchema, createPagePaginationSchema, statusQuerySchema } from './common';
 import { defaultOptionsSchema } from './default-options';
-import { serializedMemoryConfigSchema } from './memory-config';
+import { storedMemoryRefSchema } from './memory-config';
 import { ruleGroupSchema } from './rule-group';
 import { workspaceSnapshotConfigSchema } from './stored-workspaces';
 import { toolProvidersSchema } from './tool-providers';
@@ -79,7 +79,7 @@ const scorerConfigSchema = z.object({
  */
 const agentInstructionBlockSchema = z.discriminatedUnion('type', [
   z.object({ type: z.literal('text'), content: z.string() }),
-  z.object({ type: z.literal('prompt_block_ref'), id: z.string() }),
+  z.object({ type: z.literal('prompt_block_ref'), id: z.string(), rules: ruleGroupSchema.optional() }),
   z.object({ type: z.literal('prompt_block'), content: z.string(), rules: ruleGroupSchema.optional() }),
 ]);
 
@@ -109,6 +109,14 @@ const modelConfigSchema = z
     name: z.string().describe('Model name (e.g., gpt-4o, claude-3-opus)'),
   })
   .passthrough();
+
+const modelListEntrySchema = z.object({
+  id: z.string(),
+  provider: z.string(),
+  modelId: z.string(),
+  enabled: z.boolean(),
+  maxRetries: z.number(),
+});
 
 /** Per-tool config schema */
 const toolConfigSchema = z.object({ description: z.string().optional(), rules: ruleGroupSchema.optional() });
@@ -182,6 +190,7 @@ const processorPhaseSchema = z.enum([
   'processOutputStream',
   'processOutputResult',
   'processOutputStep',
+  'processToolResult',
 ]);
 
 /**
@@ -251,6 +260,25 @@ const storedProcessorGraphSchema = z.object({
  * Fields that support conditional variants (StorageConditionalField) can be either
  * a static value OR an array of { value, rules? } variants evaluated at request time.
  */
+/**
+ * Serializable resumable-stream configuration. Mirrors `StorageDurableConfig`:
+ * `cache`/`pubsub` are live runtime objects and cannot be persisted, so they are
+ * not accepted here. Intentionally not a conditional field — stream configuration is
+ * decided when the agent is hydrated, not per request.
+ */
+const durableConfigSchema = z.union([
+  z.boolean(),
+  z.strictObject(
+    {
+      cleanupTimeoutMs: z.number().int().nonnegative().optional(),
+    },
+    {
+      error:
+        'Stored-agent durable configuration only accepts cleanupTimeoutMs. Use createDurableAgent({ agent, ...executionOptions }) for durable execution options.',
+    },
+  ),
+]);
+
 const snapshotConfigSchema = z.object({
   name: z.string().describe('Name of the agent'),
   description: z.string().optional().describe('Description of the agent'),
@@ -258,6 +286,7 @@ const snapshotConfigSchema = z.object({
   model: conditionalFieldSchema(modelConfigSchema).describe(
     'Model configuration — static value or array of conditional variants',
   ),
+  modelList: z.array(modelListEntrySchema).optional().describe('Ordered model fallback list owned by Studio'),
   tools: conditionalFieldSchema(toolsConfigSchema)
     .optional()
     .describe('Tool keys mapped to per-tool config — static or conditional'),
@@ -287,9 +316,9 @@ const snapshotConfigSchema = z.object({
   outputProcessors: conditionalFieldSchema(storedProcessorGraphSchema)
     .optional()
     .describe('Output processor graph — static or conditional'),
-  memory: conditionalFieldSchema(serializedMemoryConfigSchema)
+  memory: conditionalFieldSchema(storedMemoryRefSchema)
     .optional()
-    .describe('Memory configuration — static or conditional'),
+    .describe('Memory: registered memory reference or inline config — static or conditional'),
   scorers: conditionalFieldSchema(z.record(z.string(), scorerConfigSchema))
     .optional()
     .describe('Scorer keys with optional sampling config — static or conditional'),
@@ -307,6 +336,11 @@ const snapshotConfigSchema = z.object({
     .record(z.string(), z.unknown())
     .optional()
     .describe('JSON Schema defining valid request context variables for conditional rule evaluation'),
+  durable: durableConfigSchema
+    .optional()
+    .describe(
+      'Enable resumable streams when this agent is hydrated. Does not enable durable execution or checkpoint recovery.',
+    ),
 });
 
 /**
@@ -348,6 +382,14 @@ export const createStoredAgentBodySchema = z
       .enum(['private', 'public'])
       .optional()
       .describe('Agent visibility: private (owner/admin only) or public (any reader)'),
+    autoPublish: z
+      .boolean()
+      .optional()
+      .describe(
+        'Publish the initial version so the agent resolves at status="published". Defaults to true when omitted. ' +
+          'Pass false to stage the agent as an unpublished draft — useful when overriding a code-defined agent, ' +
+          'whose code definition keeps serving traffic until the override is published.',
+      ),
   })
   .merge(snapshotConfigCreateSchema);
 
@@ -356,9 +398,9 @@ export const createStoredAgentBodySchema = z
  */
 const snapshotConfigUpdateSchema = snapshotConfigSchema.extend({
   memory: z
-    .union([conditionalFieldSchema(serializedMemoryConfigSchema), z.null()])
+    .union([conditionalFieldSchema(storedMemoryRefSchema), z.null()])
     .optional()
-    .describe('Memory configuration — static, conditional, or null to disable memory'),
+    .describe('Memory: registered memory reference or inline config — static, conditional, or null to disable memory'),
 });
 
 /**
@@ -430,6 +472,7 @@ export const storedAgentSchema = z.object({
   model: conditionalFieldSchema(modelConfigSchema).describe(
     'Model configuration — static value or array of conditional variants',
   ),
+  modelList: z.array(modelListEntrySchema).optional().describe('Ordered model fallback list owned by Studio'),
   tools: conditionalFieldSchema(toolsConfigSchema)
     .optional()
     .describe('Tool keys mapped to per-tool config — static or conditional'),
@@ -459,9 +502,9 @@ export const storedAgentSchema = z.object({
   outputProcessors: conditionalFieldSchema(storedProcessorGraphSchema)
     .optional()
     .describe('Output processor graph — static or conditional'),
-  memory: conditionalFieldSchema(serializedMemoryConfigSchema)
+  memory: conditionalFieldSchema(storedMemoryRefSchema)
     .optional()
-    .describe('Memory configuration — static or conditional'),
+    .describe('Memory: registered memory reference or inline config — static or conditional'),
   scorers: conditionalFieldSchema(z.record(z.string(), scorerConfigSchema))
     .optional()
     .describe('Scorer keys with optional sampling config — static or conditional'),
@@ -479,6 +522,16 @@ export const storedAgentSchema = z.object({
     .record(z.string(), z.unknown())
     .optional()
     .describe('JSON Schema defining valid request context variables'),
+  durable: z
+    .union([
+      z.boolean(),
+      z.object({
+        maxSteps: z.number().int().positive().optional(),
+        cleanupTimeoutMs: z.number().int().nonnegative().optional(),
+      }),
+    ])
+    .optional()
+    .describe('Persisted resumable-stream configuration, including legacy durable execution options'),
 });
 
 /**

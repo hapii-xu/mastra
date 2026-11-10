@@ -14,8 +14,8 @@ import { z } from 'zod/v4';
 
 import { createTool } from '../../tools';
 import { extractLines } from '../line-utils';
-import { startWorkspaceSpan } from '../tools/tracing';
-import type { Skill, WorkspaceSkills } from './types';
+import { startSkillSpan } from '../tools/tracing';
+import type { Skill, SkillsContext, WorkspaceSkills } from './types';
 
 // =============================================================================
 // Factory
@@ -61,6 +61,16 @@ export function formatSkillActivation(skill: Skill): string {
 // Individual Tools
 // =============================================================================
 
+/** Above this many skills, a not-found skill lists suggestions instead of every skill. */
+const MAX_LISTED_SKILLS = 20;
+const MAX_SUGGESTED_SKILLS = 5;
+
+async function getScopedSkills(skills: WorkspaceSkills, requestContext?: object): Promise<WorkspaceSkills> {
+  return skills.getScoped
+    ? skills.getScoped({ requestContext: requestContext as SkillsContext['requestContext'] })
+    : skills;
+}
+
 /**
  * Resolve a skill identifier (name or path) to a Skill.
  * The `skills.get()` method handles both name-based lookup (with tie-breaking)
@@ -81,9 +91,25 @@ async function resolveSkill(
   const skill = await skills.get(identifier);
   if (skill) return { skill };
 
+  const notFound = `Skill "${identifier}" not found.`;
   const allSkills = await skills.list();
-  const skillEntries = allSkills.map(s => `${s.name} (${s.path})`);
-  return { notFound: `Skill "${identifier}" not found. Available skills: ${skillEntries.join(', ')}` };
+  if (allSkills.length <= MAX_LISTED_SKILLS) {
+    const skillEntries = allSkills.map(s => `${s.name} (${s.path})`);
+    return { notFound: `${notFound} Available skills: ${skillEntries.join(', ')}` };
+  }
+
+  // Listing every skill would put the whole catalog into the conversation, so suggest
+  // the closest matches instead and point the model at skill_search.
+  // Search by the last path segment: earlier segments ("skills/") match every skill.
+  const name = identifier.split('/').filter(Boolean).pop() ?? '';
+  const query = name.replace(/[-_.]+/g, ' ').trim();
+  // An empty query would "match" the first few skills, so don't suggest anything
+  const matches = query
+    ? await skills.search(query, { topK: MAX_SUGGESTED_SKILLS, includeReferences: false }).catch(() => [])
+    : [];
+  const suggestions = [...new Set(matches.map(m => `${m.skillName} (${m.skillPath})`))];
+  const closest = suggestions.length > 0 ? ` Closest matches: ${suggestions.join(', ')}.` : '';
+  return { notFound: `${notFound}${closest} Use the \`skill_search\` tool to find other skills.` };
 }
 
 function createSkillTool(skills: WorkspaceSkills) {
@@ -97,14 +123,15 @@ function createSkillTool(skills: WorkspaceSkills) {
         .describe('The name or path of the skill to activate. Use the path when multiple skills share the same name.'),
     }),
     execute: async ({ name }, context) => {
-      const span = startWorkspaceSpan(context, context?.workspace, {
-        category: 'skill',
+      const span = startSkillSpan(context, {
         operation: 'activate',
         input: { name },
+        attributes: { skillName: name },
       });
 
       try {
-        const result = await resolveSkill(skills, name);
+        const scopedSkills = await getScopedSkills(skills, context?.requestContext);
+        const result = await resolveSkill(scopedSkills, name);
 
         if ('notFound' in result) {
           span.end({ success: false });
@@ -130,23 +157,23 @@ function createSkillSearchTool(skills: WorkspaceSkills) {
   const tool = createTool({
     id: 'skill_search',
     description:
-      'Search across skill content to find relevant information. Useful when you need to find specific details within skills.',
+      'Search skills by name, description, and content. Use it to find which skill to load with the `skill` tool, or to find specific details inside skills.',
     inputSchema: z.object({
       query: z.string().describe('The search query'),
       skillNames: z.array(z.string()).optional().describe('Optional list of skill names to search within'),
       topK: z.number().optional().describe('Maximum number of results to return (default: 5)'),
     }),
     execute: async ({ query, skillNames, topK }, context) => {
-      const span = startWorkspaceSpan(context, context?.workspace, {
-        category: 'skill',
+      const span = startSkillSpan(context, {
         operation: 'search',
         input: { query, skillNames, topK },
         attributes: {},
       });
 
       try {
-        await skills.maybeRefresh();
-        const results = await skills.search(query, { topK, skillNames });
+        const scopedSkills = await getScopedSkills(skills, context?.requestContext);
+        await scopedSkills.maybeRefresh();
+        const results = await scopedSkills.search(query, { topK, skillNames });
 
         if (results.length === 0) {
           span.end({ success: true }, { resultCount: 0 });
@@ -157,8 +184,10 @@ function createSkillSearchTool(skills: WorkspaceSkills) {
         return results
           .map(r => {
             const preview = r.content.substring(0, 200) + (r.content.length > 200 ? '...' : '');
+            // Reference hits name their file so the model can pass it to skill_read
+            const file = r.source !== 'SKILL.md' ? ` ${r.source}` : '';
             const location = r.lineRange ? ` (lines ${r.lineRange.start}-${r.lineRange.end})` : '';
-            return `[${r.skillName}]${location} (score: ${r.score.toFixed(2)})\n${preview}`;
+            return `[${r.skillName}]${file}${location} (score: ${r.score.toFixed(2)})\n${preview}`;
           })
           .join('\n\n');
       } catch (err) {
@@ -193,51 +222,68 @@ function createSkillReadTool(skills: WorkspaceSkills) {
         .describe('Ending line number (1-indexed, inclusive). If omitted, reads to the end.'),
     }),
     execute: async ({ skillName, path, startLine, endLine }, context) => {
-      const span = startWorkspaceSpan(context, context?.workspace, {
-        category: 'skill',
+      const span = startSkillSpan(context, {
         operation: 'read',
         input: { skillName, path, startLine, endLine },
-        attributes: {},
+        attributes: { skillName },
       });
 
       try {
+        const scopedSkills = await getScopedSkills(skills, context?.requestContext);
         // Resolve skill by name or path (get() handles both with tie-breaking)
-        const resolved = await resolveSkill(skills, skillName);
+        const resolved = await resolveSkill(scopedSkills, skillName);
         if ('notFound' in resolved) {
           span.end({ success: false });
           return resolved.notFound;
         }
         const resolvedPath = resolved.skill.path;
 
-        // Try each reader using the resolved path to target the exact skill candidate
-        let content: string | Buffer | null = null;
-        content = await skills.getReference(resolvedPath, path);
-        if (content === null) content = await skills.getScript(resolvedPath, path);
-        if (content === null) content = await skills.getAsset(resolvedPath, path);
+        // Every accessor resolves the same skill-root-relative path; getAsset is the only one
+        // that returns the raw bytes instead of decoding them as UTF-8, so read through it and
+        // classify the bytes here. Going through getReference first would lossily decode any
+        // binary file before getAsset was reached.
+        const bytes = await scopedSkills.getAsset(resolvedPath, path);
 
-        if (content === null) {
-          const refs = (await skills.listReferences(resolvedPath)).map(f => `references/${f}`);
-          const scriptsList = (await skills.listScripts(resolvedPath)).map(f => `scripts/${f}`);
-          const assets = (await skills.listAssets(resolvedPath)).map(f => `assets/${f}`);
+        if (bytes === null) {
+          const refs = (await scopedSkills.listReferences(resolvedPath)).map(f => `references/${f}`);
+          const scriptsList = (await scopedSkills.listScripts(resolvedPath)).map(f => `scripts/${f}`);
+          const assets = (await scopedSkills.listAssets(resolvedPath)).map(f => `assets/${f}`);
           const allFiles = [...refs, ...scriptsList, ...assets];
           const fileList = allFiles.length > 0 ? `\nAvailable files: ${allFiles.join(', ')}` : '';
           span.end({ success: false });
           return `File "${path}" not found in skill "${skillName}".${fileList}`;
         }
 
-        // Detect binary content — getReference/getScript may return binary as garbled utf-8 strings
-        const textContent = typeof content === 'string' ? content : content.toString('utf-8');
-        if (textContent.slice(0, 1000).includes('\0')) {
+        // Binary if it contains NUL bytes or is not valid UTF-8 (e.g. PNGs, PDFs — which are
+        // often NUL-free). Report the exact byte size and never put mojibake in model context.
+        const text = bytes.toString('utf-8');
+        const isBinary = bytes.includes(0) || !bytes.equals(Buffer.from(text, 'utf-8'));
+        if (isBinary) {
           const fullPath = `${resolved.skill.path}/${path}`;
-          const size = typeof content === 'string' ? Buffer.byteLength(content) : content.length;
-          span.end({ success: true }, { bytesTransferred: size });
-          return `Binary file: ${fullPath} (${size} bytes)`;
+          span.end({ success: true }, { bytesTransferred: bytes.length });
+          return `Binary file: ${fullPath} (${bytes.length} bytes)`;
         }
-        content = textContent;
 
-        const result = extractLines(content, startLine, endLine);
+        const result = extractLines(text, startLine, endLine);
+
+        // An empty range is indistinguishable from a failed read, so the model keeps paginating
+        if (result.lines.start === 0 && result.lines.end === 0) {
+          const reason =
+            (startLine ?? 1) > result.totalLines
+              ? `Requested startLine ${startLine} is past the end of the file. The file has been fully read; stop paginating.`
+              : `Requested range ${startLine}-${endLine} is empty because startLine is greater than endLine.`;
+          span.end({ success: true }, { bytesTransferred: 0 });
+          return `File "${path}" has ${result.totalLines} lines (valid range 1-${result.totalLines}). ${reason}`;
+        }
+
+        // Header ranged reads so the model sees EOF coming instead of overshooting to find it
+        const output =
+          startLine !== undefined || endLine !== undefined
+            ? `${path} (lines ${result.lines.start}-${result.lines.end} of ${result.totalLines})\n${result.content}`
+            : result.content;
+
         span.end({ success: true }, { bytesTransferred: Buffer.byteLength(result.content, 'utf-8') });
-        return result.content;
+        return output;
       } catch (err) {
         span.error(err);
         throw err;

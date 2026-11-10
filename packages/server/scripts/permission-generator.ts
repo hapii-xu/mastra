@@ -10,7 +10,7 @@
 import * as path from 'node:path';
 import { fileURLToPath } from 'node:url';
 
-import { SERVER_ROUTES } from '../src/server/server-adapter/routes/index.js';
+import { SERVER_ROUTES, OPT_IN_ROUTES } from '../src/server/server-adapter/routes/index.js';
 import { getEffectivePermission } from '../src/server/server-adapter/routes/permissions.js';
 
 const __filename = fileURLToPath(import.meta.url);
@@ -59,6 +59,7 @@ const RESOURCE_DESCRIPTIONS: Record<string, string> = {
   'stored-prompt-blocks': 'stored prompt blocks',
   'stored-scorers': 'stored scorers',
   'stored-skills': 'stored skills',
+  'stored-workflows': 'stored workflows',
   'stored-workspaces': 'stored workspaces',
   system: 'system info',
   tools: 'tools',
@@ -116,15 +117,17 @@ export interface PermissionData {
 }
 
 /**
- * Derives permission data from SERVER_ROUTES using getEffectivePermission.
- * This ensures the generated permissions match runtime behavior exactly.
+ * Derives permission data from the routes the package can serve, including
+ * opt-in routes. An app that opts into a route still grants its permission, and
+ * an app that does not must be able to name the permission in a role so the
+ * route is gated the moment it is registered.
  */
 export function derivePermissionData(): PermissionData {
   const resourceSet = new Set<string>();
   const actionSet = new Set<string>();
   const permissionSet = new Set<string>();
 
-  for (const route of SERVER_ROUTES) {
+  for (const route of [...SERVER_ROUTES, ...OPT_IN_ROUTES]) {
     const permission = getEffectivePermission(route);
     if (permission) {
       const perms = Array.isArray(permission) ? permission : [permission];

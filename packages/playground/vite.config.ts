@@ -13,6 +13,7 @@ const studioStandalonePlugin = (targetPort: string, targetHost: string): PluginO
     return html
       .replace(/%%MASTRA_SERVER_HOST%%/g, targetHost)
       .replace(/%%MASTRA_SERVER_PORT%%/g, targetPort)
+      .replace(/%%MASTRA_DEV_SERVER_INSTANCE_ID%%/g, '')
       .replace(/%%MASTRA_API_PREFIX%%/g, '/api')
       .replace(/%%MASTRA_HIDE_CLOUD_CTA%%/g, 'true')
       .replace(/%%MASTRA_STUDIO_BASE_PATH%%/g, '')
@@ -215,6 +216,37 @@ const routesManifestPlugin = (): Plugin => {
   };
 };
 
+// `pnpm dev:playground` starts this server while @mastra/playground-ui's dev script has just emptied its `dist`
+// (scripts/prune-dist.mjs). Vite caches the imports it fails to resolve, so wait for the first watch build.
+const waitForPlaygroundUiWatchPlugin = (): Plugin => ({
+  name: 'wait-for-playground-ui-watch',
+  apply: 'serve',
+  async configureServer() {
+    const pendingFile = path.resolve(__dirname, '../playground-ui/node_modules/.cache/dev-watch-pending');
+    const exists = () =>
+      fs.access(pendingFile).then(
+        () => true,
+        () => false,
+      );
+    if (!(await exists())) return;
+
+    console.info('Waiting for the @mastra/playground-ui watch build…');
+    const deadline = Date.now() + 120_000;
+    while ((await exists()) && Date.now() < deadline) {
+      await new Promise(resolve => setTimeout(resolve, 200));
+    }
+  },
+});
+
+// Green mark while developing Studio itself. `mastra dev` serves the built bundle, so users keep the default icon.
+const devFaviconPlugin = (): Plugin => ({
+  name: 'dev-favicon',
+  apply: 'serve',
+  transformIndexHtml(html: string) {
+    return html.replace('href="./mastra-dark-tile.svg"', 'href="./mastra-dark-tile-dev.svg"');
+  },
+});
+
 export default defineConfig(({ mode }) => {
   const commonConfig: UserConfig = {
     plugins: [stubNodeBuiltinsPlugin, tailwindcss(), react(), routesManifestPlugin()],
@@ -247,7 +279,11 @@ export default defineConfig(({ mode }) => {
     const targetHost = process.env.HOST || 'localhost';
 
     if (commonConfig.plugins) {
-      commonConfig.plugins.push(studioStandalonePlugin(targetPort, targetHost));
+      commonConfig.plugins.push(
+        studioStandalonePlugin(targetPort, targetHost),
+        waitForPlaygroundUiWatchPlugin(),
+        devFaviconPlugin(),
+      );
     }
 
     return {
@@ -262,6 +298,14 @@ export default defineConfig(({ mode }) => {
           // Custom server routes (e.g. @mastra/livekit's connection-details endpoint)
           // mount at the server root, outside the /api prefix, so forward them too.
           '/voice': {
+            target: `http://${targetHost}:${targetPort}`,
+            changeOrigin: true,
+          },
+          // The Studio shell (index.html) opens an SSE connection to the dev
+          // server's refresh notifications at the root, outside /api. Without
+          // this entry the dev playground 404s the SSE and hot-reload
+          // refreshes never reach it.
+          '/refresh-events': {
             target: `http://${targetHost}:${targetPort}`,
             changeOrigin: true,
           },

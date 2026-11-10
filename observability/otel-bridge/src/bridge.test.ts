@@ -7,13 +7,20 @@
  * These unit tests focus on the bridge's core logic and API surface.
  */
 
+import { MockLanguageModelV2 } from '@internal/ai-sdk-v5/test';
+import { Agent } from '@mastra/core/agent';
+import { Mastra } from '@mastra/core/mastra';
 import type { CreateSpanOptions, LogEvent } from '@mastra/core/observability';
-import { SpanType, TracingEventType } from '@mastra/core/observability';
-import { isSpanContextValid, trace } from '@opentelemetry/api';
+import { InternalSpans, SamplingStrategyType, SpanType, TracingEventType } from '@mastra/core/observability';
+import { InMemoryStore } from '@mastra/core/storage';
+import { createTool } from '@mastra/core/tools';
+import { DefaultObservabilityInstance, Observability, TestExporter } from '@mastra/observability';
+import { context, isSpanContextValid, trace } from '@opentelemetry/api';
 import { logs as otelLogs, SeverityNumber } from '@opentelemetry/api-logs';
 import { InMemoryLogRecordExporter, LoggerProvider, SimpleLogRecordProcessor } from '@opentelemetry/sdk-logs';
-import { tracing } from '@opentelemetry/sdk-node';
-import { afterAll, beforeAll, describe, expect, it } from 'vitest';
+import { BasicTracerProvider, InMemorySpanExporter, SimpleSpanProcessor } from '@opentelemetry/sdk-trace-base';
+import { NodeTracerProvider } from '@opentelemetry/sdk-trace-node';
+import { afterAll, beforeAll, describe, expect, it, vi } from 'vitest';
 import { OtelBridge } from './bridge.js';
 
 // OTEL invalid (no-op) IDs, returned when no SDK / tracer provider is registered
@@ -25,17 +32,17 @@ describe('OtelBridge', () => {
   // to produce valid span contexts. Without this, the OTEL API falls back to a
   // no-op tracer whose spans carry all-zero IDs (see issue #15589 regression
   // tests below).
-  let tracerProvider: tracing.BasicTracerProvider;
+  let tracerProvider: BasicTracerProvider;
   let loggerProvider: LoggerProvider;
   let logExporter: InMemoryLogRecordExporter;
 
   beforeAll(() => {
-    tracerProvider = new tracing.BasicTracerProvider();
+    tracerProvider = new BasicTracerProvider();
     trace.setGlobalTracerProvider(tracerProvider);
 
     logExporter = new InMemoryLogRecordExporter();
     loggerProvider = new LoggerProvider({
-      processors: [new SimpleLogRecordProcessor(logExporter)],
+      processors: [new SimpleLogRecordProcessor({ exporter: logExporter })],
     });
     otelLogs.setGlobalLoggerProvider(loggerProvider);
   });
@@ -73,6 +80,240 @@ describe('OtelBridge', () => {
       bridge.shutdown();
     });
 
+    it('preserves a resumed Mastra parent instead of treating it as external', async () => {
+      const bridge = new OtelBridge();
+      const tracing = new DefaultObservabilityInstance({
+        serviceName: 'resume-parent',
+        name: 'resume-parent-instance',
+        sampling: { type: SamplingStrategyType.ALWAYS },
+        bridge,
+      });
+
+      const span = tracing.startSpan({
+        type: SpanType.GENERIC,
+        name: 'resumed-agent',
+        parentSpanId: '1234567890abcdef',
+      })!;
+
+      expect(span.exportSpan().parentSpanId).toBe('1234567890abcdef');
+      expect(span.exportSpan().externalParentSpanId).toBeUndefined();
+
+      span.end();
+      await tracing.flush();
+      await bridge.shutdown();
+    });
+
+    describe('with an ambient OTel span active', () => {
+      // The suite-level BasicTracerProvider has no context manager, so
+      // context.with() is a no-op there. Register a NodeTracerProvider for
+      // its AsyncLocalStorage context manager; the global tracer provider
+      // set in beforeAll stays in place (first registration wins).
+      let nodeProvider: NodeTracerProvider;
+
+      beforeAll(() => {
+        nodeProvider = new NodeTracerProvider();
+        nodeProvider.register();
+      });
+
+      afterAll(async () => {
+        context.disable();
+        await nodeProvider.shutdown();
+      });
+
+      it('keeps a resumed Mastra parent instead of adopting the ambient span', async () => {
+        const bridge = new OtelBridge();
+        const instance = new DefaultObservabilityInstance({
+          serviceName: 'resume-under-ambient',
+          name: 'resume-under-ambient-instance',
+          sampling: { type: SamplingStrategyType.ALWAYS },
+          bridge,
+        });
+
+        const ambient = trace.getTracer('ambient').startSpan('ambient-request');
+        const span = context.with(trace.setSpan(context.active(), ambient), () =>
+          instance.startSpan({
+            type: SpanType.GENERIC,
+            name: 'resumed-run',
+            parentSpanId: '1234567890abcdef',
+          }),
+        )!;
+        ambient.end();
+
+        const exported = span.exportSpan();
+        expect(exported.parentSpanId).toBe('1234567890abcdef');
+        expect(exported.parentSpanId).not.toBe(ambient.spanContext().spanId);
+        expect(exported.externalParentSpanId).toBe(ambient.spanContext().spanId);
+
+        span.end();
+        await instance.flush();
+        await bridge.shutdown();
+      });
+
+      it("keeps the initial run's ambient parent on a resume served under another ambient span", async () => {
+        let calls = 0;
+        const model = new MockLanguageModelV2({
+          doGenerate: async () => ({
+            content:
+              ++calls === 1
+                ? [{ type: 'tool-call' as const, toolCallId: 'call-1', toolName: 'confirm', input: '{}' }]
+                : [{ type: 'text' as const, text: 'Approved.' }],
+            finishReason: calls === 1 ? ('tool-calls' as const) : ('stop' as const),
+            usage: { inputTokens: 1, outputTokens: 1, totalTokens: 2 },
+            warnings: [],
+          }),
+        });
+        const agent = new Agent({
+          id: 'ambient-resume',
+          name: 'Ambient resume',
+          instructions: 'Request approval, then answer.',
+          model,
+          tools: {
+            confirm: createTool({
+              id: 'confirm',
+              description: 'Request approval',
+              requireApproval: true,
+              execute: async () => ({ approved: true }),
+            }),
+          },
+        });
+        const exporter = new TestExporter();
+        const mastra = new Mastra({
+          agents: { agent },
+          storage: new InMemoryStore(),
+          logger: false,
+          observability: new Observability({
+            configs: { default: { serviceName: 'ambient-resume', bridge: new OtelBridge(), exporters: [exporter] } },
+          }),
+        });
+        const underAmbient = async <T>(name: string, fn: () => Promise<T>) => {
+          const ambient = trace.getTracer('ambient').startSpan(name);
+          try {
+            return { ambient, result: await context.with(trace.setSpan(context.active(), ambient), fn) };
+          } finally {
+            ambient.end();
+          }
+        };
+
+        try {
+          const start = await underAmbient('start request', () =>
+            agent.generate('Start.', { runId: 'ambient-resume' }),
+          );
+          expect(start.result.finishReason).toBe('suspended');
+          const resume = await underAmbient('resume request', () =>
+            agent.resumeGenerate({ approved: true }, { runId: 'ambient-resume', toolCallId: 'call-1' }),
+          );
+          expect(resume.result.text).toBe('Approved.');
+
+          const [initial, resumed] = exporter.getSpansByType(SpanType.AGENT_RUN);
+          expect(initial!.externalParentSpanId).toBe(start.ambient.spanContext().spanId);
+          expect(resumed).toMatchObject({
+            traceId: initial!.traceId,
+            parentSpanId: initial!.id,
+            resumedFromSpanId: initial!.id,
+            externalParentSpanId: start.ambient.spanContext().spanId,
+          });
+        } finally {
+          await mastra.shutdown();
+        }
+      });
+
+      it('reports an ambient parent as external on a bridged root', async () => {
+        const bridge = new OtelBridge();
+        const instance = new DefaultObservabilityInstance({
+          serviceName: 'bridged-root',
+          name: 'bridged-root-instance',
+          sampling: { type: SamplingStrategyType.ALWAYS },
+          bridge,
+        });
+
+        const ambient = trace.getTracer('ambient').startSpan('ambient-request');
+        const span = context.with(trace.setSpan(context.active(), ambient), () =>
+          instance.startSpan({
+            type: SpanType.GENERIC,
+            name: 'bridged-root-run',
+          }),
+        )!;
+        ambient.end();
+
+        const exported = span.exportSpan();
+        expect(exported.parentSpanId).toBeUndefined();
+        expect(exported.externalParentSpanId).toBe(ambient.spanContext().spanId);
+
+        span.end();
+        await instance.flush();
+        await bridge.shutdown();
+      });
+
+      it('joins the trace an HTTP server span continued from the caller, and keeps the link to the caller', async () => {
+        // HTTP instrumentation continues the caller's `traceparent` header, so the
+        // request span starts under the HTTP server span, in the caller's trace.
+        const bridge = new OtelBridge();
+        const instance = new DefaultObservabilityInstance({
+          serviceName: 'served-request',
+          name: 'served-request-instance',
+          sampling: { type: SamplingStrategyType.ALWAYS },
+          bridge,
+        });
+        const caller = { traceId: '0af7651916cd43dd8448eb211c80319c', spanId: 'b7ad6b7169203331' };
+        const remote = trace.setSpanContext(context.active(), { ...caller, traceFlags: 1, isRemote: true });
+        const httpSpan = trace.getTracer('http').startSpan('POST /mcp', {}, remote);
+
+        const span = context.with(trace.setSpan(remote, httpSpan), () =>
+          instance.startSpan({
+            type: SpanType.MCP_SERVER_REQUEST,
+            name: 'tools/call weather',
+            links: [caller],
+          }),
+        )!;
+
+        const exported = span.exportSpan();
+        expect(exported.traceId).toBe(caller.traceId);
+        expect(exported.externalParentSpanId).toBe(httpSpan.spanContext().spanId);
+        expect(exported.links).toEqual([caller]);
+        const otelSpan = (bridge as any).otelSpanMap.get(span.id).otelSpan;
+        expect(otelSpan.links).toEqual([{ context: { ...caller, traceFlags: 1, isRemote: true } }]);
+
+        span.end();
+        httpSpan.end();
+        await instance.flush();
+        await bridge.shutdown();
+      });
+
+      it('classifies a Mastra-created ambient span as an internal parent', async () => {
+        // executeInContext runs code inside a Mastra span's OTel context. A
+        // root created there inherits that span as its ambient parent — but
+        // it IS in Mastra storage, so it must not be reported as external.
+        const bridge = new OtelBridge();
+        const instance = new DefaultObservabilityInstance({
+          serviceName: 'nested-root',
+          name: 'nested-root-instance',
+          sampling: { type: SamplingStrategyType.ALWAYS },
+          bridge,
+        });
+
+        const outerSpan = instance.startSpan({
+          type: SpanType.GENERIC,
+          name: 'outer-mastra-span',
+        })!;
+
+        const nestedRoot = bridge.executeInContextSync(outerSpan.id, () =>
+          instance.startSpan({
+            type: SpanType.GENERIC,
+            name: 'nested-root-run',
+          }),
+        )!;
+
+        const exported = nestedRoot.exportSpan();
+        expect(exported.parentSpanId).toBe(outerSpan.id);
+        expect(exported.externalParentSpanId).toBeUndefined();
+
+        nestedRoot.end();
+        outerSpan.end();
+        await instance.flush();
+        await bridge.shutdown();
+      });
+    });
+
     it('should handle errors gracefully and return undefined on failure', () => {
       const bridge = new OtelBridge();
 
@@ -82,6 +323,144 @@ describe('OtelBridge', () => {
       expect(result).toBeUndefined();
 
       bridge.shutdown();
+    });
+
+    // Regression tests for https://github.com/mastra-ai/mastra/issues/20771
+    //
+    // A workflow resumed after suspend restores traceId + parentSpanId from the
+    // persisted snapshot, but the parent OTEL span ended when the run suspended
+    // (possibly in another process) so it is not in the bridge's span map. The
+    // bridge must parent the span under a remote span context built from the
+    // persisted IDs instead of dropping them and starting a new trace.
+    describe('when restoring a persisted trace context', () => {
+      it('continues the persisted trace when the parent span is no longer live', () => {
+        const bridge = new OtelBridge();
+
+        const persistedTraceId = 'a1b2c3d4e5f60718293a4b5c6d7e8f90';
+        const persistedParentSpanId = '1a2b3c4d5e6f7081';
+
+        const result = bridge.createSpan({
+          type: SpanType.WORKFLOW_RUN,
+          name: 'workflow run (resumed)',
+          attributes: {},
+          traceId: persistedTraceId,
+          parentSpanId: persistedParentSpanId,
+        });
+
+        expect(result?.traceId).toBe(persistedTraceId);
+        expect(result?.parentSpanId).toBe(persistedParentSpanId);
+        expect(result?.spanId).toMatch(/^[0-9a-f]{16}$/);
+        expect(result?.spanId).not.toBe(persistedParentSpanId);
+
+        bridge.shutdown();
+      });
+
+      it('prefers a live parent span over the persisted IDs', () => {
+        const bridge = new OtelBridge();
+
+        const parentIds = bridge.createSpan({
+          type: SpanType.WORKFLOW_RUN,
+          name: 'live parent',
+          attributes: {},
+        });
+        expect(parentIds).toBeDefined();
+
+        const liveParent = {
+          id: parentIds!.spanId,
+          traceId: parentIds!.traceId,
+          isInternal: false,
+        };
+
+        const result = bridge.createSpan({
+          type: SpanType.WORKFLOW_STEP,
+          name: 'child of live parent',
+          attributes: {},
+          parent: liveParent as any,
+          traceId: 'a1b2c3d4e5f60718293a4b5c6d7e8f90',
+          parentSpanId: '1a2b3c4d5e6f7081',
+        });
+
+        expect(result?.traceId).toBe(parentIds!.traceId);
+        expect(result?.parentSpanId).toBe(parentIds!.spanId);
+
+        bridge.shutdown();
+      });
+
+      it('ignores malformed persisted IDs and falls back to the active context', () => {
+        const bridge = new OtelBridge();
+
+        const result = bridge.createSpan({
+          type: SpanType.WORKFLOW_RUN,
+          name: 'workflow run (resumed)',
+          attributes: {},
+          traceId: 'not-a-valid-trace-id',
+          parentSpanId: 'nope',
+        });
+
+        // Falls back to a fresh trace rather than emitting garbage trace links
+        expect(result?.traceId).toMatch(/^[0-9a-f]{32}$/);
+        expect(result?.traceId).not.toBe('not-a-valid-trace-id');
+        expect(result?.parentSpanId).toBeUndefined();
+
+        bridge.shutdown();
+      });
+    });
+
+    describe('with span links', () => {
+      const startLink = { traceId: 'a1b2c3d4e5f60718293a4b5c6d7e8f90', spanId: '1a2b3c4d5e6f7081' };
+      const lateLink = { traceId: 'b1b2c3d4e5f60718293a4b5c6d7e8f90', spanId: '2a2b3c4d5e6f7081' };
+
+      it('starts the OpenTelemetry span with links to valid linked spans, in a new trace when no context is active', () => {
+        const bridge = new OtelBridge();
+        const startSpan = vi.spyOn((bridge as any).otelTracer, 'startSpan');
+
+        const result = bridge.createSpan({
+          type: SpanType.MCP_SERVER_REQUEST,
+          name: 'tools/call weather',
+          attributes: {},
+          links: [startLink, { traceId: 'not-a-trace-id', spanId: 'nope' }],
+        });
+
+        const options = startSpan.mock.calls[0]![1] as { links?: Array<{ context: Record<string, unknown> }> };
+        expect(options.links).toEqual([{ context: { ...startLink, traceFlags: 1, isRemote: true } }]);
+        expect(result?.traceId).not.toBe(startLink.traceId);
+        expect(result?.externalParentSpanId).toBeUndefined();
+
+        startSpan.mockRestore();
+        bridge.shutdown();
+      });
+
+      it('adds links set after the span started when the span ends', async () => {
+        const bridge = new OtelBridge();
+        bridge.init({ config: { serviceName: 'late-links' } } as any);
+        const ids = bridge.createSpan({
+          type: SpanType.MCP_TOOL_CALL,
+          name: 'tool',
+          attributes: {},
+          links: [startLink],
+        })!;
+        const otelSpan = (bridge as any).otelSpanMap.get(ids.spanId).otelSpan;
+        const addLinks = vi.spyOn(otelSpan, 'addLinks');
+
+        await bridge.exportTracingEvent({
+          type: TracingEventType.SPAN_ENDED,
+          exportedSpan: {
+            id: ids.spanId,
+            traceId: ids.traceId,
+            name: 'tool',
+            type: SpanType.MCP_TOOL_CALL,
+            startTime: new Date(),
+            endTime: new Date(),
+            isEvent: false,
+            isRootSpan: true,
+            links: [startLink, lateLink],
+          },
+        } as any);
+
+        expect(addLinks).toHaveBeenCalledTimes(1);
+        expect(addLinks.mock.calls[0]![0]).toEqual([{ context: { ...lateLink, traceFlags: 1, isRemote: true } }]);
+        await bridge.shutdown();
+      });
     });
 
     // Regression tests for https://github.com/mastra-ai/mastra/issues/15589
@@ -171,6 +550,94 @@ describe('OtelBridge', () => {
 
         bridge.shutdown();
       });
+
+      // Regression tests for https://github.com/mastra-ai/mastra/issues/24950
+      it('warns once, with an actionable message, across many createSpan calls', () => {
+        const bridge = new OtelBridge();
+        const warn = vi.spyOn(bridge['logger'], 'warn');
+
+        for (let i = 0; i < 3; i++) {
+          bridge.createSpan({ type: SpanType.AGENT_RUN, name: 'test-agent', attributes: { agentId: 'test' } });
+        }
+
+        expect(warn).toHaveBeenCalledTimes(1);
+        const message = String(warn.mock.calls[0]![0]);
+        expect(message).toContain('No OpenTelemetry tracer provider is registered globally');
+        expect(message).toContain('new OtelBridge({ tracerProvider })');
+        expect(message).toContain('https://mastra.ai/reference/observability/tracing/bridges/otel#setup-requirements');
+
+        bridge.shutdown();
+      });
+
+      it('names the passed tracerProvider as the cause when it is a no-op', () => {
+        const bridge = new OtelBridge({ tracerProvider: trace.getTracerProvider() });
+        const warn = vi.spyOn(bridge['logger'], 'warn');
+
+        bridge.createSpan({ type: SpanType.AGENT_RUN, name: 'test-agent', attributes: { agentId: 'test' } });
+
+        expect(warn).toHaveBeenCalledTimes(1);
+        expect(String(warn.mock.calls[0]![0])).toContain(
+          'The tracerProvider passed to OtelBridge returned a no-op span',
+        );
+
+        bridge.shutdown();
+      });
+
+      it('does not reuse the parent span ID when the no-op tracer has a valid parent', () => {
+        // The no-op tracer hands back a span wrapping the parent's span
+        // context. Its IDs are valid, but reusing them would give every
+        // Mastra span the parent's span ID.
+        const bridge = new OtelBridge();
+        const warn = vi.spyOn(bridge['logger'], 'warn');
+
+        const result = bridge.createSpan({
+          type: SpanType.AGENT_RUN,
+          name: 'resumed-agent',
+          attributes: { agentId: 'test' },
+          traceId: '0af7651916cd43dd8448eb211c80319c',
+          parentSpanId: 'b7ad6b7169203331',
+        });
+
+        expect(result).toBeUndefined();
+        expect(warn).toHaveBeenCalledTimes(1);
+
+        bridge.shutdown();
+      });
+
+      it('does not warn per span when those spans end', async () => {
+        const bridge = new OtelBridge();
+        const instance = new DefaultObservabilityInstance({
+          serviceName: 'no-sdk',
+          name: 'no-sdk-instance',
+          sampling: { type: SamplingStrategyType.ALWAYS },
+          bridge,
+        });
+        const warn = vi.spyOn(bridge['logger'], 'warn');
+
+        const root = instance.startSpan({ type: SpanType.AGENT_RUN, name: 'agent', attributes: { agentId: 'a' } })!;
+        root.createChildSpan({ type: SpanType.GENERIC, name: 'child' }).end();
+        root.end();
+        await instance.flush();
+
+        expect(warn).toHaveBeenCalledTimes(1);
+        await bridge.shutdown();
+      });
+    });
+
+    it('does not warn when a tracer provider is registered', () => {
+      const bridge = new OtelBridge();
+      const warn = vi.spyOn(bridge['logger'], 'warn');
+
+      const result = bridge.createSpan({
+        type: SpanType.AGENT_RUN,
+        name: 'test-agent',
+        attributes: { agentId: 'test' },
+      });
+
+      expect(result).toBeDefined();
+      expect(warn).not.toHaveBeenCalled();
+
+      bridge.shutdown();
     });
   });
 
@@ -271,6 +738,74 @@ describe('OtelBridge', () => {
 
       // Shutdown should not throw
       await expect(bridge.shutdown()).resolves.toBeUndefined();
+    });
+  });
+
+  describe('flush with global providers', () => {
+    it('flushes the tracer provider registered globally through the API proxy', async () => {
+      // trace.getTracerProvider() returns the API's ProxyTracerProvider, which
+      // has no forceFlush of its own; the bridge must reach the delegate.
+      const forceFlush = vi.spyOn(tracerProvider, 'forceFlush');
+      try {
+        const bridge = new OtelBridge();
+        await bridge.flush();
+
+        expect(forceFlush).toHaveBeenCalledTimes(1);
+        await bridge.shutdown();
+      } finally {
+        forceFlush.mockRestore();
+      }
+    });
+
+    it('flushes a logger provider registered after the bridge was constructed', async () => {
+      otelLogs.disable();
+      const lateLoggerProvider = new LoggerProvider({
+        processors: [new SimpleLogRecordProcessor({ exporter: new InMemoryLogRecordExporter() })],
+      });
+      const forceFlush = vi.spyOn(lateLoggerProvider, 'forceFlush');
+      try {
+        const bridge = new OtelBridge();
+        otelLogs.setGlobalLoggerProvider(lateLoggerProvider);
+
+        await bridge.flush();
+
+        expect(forceFlush).toHaveBeenCalledTimes(1);
+        await bridge.shutdown();
+      } finally {
+        forceFlush.mockRestore();
+        await lateLoggerProvider.shutdown();
+        otelLogs.disable();
+        otelLogs.setGlobalLoggerProvider(loggerProvider);
+      }
+    });
+
+    it('ends leftover spans before flushing on shutdown', async () => {
+      const calls: string[] = [];
+      const customProvider = new BasicTracerProvider({
+        spanProcessors: [
+          {
+            onStart: () => {},
+            onEnd: () => calls.push('end'),
+            forceFlush: async () => {
+              calls.push('flush');
+            },
+            shutdown: async () => {},
+          },
+        ],
+      });
+      const bridge = new OtelBridge({ tracerProvider: customProvider });
+
+      const result = bridge.createSpan({
+        type: SpanType.AGENT_RUN,
+        name: 'left-open',
+        attributes: { agentId: 'test' },
+      } as CreateSpanOptions<SpanType.AGENT_RUN>);
+      expect(result).toBeDefined();
+
+      await bridge.shutdown();
+
+      expect(calls).toEqual(['end', 'flush']);
+      await customProvider.shutdown();
     });
   });
 
@@ -479,7 +1014,7 @@ describe('OtelBridge', () => {
     it('should use a custom tracerProvider to create spans without touching the global', async () => {
       trace.disable();
       try {
-        const customProvider = new tracing.BasicTracerProvider();
+        const customProvider = new BasicTracerProvider();
         const bridge = new OtelBridge({ tracerProvider: customProvider });
 
         const result = bridge.createSpan({
@@ -506,7 +1041,7 @@ describe('OtelBridge', () => {
       try {
         const customLogExporter = new InMemoryLogRecordExporter();
         const customLoggerProvider = new LoggerProvider({
-          processors: [new SimpleLogRecordProcessor(customLogExporter)],
+          processors: [new SimpleLogRecordProcessor({ exporter: customLogExporter })],
         });
         const bridge = new OtelBridge({ loggerProvider: customLoggerProvider });
 
@@ -535,7 +1070,7 @@ describe('OtelBridge', () => {
     });
 
     it('should flush the custom provider, not the global', async () => {
-      const customProvider = new tracing.BasicTracerProvider();
+      const customProvider = new BasicTracerProvider();
       let flushed = false;
       const originalFlush = customProvider.forceFlush.bind(customProvider);
       customProvider.forceFlush = async () => {
@@ -556,10 +1091,10 @@ describe('OtelBridge', () => {
       trace.disable();
       otelLogs.disable();
       try {
-        const customTracerProvider = new tracing.BasicTracerProvider();
+        const customTracerProvider = new BasicTracerProvider();
         const customLogExporter = new InMemoryLogRecordExporter();
         const customLoggerProvider = new LoggerProvider({
-          processors: [new SimpleLogRecordProcessor(customLogExporter)],
+          processors: [new SimpleLogRecordProcessor({ exporter: customLogExporter })],
         });
 
         const bridge = new OtelBridge({ tracerProvider: customTracerProvider, loggerProvider: customLoggerProvider });
@@ -601,9 +1136,9 @@ describe('OtelBridge', () => {
     it('should export span attributes correctly through custom provider', async () => {
       trace.disable();
       try {
-        const spanExporter = new tracing.InMemorySpanExporter();
-        const customProvider = new tracing.BasicTracerProvider({
-          spanProcessors: [new tracing.SimpleSpanProcessor(spanExporter)],
+        const spanExporter = new InMemorySpanExporter();
+        const customProvider = new BasicTracerProvider({
+          spanProcessors: [new SimpleSpanProcessor(spanExporter)],
         });
 
         const bridge = new OtelBridge({ tracerProvider: customProvider });
@@ -641,6 +1176,94 @@ describe('OtelBridge', () => {
       } finally {
         trace.setGlobalTracerProvider(tracerProvider);
       }
+    });
+  });
+
+  describe('span map cleanup', () => {
+    const mapSize = (bridge: OtelBridge) => bridge['otelSpanMap'].size;
+
+    const makeInstance = (bridge: OtelBridge, config: Record<string, unknown> = {}) =>
+      new DefaultObservabilityInstance({
+        serviceName: 'map-cleanup',
+        name: 'map-cleanup-instance',
+        sampling: { type: SamplingStrategyType.ALWAYS },
+        bridge,
+        ...config,
+      } as any);
+
+    const runWorkflow = (tracing: DefaultObservabilityInstance, steps = 5) => {
+      const run = tracing.startSpan({
+        type: SpanType.WORKFLOW_RUN,
+        name: 'workflow',
+        attributes: { workflowId: 'wf-1' },
+        tracingPolicy: { internal: InternalSpans.NONE },
+      })!;
+
+      for (let i = 0; i < steps; i++) {
+        const step = run.createChildSpan({
+          type: SpanType.WORKFLOW_STEP,
+          name: `step-${i}`,
+          attributes: { stepId: `step-${i}` },
+          tracingPolicy: { internal: InternalSpans.NONE },
+        });
+        step.end();
+      }
+
+      run.end();
+    };
+
+    it('does not retain entries for exported spans', async () => {
+      const bridge = new OtelBridge();
+      const tracing = makeInstance(bridge);
+
+      for (let run = 0; run < 4; run++) runWorkflow(tracing);
+      await tracing.flush();
+
+      expect(mapSize(bridge)).toBe(0);
+      await bridge.shutdown();
+    });
+
+    it('does not retain entries for spans dropped by excludeSpanTypes', async () => {
+      const bridge = new OtelBridge();
+      const tracing = makeInstance(bridge, { excludeSpanTypes: [SpanType.WORKFLOW_STEP] });
+
+      for (let run = 0; run < 4; run++) runWorkflow(tracing);
+      await tracing.flush();
+
+      expect(mapSize(bridge)).toBe(0);
+      await bridge.shutdown();
+    });
+
+    it('does not retain entries for spans dropped by spanFilter', async () => {
+      const bridge = new OtelBridge();
+      const tracing = makeInstance(bridge, {
+        spanFilter: (span: { type: SpanType }) => span.type !== SpanType.WORKFLOW_STEP,
+      });
+
+      for (let run = 0; run < 4; run++) runWorkflow(tracing);
+      await tracing.flush();
+
+      expect(mapSize(bridge)).toBe(0);
+      await bridge.shutdown();
+    });
+
+    it('does not retain entries for spans dropped by an output processor', async () => {
+      const bridge = new OtelBridge();
+      const tracing = makeInstance(bridge, {
+        spanOutputProcessors: [
+          {
+            name: 'drop-steps',
+            process: (span: { type: SpanType }) => (span.type === SpanType.WORKFLOW_STEP ? undefined : span),
+            shutdown: async () => {},
+          },
+        ],
+      });
+
+      for (let run = 0; run < 4; run++) runWorkflow(tracing);
+      await tracing.flush();
+
+      expect(mapSize(bridge)).toBe(0);
+      await bridge.shutdown();
     });
   });
 });

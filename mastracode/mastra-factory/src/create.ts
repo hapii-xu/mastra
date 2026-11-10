@@ -1,19 +1,21 @@
+import { randomBytes } from 'node:crypto';
 import fs from 'node:fs';
 import path from 'node:path';
 import * as p from '@clack/prompts';
 // `mastra/internal/auth` is the CLI's internal barrel — drives the browser-auth
 // flow and reuses persisted credentials + org resolution rather than duplicating
 // them here.
-import { fetchOrgs, getToken, loadCredentials, resolveCurrentOrg } from 'mastra/internal/auth';
+import type { PosthogAnalytics } from 'mastra/dist/analytics/index.js';
+import { fetchOrgs, getToken, loadCredentials, LoginCancelledError, resolveCurrentOrg } from 'mastra/internal/auth';
 import color from 'picocolors';
 import { x } from 'tinyexec';
 
-import type { Analytics } from './analytics.js';
 import { upsertEnvFile } from './env.js';
 import type { PlatformProject, ProjectRegion } from './platform.js';
 import {
   attachNeonDatabase,
   createServerProject,
+  ensureProductionEnvironment,
   getDatabaseConnection,
   mintOrgApiKey,
   PlatformApiError,
@@ -22,9 +24,16 @@ import {
 import { cloneTemplate, renameProject } from './utils/clone.js';
 import { detectPackageManager, getInstallArgs } from './utils/pm.js';
 
+export const PLATFORM_TEMPLATE_REPO = 'https://github.com/mastra-ai/template-factory';
+export const SELF_HOSTED_TEMPLATE_REPO = 'https://github.com/mastra-ai/template-factory-self-hosted';
+
 export interface CreateArgs {
   projectName?: string;
-  template: string;
+  /**
+   * Public GitHub URL of the template to scaffold. Omitted → the platform
+   * template, or the self-hosted template with `noPlatform`.
+   */
+  template?: string;
   /**
    * Skip the platform round-trip (auth, project, sk_ key, Neon). Useful for
    * offline scaffold testing. `.env` is left as-is from the template's
@@ -39,7 +48,7 @@ export interface CreateArgs {
    * equals the value. If no match, provisioning fails with a clear message.
    */
   org?: string;
-  analytics: Analytics;
+  analytics: PosthogAnalytics;
 }
 
 interface PlatformProvisionResult {
@@ -51,8 +60,8 @@ interface PlatformProvisionResult {
 }
 
 const PROJECT_REGION_OPTIONS = [
-  { value: 'eu', label: '🇪🇺 eu' },
   { value: 'us', label: '🇺🇸 us' },
+  { value: 'eu', label: '🇪🇺 eu' },
 ] as const satisfies ReadonlyArray<{ value: ProjectRegion; label: string }>;
 
 const NEON_REGION_BY_PROJECT_REGION = {
@@ -98,7 +107,10 @@ export async function create(args: CreateArgs): Promise<void> {
   const spinner = p.spinner();
   spinner.start('Downloading the Mastra Factory template...');
   try {
-    await cloneTemplate(args.template, projectPath);
+    await cloneTemplate(
+      args.template ?? (args.noPlatform ? SELF_HOSTED_TEMPLATE_REPO : PLATFORM_TEMPLATE_REPO),
+      projectPath,
+    );
     await renameProject(projectPath, projectName);
     // Seed .env from the example. Platform-provisioning below rewrites the
     // handful of platform keys idempotently; other keys stay as-is so the
@@ -111,6 +123,7 @@ export async function create(args: CreateArgs): Promise<void> {
     } catch {
       // Best-effort on Unix; no-op or unsupported on Windows.
     }
+    seedCredentialEncryptionKey(envPath);
     spinner.stop('Template downloaded.');
   } catch (err) {
     spinner.stop('Template download failed.');
@@ -136,6 +149,7 @@ export async function create(args: CreateArgs): Promise<void> {
   // ── Platform provisioning ────────────────────────────────────────────────
   let platformResult: PlatformProvisionResult | null = null;
   let platformError: string | null = null;
+  let platformSkipped = false;
   if (!args.noPlatform) {
     try {
       platformResult = await runPlatformProvisioning({
@@ -145,8 +159,13 @@ export async function create(args: CreateArgs): Promise<void> {
         org: args.org,
       });
     } catch (err) {
-      platformError = err instanceof Error ? err.message : String(err);
-      p.log.warn(`Platform provisioning failed: ${platformError}`);
+      if (err instanceof LoginCancelledError) {
+        platformSkipped = true;
+        p.log.info('Skipping Mastra platform setup.');
+      } else {
+        platformError = err instanceof Error ? err.message : String(err);
+        p.log.warn(`Platform provisioning failed: ${platformError}`);
+      }
     }
   }
 
@@ -207,6 +226,10 @@ export async function create(args: CreateArgs): Promise<void> {
       '',
       `Manage your project at ${color.underline('https://projects.mastra.ai')}`,
     );
+  } else if (platformSkipped) {
+    lines.push(
+      `${color.yellow('Skipped Mastra platform setup.')} Configure ${color.cyan('.env')} manually before running.`,
+    );
   } else if (args.noPlatform) {
     lines.push(
       `${color.yellow('Skipped platform provisioning (--no-platform).')} Configure ${color.cyan('.env')} manually before running.`,
@@ -247,9 +270,9 @@ async function runPlatformProvisioning({
   };
 
   try {
-    // 1. Auth — triggers the browser-auth flow if no cached credential.
-    //    When that flow is about to open (no env token, no cached credential),
-    //    pause first so the browser doesn't pop open unannounced.
+    // 1. Auth — announce the browser-auth flow before opening it when there is
+    //    no cached credential. Once the browser is open, any key skips platform
+    //    provisioning; Ctrl+C remains the process-level cancellation signal.
     const willOpenAuthFlow = !process.env.MASTRA_API_TOKEN && !(await loadCredentials());
     if (willOpenAuthFlow) {
       const proceed = await p.text({
@@ -257,11 +280,12 @@ async function runPlatformProvisioning({
         defaultValue: '',
       });
       if (p.isCancel(proceed)) {
-        throw new Error('Sign-in cancelled.');
+        p.cancel('Operation cancelled');
+        process.exit(0);
       }
     }
     p.log.info('Signing in to Mastra…');
-    const token = await getToken();
+    const token = await getToken(undefined, { skipOnInput: true, source: 'create-factory' });
 
     // 2. Org — `--org <id-or-name>` skips the picker; otherwise prompt every
     //    time so the user consciously chooses which org owns the new factory
@@ -277,6 +301,7 @@ async function runPlatformProvisioning({
       (await p.select({
         message: 'Where should your Factory project run?',
         options: [...PROJECT_REGION_OPTIONS],
+        initialValue: 'us',
       }));
     if (p.isCancel(projectRegion)) {
       p.cancel('Operation cancelled');
@@ -314,6 +339,21 @@ async function runPlatformProvisioning({
       throw err;
     }
     envAccumulator.MASTRA_PLATFORM_SECRET_KEY = secretKey;
+
+    const environmentSpinner = p.spinner();
+    environmentSpinner.start('Configuring production environment…');
+    try {
+      envAccumulator.MASTRA_ENVIRONMENT_ID = await ensureProductionEnvironment({
+        token,
+        orgId,
+        projectId: project.id,
+        region: projectRegion,
+      });
+      environmentSpinner.stop('Production environment ready.');
+    } catch (err) {
+      environmentSpinner.stop('Environment setup failed.');
+      throw err;
+    }
 
     // 5-7. Neon attach + poll + connection string.
     const neonSpinner = p.spinner();
@@ -388,6 +428,18 @@ function sanitizeDatabaseName(projectName: string): string {
   const cleaned = projectName.replace(/[^a-zA-Z0-9_-]/g, '-').replace(/^-+|-+$/g, '');
   const truncated = (cleaned || 'factory').slice(0, 64);
   return truncated;
+}
+
+/**
+ * Fill the template's empty `FACTORY_CREDENTIAL_ENCRYPTION_KEY` placeholder
+ * with a fresh AES-256 key so stored credentials are encrypted from the first
+ * boot. Templates that don't declare the key, or that already set one, are
+ * left alone.
+ */
+function seedCredentialEncryptionKey(envPath: string): void {
+  const env = fs.readFileSync(envPath, 'utf8');
+  if (!/^\s*(#\s*)?FACTORY_CREDENTIAL_ENCRYPTION_KEY\s*=\s*$/m.test(env)) return;
+  upsertEnvFile(envPath, { FACTORY_CREDENTIAL_ENCRYPTION_KEY: randomBytes(32).toString('base64') });
 }
 
 /**

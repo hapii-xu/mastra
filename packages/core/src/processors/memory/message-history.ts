@@ -1,18 +1,27 @@
-import type { Processor } from '..';
+import type { OutputResult, Processor, ProcessorSpanPhase } from '..';
 import type { MastraDBMessage, MessageList } from '../../agent';
-import { parseMemoryRequestContext } from '../../memory';
-import { removeWorkingMemoryTags } from '../../memory/working-memory-utils';
-import { SpanType, EntityType } from '../../observability';
+import { filterMessagesForPersistence } from '../../agent/filter-messages-for-persistence';
+import { noteThreadMessagesSaved } from '../../agent/thread-saves';
+import { loadMessageHistory, parseMemoryRequestContext } from '../../memory';
+import { getMemoryTokenBoundary, isAfterMemoryTokenBoundary } from '../../memory/message-history-config';
+import { SpanType } from '../../observability';
 import type { ObservabilityContext, MemoryOperationAttributes } from '../../observability';
+import { MASTRA_CONTINUATION_TOOL_CALL_IDS_KEY } from '../../request-context';
 import type { RequestContext } from '../../request-context';
 import type { MemoryStorage } from '../../storage';
+
+// Bounds the newest-first scan for continuation tool-call messages that fall outside the history window.
+const CONTINUATION_SCAN_PAGE_SIZE = 100;
+const CONTINUATION_SCAN_MAX_PAGES = 10;
 
 /**
  * Options for the MessageHistory processor
  */
 export interface MessageHistoryOptions {
   storage: MemoryStorage;
-  lastMessages?: number;
+  lastMessages?: number | false;
+  tokenLimit?: { maxTokens: number; atMaxRemoveTokens: number };
+  tokenCounter?: { countMessage(message: MastraDBMessage): number | Promise<number> };
 }
 
 /**
@@ -23,15 +32,46 @@ export interface MessageHistoryOptions {
  * This processor retrieves threadId and resourceId from RequestContext at execution time,
  * making it decoupled from memory-specific context.
  */
+/**
+ * Which memory operation each pipeline phase performs. The input phase recalls
+ * stored history into the context; the output phase saves the turn.
+ */
+const MEMORY_PHASE_OPERATION: Partial<Record<ProcessorSpanPhase, 'recall' | 'save'>> = {
+  input: 'recall',
+  inputStep: 'recall',
+  output: 'save',
+  outputStep: 'save',
+};
+
 export class MessageHistory implements Processor {
   readonly id = 'message-history';
   readonly name = 'MessageHistory';
+
+  /**
+   * Trace as a memory operation rather than an anonymous processor run: a user
+   * configures `memory`, not a processor. The two phases are different memory
+   * operations — the input phase recalls stored history, the output phase saves
+   * the turn — so each is named for what it does.
+   *
+   * This replaces a MEMORY_OPERATION span the processor used to create *inside*
+   * its own processor span, which meant two spans per phase describing one
+   * operation.
+   */
+  readonly spanType = SpanType.MEMORY_OPERATION;
+  readonly spanName = (phase: ProcessorSpanPhase): string => `memory: ${MEMORY_PHASE_OPERATION[phase] ?? 'recall'}`;
+  readonly spanAttributes = (phase: ProcessorSpanPhase): Partial<MemoryOperationAttributes> => ({
+    operationType: MEMORY_PHASE_OPERATION[phase] ?? 'recall',
+  });
   private storage: MemoryStorage;
-  private lastMessages?: number;
+  private lastMessages?: number | false;
+  private tokenLimit?: MessageHistoryOptions['tokenLimit'];
+  private tokenCounter?: MessageHistoryOptions['tokenCounter'];
 
   constructor(options: MessageHistoryOptions) {
     this.storage = options.storage;
     this.lastMessages = options.lastMessages;
+    this.tokenLimit = options.tokenLimit;
+    this.tokenCounter = options.tokenCounter;
   }
 
   /**
@@ -62,22 +102,86 @@ export class MessageHistory implements Processor {
     return null;
   }
 
-  private createMemorySpan(
-    operationType: MemoryOperationAttributes['operationType'],
-    observabilityContext?: Partial<ObservabilityContext>,
-    input?: any,
-    attributes?: Partial<MemoryOperationAttributes>,
-  ) {
-    const currentSpan = observabilityContext?.tracingContext?.currentSpan;
-    if (!currentSpan) return undefined;
-    return currentSpan.createChildSpan({
-      type: SpanType.MEMORY_OPERATION,
-      name: `memory: ${operationType}`,
-      entityType: EntityType.MEMORY,
-      entityName: 'Memory',
-      input,
-      attributes: { operationType, ...attributes },
-    });
+  /**
+   * This processor's own span, which the runner already typed as the memory
+   * operation. Recording onto it rather than creating a child keeps one span
+   * per memory operation. The runner owns its lifecycle, so this only ever
+   * updates — it never ends or errors the span.
+   */
+  private memorySpan(observabilityContext?: Partial<ObservabilityContext>) {
+    return observabilityContext?.tracingContext?.currentSpan;
+  }
+
+  private async loadContinuationToolCallMessages(
+    requestContext: RequestContext | undefined,
+    threadId: string,
+    resourceId: string | undefined,
+    loaded: MastraDBMessage[],
+  ): Promise<MastraDBMessage[]> {
+    const ids = requestContext?.get(MASTRA_CONTINUATION_TOOL_CALL_IDS_KEY);
+    if (!Array.isArray(ids) || ids.length === 0) return [];
+
+    const missing = new Set<string>(ids.filter((id): id is string => typeof id === 'string'));
+    for (const msg of loaded) {
+      for (const id of toolCallIdsOf(msg)) missing.delete(id);
+    }
+    if (missing.size === 0) return [];
+
+    // Scan newest-first in bounded pages so a long thread is never read in full.
+    const loadedIds = new Set(loaded.map(msg => msg.id));
+    const found: MastraDBMessage[] = [];
+    for (let page = 0; page < CONTINUATION_SCAN_MAX_PAGES && missing.size > 0; page++) {
+      const { messages, hasMore } = await this.storage.listMessages({
+        threadId,
+        resourceId,
+        page,
+        perPage: CONTINUATION_SCAN_PAGE_SIZE,
+        orderBy: { field: 'createdAt', direction: 'DESC' },
+        includeTotal: false,
+      });
+      for (const msg of messages) {
+        if (msg.role === 'system' || loadedIds.has(msg.id)) continue;
+        const ids = toolCallIdsOf(msg).filter(id => missing.has(id));
+        if (!ids.length) continue;
+        found.push(msg);
+        loadedIds.add(msg.id);
+        for (const id of ids) missing.delete(id);
+      }
+      if (!hasMore || messages.length < CONTINUATION_SCAN_PAGE_SIZE) break;
+    }
+    return found;
+  }
+
+  /**
+   * Keep pinned messages inside the token budget: drop the oldest unpinned history first,
+   * and skip any pinned message that cannot fit on its own.
+   */
+  private async fitPinnedMessages(
+    history: MastraDBMessage[],
+    pinned: MastraDBMessage[],
+  ): Promise<{ history: MastraDBMessage[]; pinned: MastraDBMessage[] }> {
+    if (!this.tokenLimit || !this.tokenCounter || !pinned.length) return { history, pinned };
+    const maxTokens = this.tokenLimit.maxTokens - this.tokenLimit.atMaxRemoveTokens;
+    // Keep each pinned result that fits on its own, then give the rest of the budget to history.
+    const fittedPinned: MastraDBMessage[] = [];
+    let pinnedTokens = 0;
+    for (const msg of pinned) {
+      const tokens = await this.tokenCounter.countMessage(msg);
+      if (pinnedTokens + tokens > maxTokens) continue;
+      pinnedTokens += tokens;
+      fittedPinned.push(msg);
+    }
+    if (!fittedPinned.length) return { history, pinned: [] };
+    // history is newest-first; keep the newest messages that still fit next to the pinned ones.
+    const kept: MastraDBMessage[] = [];
+    let total = pinnedTokens;
+    for (const msg of history) {
+      const tokens = await this.tokenCounter.countMessage(msg);
+      if (total + tokens > maxTokens) break;
+      total += tokens;
+      kept.push(msg);
+    }
+    return { history: kept, pinned: fittedPinned };
   }
 
   async processInput(
@@ -98,130 +202,81 @@ export class MessageHistory implements Processor {
     }
 
     const { threadId, resourceId } = context;
+    const memoryRunState = parseMemoryRequestContext(requestContext)?.runState?.();
 
-    const span = this.createMemorySpan(
-      'recall',
-      observabilityContext,
-      { threadId, resourceId },
-      {
-        lastMessages: this.lastMessages,
-      },
-    );
+    // The runner records failures on this span and ends it.
+    const span = this.memorySpan(observabilityContext);
+    span?.update({ attributes: { lastMessages: this.lastMessages } });
 
-    try {
-      // 1. Fetch historical messages from storage (as DB format)
+    // 1. Fetch historical messages from storage (as DB format)
+    const storedBoundary = getMemoryTokenBoundary(parseMemoryRequestContext(requestContext)?.thread);
+    const boundary =
+      this.tokenLimit &&
+      storedBoundary?.maxTokens === this.tokenLimit.maxTokens &&
+      storedBoundary.atMaxRemoveTokens === this.tokenLimit.atMaxRemoveTokens
+        ? storedBoundary
+        : undefined;
+    const cacheKey = `history:${threadId}:${resourceId ?? ''}:${this.lastMessages ?? 'all'}:${JSON.stringify(boundary)}`;
+    const loadMessages = async () => {
+      if (this.tokenLimit) {
+        const result = await loadMessageHistory({
+          storage: this.storage,
+          threadId,
+          resourceId,
+          boundary,
+          maxMessages: typeof this.lastMessages === 'number' ? this.lastMessages : undefined,
+          maxTokens: this.tokenLimit.maxTokens,
+          atMaxRemoveTokens: this.tokenLimit.atMaxRemoveTokens,
+          tokenCounter: this.tokenCounter,
+          includeOverflow: true,
+        });
+        return [...result.overflow, ...result.messages].reverse();
+      }
+
       const result = await this.storage.listMessages({
         threadId,
         resourceId,
         page: 0,
         perPage: this.lastMessages,
         orderBy: { field: 'createdAt', direction: 'DESC' },
+        // Last-N history read only consumes `messages`; skip the COUNT(*) work.
+        includeTotal: false,
       });
+      return result.messages;
+    };
+    const messages = memoryRunState ? await memoryRunState.load(cacheKey, loadMessages) : await loadMessages();
 
-      // 2. Filter out system messages (they should never be stored in DB)
-      const filteredMessages = result.messages.filter((msg: MastraDBMessage) => {
-        return msg.role !== 'system';
-      });
+    // 2. Filter out system messages (they should never be stored in DB)
+    const filteredMessages = messages.filter((msg: MastraDBMessage) => {
+      return msg.role !== 'system' && (!boundary || isAfterMemoryTokenBoundary(msg, boundary));
+    });
 
-      // 3. Merge with incoming messages and messages already in MessageList (avoiding duplicates by ID)
-      // This includes messages added by previous processors like SemanticRecall
-      const existingMessages = messageList.get.all.db();
-      const messageIds = new Set(existingMessages.map((m: MastraDBMessage) => m.id).filter(Boolean));
-      const uniqueHistoricalMessages = filteredMessages.filter((m: MastraDBMessage) => !m.id || !messageIds.has(m.id));
-
-      // Reverse to chronological order (oldest first) since we fetched DESC
-      const chronologicalMessages = uniqueHistoricalMessages.reverse();
-
-      if (chronologicalMessages.length === 0) {
-        span?.end({
-          output: { success: true },
-          attributes: { messageCount: 0 },
-        });
-        return messageList;
-      }
-
-      // Add historical messages with source: 'memory'
-      for (const msg of chronologicalMessages) {
-        if (msg.role === 'system') {
-          continue; // memory should not store system messages
-        } else {
-          messageList.add(msg, 'memory');
-        }
-      }
-
-      span?.end({
-        output: { success: true },
-        attributes: { messageCount: chronologicalMessages.length },
-      });
-
-      return messageList;
-    } catch (error) {
-      span?.error({ error: error as Error, endSpan: true });
-      throw error;
+    // A background task's result is written into its original tool-call message, which keeps
+    // its dispatch-time createdAt. The continuation turn that reports the result must still see
+    // it, so load those messages even when they fall outside the history window.
+    const pinnedMessages = await this.loadContinuationToolCallMessages(
+      requestContext,
+      threadId,
+      resourceId,
+      filteredMessages,
+    );
+    if (pinnedMessages.length) {
+      const fitted = await this.fitPinnedMessages(filteredMessages, pinnedMessages);
+      filteredMessages.splice(0, filteredMessages.length, ...fitted.history, ...fitted.pinned);
+      filteredMessages.sort((a, b) => new Date(b.createdAt).getTime() - new Date(a.createdAt).getTime());
     }
-  }
 
-  /**
-   * Filters messages before persisting to storage:
-   * 1. Removes system messages - these are runtime instructions and should never be stored
-   * 2. Removes streaming tool calls (state === 'partial-call') - these are intermediate states
-   * 3. Removes updateWorkingMemory tool invocations (hide args from message history)
-   * 4. Strips <working_memory> tags from text content
-   *
-   * Note: We preserve 'call' state tool invocations because:
-   * - For server-side tools, 'call' should have been converted to 'result' by the time OUTPUT is processed
-   * - For client-side tools (no execute function), 'call' is the final state from the server's perspective
-   */
-  private filterMessagesForPersistence(messages: MastraDBMessage[]): MastraDBMessage[] {
-    return messages
-      .filter(m => m.role !== 'system')
-      .map(m => {
-        const newMessage = { ...m };
-        // Only spread content if it's a proper V2 object
-        if (m.content && typeof m.content === 'object' && !Array.isArray(m.content)) {
-          newMessage.content = { ...m.content };
-        }
+    // 3. Add stored history in chronological order. MessageList layers any matching
+    // input copy onto the stored message so memory remains the authoritative base.
+    const chronologicalMessages = filteredMessages.reverse();
 
-        // Strip working memory tags from string content
-        if (typeof newMessage.content?.content === 'string' && newMessage.content.content.length > 0) {
-          const cleanedContent = removeWorkingMemoryTags(newMessage.content.content);
-          newMessage.content.content =
-            cleanedContent !== newMessage.content.content ? cleanedContent.trim() : newMessage.content.content;
-        }
+    for (const msg of chronologicalMessages) {
+      messageList.add(msg, 'memory');
+    }
 
-        if (Array.isArray(newMessage.content?.parts)) {
-          newMessage.content.parts = newMessage.content.parts
-            .map(p => {
-              // Filter out streaming tool calls (partial-call is an intermediate state during streaming)
-              if (p.type === `tool-invocation` && p.toolInvocation.state === `partial-call`) {
-                return null;
-              }
-              // Filter out updateWorkingMemory tool invocations (hide args from message history)
-              if (p.type === `tool-invocation` && p.toolInvocation.toolName === `updateWorkingMemory`) {
-                return null;
-              }
-              // Strip working memory tags from text parts
-              if (p.type === `text`) {
-                const text = typeof p.text === 'string' ? p.text : '';
-                const cleaned = removeWorkingMemoryTags(text);
-                return {
-                  ...p,
-                  text: cleaned !== text ? cleaned.trim() : text,
-                };
-              }
-              return p;
-            })
-            .filter((p): p is NonNullable<typeof p> => Boolean(p));
+    span?.update({ attributes: { messageCount: chronologicalMessages.length } });
 
-          // If all parts were filtered out, skip the whole message
-          if (newMessage.content.parts.length === 0) {
-            return null;
-          }
-        }
-
-        return newMessage;
-      })
-      .filter((m): m is NonNullable<typeof m> => Boolean(m));
+    return messageList;
   }
 
   async processOutputResult(
@@ -230,9 +285,10 @@ export class MessageHistory implements Processor {
       messageList: MessageList;
       abort: (reason?: string) => never;
       requestContext?: RequestContext;
+      result?: OutputResult;
     } & Partial<ObservabilityContext>,
   ): Promise<MessageList> {
-    const { messageList, requestContext, ...observabilityContext } = args;
+    const { messageList, requestContext, result, ...observabilityContext } = args;
 
     // Get memory context from RequestContext or MessageList
     const context = this.getMemoryContext(requestContext, messageList);
@@ -247,32 +303,37 @@ export class MessageHistory implements Processor {
 
     const { threadId, resourceId } = context;
 
-    const newInput = messageList.get.input.db();
-    const newOutput = messageList.get.response.db();
-    const messagesToSave = [...newInput, ...newOutput];
+    const persistenceMessageList = messageList.cloneForPersistence();
+    const newInput = persistenceMessageList.get.input.db();
+    const newOutput = persistenceMessageList.get.response.db();
+    // Apply transcript redaction before persisting: this path bypasses
+    // drainUnsavedMessages(), and a background tool result may sit in the
+    // list as a raw payload whose transcript transform lives only in
+    // providerMetadata. Persisting it untransformed would leak the raw
+    // payload to storage whenever this save lands after the redacting
+    // save-queue flush (last-writer-wins on the message id).
+    const messagesToSave = persistenceMessageList.transformMessagesForTranscript([...newInput, ...newOutput]);
 
     if (messagesToSave.length === 0) {
       return messageList;
     }
 
-    const span = this.createMemorySpan('save', observabilityContext, undefined, {
-      messageCount: messagesToSave.length,
-    });
-
-    try {
-      await this.persistMessages({ messages: messagesToSave, threadId, resourceId });
-      // add extra 1ms latency to make sure the next generate has not the same input
-      await new Promise(resolve => setTimeout(resolve, 10));
-
-      span?.end({
-        output: { success: true },
-      });
-
+    // Don't persist an input-only failed turn: if the provider errored before
+    // producing any output, saving the user message would orphan it in history.
+    // A run that accepted the input before failing (e.g. cut off by its total deadline) keeps it.
+    if (result?.finishReason === 'error' && newOutput.length === 0 && !result.inputAccepted) {
       return messageList;
-    } catch (error) {
-      span?.error({ error: error as Error, endSpan: true });
-      throw error;
     }
+
+    // The runner records failures on this span and ends it.
+    const span = this.memorySpan(observabilityContext);
+    span?.update({ attributes: { messageCount: messagesToSave.length } });
+
+    await this.persistMessages({ messages: messagesToSave, threadId, resourceId });
+    // add extra 1ms latency to make sure the next generate has not the same input
+    await new Promise(resolve => setTimeout(resolve, 10));
+
+    return messageList;
   }
 
   /**
@@ -289,21 +350,19 @@ export class MessageHistory implements Processor {
       return;
     }
 
-    const filtered = this.filterMessagesForPersistence(messages);
+    const filtered = filterMessagesForPersistence(messages);
 
     if (filtered.length === 0) {
       return;
     }
 
-    // Ensure thread exists (create if needed) before saving messages
+    const savedAt = Date.now();
+
+    // Ensure thread exists (create if needed) before saving messages.
+    // Nothing to write when it already exists: re-writing the row we just read
+    // would clobber a title generated concurrently with this save.
     const thread = await this.storage.getThreadById({ threadId });
-    if (thread) {
-      await this.storage.updateThread({
-        id: threadId,
-        title: thread.title || '',
-        metadata: thread.metadata || {},
-      });
-    } else {
+    if (!thread) {
       // Auto-create thread if it doesn't exist
       await this.storage.saveThread({
         thread: {
@@ -319,5 +378,15 @@ export class MessageHistory implements Processor {
 
     // Persist messages after thread is guaranteed to exist
     await this.storage.saveMessages({ messages: filtered });
+    noteThreadMessagesSaved({ threadId, resourceId, savedAt });
   }
+}
+
+function toolCallIdsOf(msg: MastraDBMessage): string[] {
+  const parts = msg.content?.parts ?? [];
+  const ids: string[] = [];
+  for (const part of parts) {
+    if (part.type === 'tool-invocation') ids.push(part.toolInvocation.toolCallId);
+  }
+  return ids;
 }

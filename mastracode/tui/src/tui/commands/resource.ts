@@ -1,8 +1,11 @@
+import { disposeAssistantRenderState } from '../assistant-render-registry.js';
+import { requireLocal } from '../runtime.js';
+import { clearPendingTools } from '../state.js';
 import type { SlashCommandContext } from './types.js';
 
 export async function handleResourceCommand(ctx: SlashCommandContext, args: string[]): Promise<void> {
-  const { state, controller } = ctx;
-  const { session } = state;
+  const { state } = ctx;
+  const { controller, session } = requireLocal(state, '/resource');
   const sub = args[0]?.trim();
   const current = session.identity.getResourceId();
   const defaultId = session.identity.getDefaultResourceId();
@@ -40,9 +43,9 @@ export async function handleResourceCommand(ctx: SlashCommandContext, args: stri
 
   if (latest) {
     await session.thread.switch({ threadId: latest.id, emitEvent: false });
+    disposeAssistantRenderState(state);
     state.chatContainer.clear();
-    state.pendingTools.clear();
-    state.pendingTaskToolIds?.clear();
+    clearPendingTools(state);
     state.allToolComponents = [];
     state.allSystemReminderComponents = [];
     state.messageComponentsById.clear();
@@ -55,9 +58,9 @@ export async function handleResourceCommand(ctx: SlashCommandContext, args: stri
         : `Switched to resource: ${newId} — resumed thread: ${latest.title || latest.id}`,
     );
   } else {
+    disposeAssistantRenderState(state);
     state.chatContainer.clear();
-    state.pendingTools.clear();
-    state.pendingTaskToolIds?.clear();
+    clearPendingTools(state);
     state.allToolComponents = [];
     state.allSystemReminderComponents = [];
     state.messageComponentsById.clear();

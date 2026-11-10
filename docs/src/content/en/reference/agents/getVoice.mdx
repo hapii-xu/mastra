@@ -1,6 +1,6 @@
 ---
 title: "Reference: Agent.getVoice() | Agents"
-description: "Documentation for the `Agent.getVoice()` method in Mastra agents, which retrieves the voice provider for speech capabilities."
+description: "The .getVoice() method retrieves the voice provider configured for an agent, resolving it if it's a function."
 packages:
   - "@mastra/core"
 ---
@@ -49,7 +49,7 @@ await agent.getVoice()
   content={[
   {
     name: 'voice',
-    type: 'Promise<MastraVoice>',
+    type: 'Promise<IMastraVoice>',
     description:
       'A promise that resolves to the voice provider configured for the agent, or a default voice provider if none was configured.',
   },
@@ -66,5 +66,5 @@ await agent.getVoice({
 
 ## Related
 
-- [Voice in Mastra](/docs/voice/overview)
+- [Voice in Mastra](/reference/voice/overview)
 - [Voice providers](../voice/mastra-voice)

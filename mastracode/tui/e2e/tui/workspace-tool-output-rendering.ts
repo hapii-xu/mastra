@@ -1,4 +1,4 @@
-import { mkdirSync, writeFileSync } from 'node:fs';
+import { mkdirSync, readFileSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { expect } from './expect.js';
 import type { McE2eScenario } from './types.js';
@@ -10,7 +10,11 @@ export const workspaceToolOutputRenderingScenario: McE2eScenario = {
   skipReason: 'current main repeats workspace tool calls and never reaches final assistant completion text',
   useOpenAIModel: true,
   aimockFixture: 'workspace-tool-output-rendering.json',
-  prepare({ projectDir }) {
+  prepare({ appDataDir, projectDir }) {
+    const settingsPath = join(appDataDir, 'settings.json');
+    const settings = JSON.parse(readFileSync(settingsPath, 'utf8')) as Record<string, unknown>;
+    settings.lsp = true;
+    writeFileSync(settingsPath, JSON.stringify(settings, null, 2));
     mkdirSync(join(projectDir, 'src'), { recursive: true });
     writeFileSync(join(projectDir, 'src', 'workspace-output-e2e.ts'), 'export const WORKSPACE_E2E_SYMBOL = 42;\n');
   },
@@ -21,7 +25,7 @@ export const workspaceToolOutputRenderingScenario: McE2eScenario = {
     terminal.submit('Render workspace shell and lsp outputs.');
 
     await runtime.waitForScreenText(/\$ printf 'WORKSPACE_E2E_SHELL_OUTPUT/i, terminal, 10_000);
-    await runtime.waitForScreenText(/│ WORKSPACE_E2E_SHELL_OUTPUT/i, terminal, 10_000);
+    await runtime.waitForScreenText(/^\s+WORKSPACE_E2E_SHELL_OUTPUT/im, terminal, 10_000);
     await runtime.waitForScreenText(/lsp_inspect\s+src\/workspace-output-e2e\.ts\s+L1/i, terminal, 15_000);
     await runtime.waitForScreenText(/WORKSPACE_E2E_SYMBOL/i, terminal, 15_000);
     await runtime.waitForScreenText(/Workspace tool output rendering complete\./i, terminal, 15_000);

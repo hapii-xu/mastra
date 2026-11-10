@@ -23,17 +23,23 @@ import type { MastraPackageInfo } from '../../utils/mastra-packages.js';
 import { getMastraPackages } from '../../utils/mastra-packages.js';
 import { loadAndValidatePresets } from '../../utils/validate-presets.js';
 import { resolveFactoryUIDevDist } from '../build/factory-ui-build.js';
+import { getSourceMapNodeArgs } from '../utils.js';
 
 import { acquireDevLock, releaseDevLock, updateDevLock } from './dev-lock';
 import { DevBundler } from './DevBundler';
+import { createEnvironmentState } from './env-state.js';
 
 let currentServerProcess: ChildProcess | undefined;
 let isRestarting = false;
 let serverStartTime: number | undefined;
 let requestContextPresetsJson: string | undefined;
 const ON_ERROR_MAX_RESTARTS = 3;
+// How long a stopping server gets to drain and run Mastra's shutdown (including its final
+// usage telemetry report) before it is killed, on both hot reload and Ctrl-C.
+const SERVER_SHUTDOWN_TIMEOUT_MS = 5000;
+const environmentState = createEnvironmentState();
 
-function waitForProcessExit(child: ChildProcess, timeoutMs = 2000): Promise<void> {
+function waitForProcessExit(child: ChildProcess, timeoutMs = SERVER_SHUTDOWN_TIMEOUT_MS): Promise<void> {
   if (child.exitCode !== null) {
     return Promise.resolve();
   }
@@ -71,6 +77,7 @@ interface StartOptions {
   mastraPackages?: MastraPackageInfo[];
   peerDepMismatches?: PeerDepMismatch[];
   factory?: boolean;
+  sourcemap?: boolean;
 }
 
 type ProcessOptions = {
@@ -114,7 +121,10 @@ const startServer = async (
     serverStartTime = Date.now();
     devLogger.starting();
 
-    const commands = [];
+    // Built up front so the source map check sees the NODE_OPTIONS the child
+    // actually gets, including values from .env files that process.env lacks.
+    const childEnvironment = environmentState.getChildEnvironment(env);
+    const commands = getSourceMapNodeArgs(!!startOptions.sourcemap, childEnvironment.NODE_OPTIONS);
 
     const inspect = startOptions.inspect === '' ? true : startOptions.inspect;
     const inspectBrk = startOptions.inspectBrk === '' ? true : startOptions.inspectBrk;
@@ -155,8 +165,10 @@ const startServer = async (
     currentServerProcess = execa(process.execPath, commands, {
       cwd: publicDir,
       env: {
-        NODE_ENV: 'production',
-        ...Object.fromEntries(env),
+        ...childEnvironment,
+        // A dotenv-provided NODE_ENV still wins, matching the behaviour before the
+        // child environment was built from the layered dotenv state.
+        NODE_ENV: env.get('NODE_ENV') ?? 'production',
         MASTRA_DEV: 'true',
         PORT: port.toString(),
         MASTRA_PACKAGES_FILE: packagesFilePath,
@@ -389,7 +401,7 @@ async function rebundleAndRestart(
               resolve();
             }
           }
-        }, 5000);
+        }, SERVER_SHUTDOWN_TIMEOUT_MS);
       });
       if (currentServerProcess === serverProcess) {
         currentServerProcess = undefined;
@@ -403,10 +415,7 @@ async function rebundleAndRestart(
       env.set('MASTRA_REQUEST_CONTEXT_PRESETS', requestContextPresetsJson);
     }
 
-    // spread env into process.env
-    for (const [key, value] of env.entries()) {
-      process.env[key] = value;
-    }
+    environmentState.sync(env);
 
     await startServer(
       join(dotMastraPath, 'output'),
@@ -463,6 +472,7 @@ export async function dev({
 
   const bundler = new DevBundler(env, factory);
   bundler.__setLogger(createLogger(debug)); // Keep Pino logger for internal bundler operations
+  bundler.setConfigEntryFile(userEntryFile);
 
   // Discover fs-routed agents under agents/* and, if any exist, wrap the entry so
   // they are registered onto the user's mastra instance. Falls back to the user
@@ -479,12 +489,7 @@ export async function dev({
   // Clear any prior presets to avoid cross-run leakage
   requestContextPresetsJson = undefined;
   loadedEnv.delete('MASTRA_REQUEST_CONTEXT_PRESETS');
-  delete process.env.MASTRA_REQUEST_CONTEXT_PRESETS;
-
-  // spread loadedEnv into process.env
-  for (const [key, value] of loadedEnv.entries()) {
-    process.env[key] = value;
-  }
+  environmentState.allowLoadedOverride('MASTRA_REQUEST_CONTEXT_PRESETS');
 
   // Load and validate request context presets if provided
   if (requestContextPresets) {
@@ -497,6 +502,14 @@ export async function dev({
       process.exit(1);
     }
   }
+
+  environmentState.sync(loadedEnv);
+
+  // Empty the output directory before extracting server options. Extraction
+  // imports a generated config from `.mastra/output`, so leftovers from a
+  // previous `mastra build` (e.g. packed workspace deps under node_modules)
+  // would otherwise shadow the project's own dependencies.
+  await bundler.prepare(dotMastraPath);
 
   const serverOptions = userEntryFile ? await getServerOptions(userEntryFile, join(dotMastraPath, 'output')) : null;
   let portToUse = serverOptions?.port ?? process.env.PORT;
@@ -541,22 +554,6 @@ export async function dev({
   const peerDepMismatches = await checkMastraPeerDeps(mastraPackages);
   logPeerDepWarnings(peerDepMismatches);
 
-  const startOptions: StartOptions = {
-    inspect,
-    inspectBrk,
-    customArgs,
-    https: httpsOptions,
-    mastraPackages,
-    peerDepMismatches,
-    factory,
-  };
-
-  await bundler.prepare(dotMastraPath);
-
-  // Re-assert the lock after prepare() emptied the directory.
-  // The bundler preserves the lock, but this ensures the data is current.
-  await updateDevLock(dotMastraPath, hostToUse, Number(portToUse));
-
   // Write the generated fs-routed agents wrapper entry. Runs after `prepare()`
   // empties the output directory so the wrapper is not wiped before the watcher
   // reads it. No-op when there are no fs-routed agents.
@@ -575,6 +572,17 @@ export async function dev({
     outputDirectory: dotMastraPath,
     preparedEntry: fsAgents,
   });
+
+  const startOptions: StartOptions = {
+    inspect,
+    inspectBrk,
+    customArgs,
+    https: httpsOptions,
+    mastraPackages,
+    peerDepMismatches,
+    factory,
+    sourcemap: bundler.sourcemapEnabled,
+  };
 
   await startServer(
     join(dotMastraPath, 'output'),
@@ -617,7 +625,12 @@ export async function dev({
     if (isShuttingDown) return;
     isShuttingDown = true;
 
-    const forceExit = setTimeout(() => process.exit(0), 3000);
+    // Leave the server its full shutdown window: exiting first would let execa's cleanup
+    // signal it again, which force-quits it.
+    const forceExit = setTimeout(() => {
+      releaseDevLock(dotMastraPath);
+      process.exit(0);
+    }, SERVER_SHUTDOWN_TIMEOUT_MS + 1000);
     forceExit.unref();
 
     devLogger.shutdown();

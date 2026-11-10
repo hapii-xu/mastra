@@ -8,6 +8,7 @@
  */
 import { describe, it, expect, vi, beforeEach } from 'vitest';
 import { z } from 'zod';
+import { ScorerRunError } from '../../../evals/base';
 import type { MastraScorer } from '../../../evals/base';
 import type { Trajectory } from '../../../evals/types';
 import type { Mastra } from '../../../mastra';
@@ -95,6 +96,7 @@ function buildMastra(storage: MastraCompositeStore) {
   return {
     mastra: {
       getStorage: vi.fn().mockReturnValue(storage),
+      observability: { flush: vi.fn().mockResolvedValue(undefined) },
       getAgent: vi.fn().mockReturnValue(mockAgent),
       getAgentById: vi.fn().mockReturnValue(mockAgent),
       getScorerById: vi.fn(),
@@ -157,6 +159,71 @@ describe('trajectory scorer dispatch', () => {
     expect(names).toContain('convertUnits');
   });
 
+  it('flushes observability before reading the trace, so the stored trace is used', async () => {
+    // The storage exporter buffers spans, so the trace is only readable after a flush.
+    let flushed = false;
+    (mastra.observability.flush as ReturnType<typeof vi.fn>).mockImplementation(async () => {
+      flushed = true;
+    });
+    const getTrace = vi.fn().mockImplementation(async () =>
+      flushed
+        ? {
+            traceId: 'trace-1',
+            spans: [
+              {
+                traceId: 'trace-1',
+                spanId: 'model-1',
+                parentSpanId: null,
+                name: 'model',
+                spanType: 'model_generation',
+                startedAt: new Date('2025-01-01T00:00:00Z'),
+                endedAt: new Date('2025-01-01T00:00:01Z'),
+              },
+            ],
+          }
+        : null,
+    );
+    const getStore = storage.getStore as ReturnType<typeof vi.fn>;
+    const getDomainStore = getStore.getMockImplementation()!;
+    getStore.mockImplementation(async (name: keyof StorageDomains) =>
+      name === 'observability' ? { getTrace } : getDomainStore(name),
+    );
+    const mockAgent = mastra.getAgentById('test-agent') as unknown as ReturnType<typeof createMockAgent>;
+    const generate = mockAgent.generate.getMockImplementation()!;
+    mockAgent.generate.mockImplementation(async () => ({ ...(await generate()), traceId: 'trace-1' }));
+    const scorer = createCapturingScorer('traj-scorer');
+
+    await runExperiment(mastra, {
+      datasetId,
+      targetType: 'agent',
+      targetId: 'test-agent',
+      scorers: [scorer],
+    });
+
+    expect(getTrace).toHaveBeenCalledWith({ traceId: 'trace-1' });
+    expect((scorer.capturedOutput as Trajectory).steps.map(s => s.stepType)).toEqual(['model_generation']);
+  });
+
+  it('keeps scoring when the flush fails', async () => {
+    (mastra.observability.flush as ReturnType<typeof vi.fn>).mockRejectedValue(new Error('flush failed'));
+    const warn = vi.fn();
+    (mastra as any).getLogger = () => ({ warn });
+    const mockAgent = mastra.getAgentById('test-agent') as unknown as ReturnType<typeof createMockAgent>;
+    const generate = mockAgent.generate.getMockImplementation()!;
+    mockAgent.generate.mockImplementation(async () => ({ ...(await generate()), traceId: 'trace-1' }));
+    const scorer = createCapturingScorer('traj-scorer');
+
+    await runExperiment(mastra, {
+      datasetId,
+      targetType: 'agent',
+      targetId: 'test-agent',
+      scorers: [scorer],
+    });
+
+    expect((scorer.capturedOutput as Trajectory).steps.map(s => s.name)).toEqual(['getWeather', 'convertUnits']);
+    expect(warn).toHaveBeenCalledWith('Failed to flush observability before reading the trace:', expect.any(Error));
+  });
+
   it('non-trajectory scorers still receive the raw output', async () => {
     const agentScorer = createAgentScorer('agent-scorer');
 
@@ -211,6 +278,26 @@ describe('steps scorer config — per-step dispatch', () => {
     return createWorkflow({ id: 'two-step-wf', inputSchema, outputSchema }).then(upperStep).then(echoStep).commit();
   }
 
+  it('trajectory scorer receives workflow step trajectory when no trace is stored', async () => {
+    const workflow = buildTwoStepWorkflow();
+    (mastra.getWorkflowById as ReturnType<typeof vi.fn>).mockReturnValue(workflow);
+    (mastra.getWorkflow as ReturnType<typeof vi.fn>).mockReturnValue(workflow);
+
+    const scorer = createCapturingScorer('traj-scorer');
+
+    const result = await runExperiment(mastra, {
+      datasetId,
+      targetType: 'workflow',
+      targetId: 'two-step-wf',
+      scorers: [scorer],
+    });
+
+    expect(result.status).toBe('completed');
+    const trajectory = scorer.capturedOutput as Trajectory;
+    expect(trajectory.steps.map(s => s.name)).toEqual(['upper', 'echo']);
+    expect(trajectory.steps.every(s => s.stepType === 'workflow_step')).toBe(true);
+  });
+
   it('runs per-step scorers against each step output', async () => {
     const workflow = buildTwoStepWorkflow();
     (mastra.getWorkflowById as ReturnType<typeof vi.fn>).mockReturnValue(workflow);
@@ -263,6 +350,61 @@ describe('steps scorer config — per-step dispatch', () => {
     expect(echoResult?.score).toBe(0.5);
     expect(echoResult?.targetScope).toBe('span');
     expect(echoResult?.stepId).toBe('echo');
+  });
+
+  it('retains completed output from a failed step scorer without persisting its recovered score', async () => {
+    const workflow = buildTwoStepWorkflow();
+    (mastra.getWorkflowById as ReturnType<typeof vi.fn>).mockReturnValue(workflow);
+    (mastra.getWorkflow as ReturnType<typeof vi.fn>).mockReturnValue(workflow);
+
+    const recoveredFailure = new ScorerRunError({
+      scorerId: 'partial-step-scorer',
+      steps: ['generateScore', 'generateReason'],
+      failedStep: 'generateReason',
+      completedSteps: ['generateScore'],
+      result: {
+        output: { upper: 'HELLO' },
+        runId: 'partial-step-run',
+        score: 0,
+        generateScorePrompt: 'score the upper-case output',
+      },
+      cause: new Error('step reason failed'),
+    });
+    const partialScorer = {
+      id: 'partial-step-scorer',
+      name: 'partial-step-scorer',
+      description: '',
+      type: 'agent' as const,
+      run: vi.fn().mockRejectedValue(recoveredFailure),
+    } as unknown as MastraScorer<any, any, any, any>;
+    const workingScorer = createAgentScorer('working-step-scorer');
+
+    const result = await runExperiment(mastra, {
+      datasetId,
+      targetType: 'workflow',
+      targetId: 'two-step-wf',
+      scorers: { steps: { upper: [partialScorer, workingScorer] } } as any,
+    });
+
+    const scores = result.results[0]?.scores ?? [];
+    expect(scores.find(score => score.scorerId === 'partial-step-scorer')).toMatchObject({
+      score: 0,
+      reason: null,
+      error: 'Scorer Run Failed: step reason failed',
+      failedStep: 'generateReason',
+      completedSteps: ['generateScore'],
+      targetScope: 'span',
+      stepId: 'upper',
+    });
+    expect(scores.find(score => score.scorerId === 'working-step-scorer')).toMatchObject({
+      score: 1,
+      error: null,
+      stepId: 'upper',
+    });
+    const scoreStoreLookups = (storage.getStore as ReturnType<typeof vi.fn>).mock.calls.filter(
+      ([domain]) => domain === 'scores',
+    );
+    expect(scoreStoreLookups).toHaveLength(1);
   });
 
   it('skips step scorers for steps that did not run successfully', async () => {
@@ -360,5 +502,100 @@ describe('categorised scorer config (AgentScorerConfig)', () => {
     expect(scores).toHaveLength(2);
     expect(agentScorer.run).toHaveBeenCalledOnce();
     expect(trajScorer.run).toHaveBeenCalledOnce();
+  });
+});
+
+describe('expectedTrajectory pass-through (#21743)', () => {
+  const expectedTrajectory = { steps: [{ stepType: 'tool_call' as const, name: 'getWeather' }] };
+
+  let storage: MastraCompositeStore;
+  let datasetsStorage: DatasetsInMemory;
+  let mastra: Mastra;
+
+  beforeEach(() => {
+    ({ storage, datasetsStorage } = buildStorage());
+    ({ mastra } = buildMastra(storage));
+  });
+
+  it('forwards a dataset item expectedTrajectory to the scorer run', async () => {
+    const dataset = await datasetsStorage.createDataset({ name: 'Test', description: '' });
+    await datasetsStorage.addItem({
+      datasetId: dataset.id,
+      input: 'What is the weather in London in Fahrenheit?',
+      expectedTrajectory,
+    });
+
+    const scorer = createCapturingScorer('traj-scorer');
+
+    await runExperiment(mastra, {
+      datasetId: dataset.id,
+      targetType: 'agent',
+      targetId: 'test-agent',
+      scorers: [scorer],
+    });
+
+    const callArg = (scorer.run as ReturnType<typeof vi.fn>).mock.calls[0]?.[0];
+    expect(callArg?.expectedTrajectory).toEqual(expectedTrajectory);
+  });
+
+  it('forwards an inline data item expectedTrajectory to the scorer run', async () => {
+    const scorer = createCapturingScorer('traj-scorer');
+
+    await runExperiment(mastra, {
+      data: [{ input: 'What is the weather in London in Fahrenheit?', expectedTrajectory }],
+      targetType: 'agent',
+      targetId: 'test-agent',
+      scorers: [scorer],
+    });
+
+    const callArg = (scorer.run as ReturnType<typeof vi.fn>).mock.calls[0]?.[0];
+    expect(callArg?.expectedTrajectory).toEqual(expectedTrajectory);
+  });
+
+  it('passes undefined when the item has no expectedTrajectory', async () => {
+    const dataset = await datasetsStorage.createDataset({ name: 'Test', description: '' });
+    await datasetsStorage.addItem({
+      datasetId: dataset.id,
+      input: 'What is the weather in London in Fahrenheit?',
+    });
+
+    const scorer = createCapturingScorer('traj-scorer');
+
+    const result = await runExperiment(mastra, {
+      datasetId: dataset.id,
+      targetType: 'agent',
+      targetId: 'test-agent',
+      scorers: [scorer],
+    });
+
+    expect(result.status).toBe('completed');
+    const callArg = (scorer.run as ReturnType<typeof vi.fn>).mock.calls[0]?.[0];
+    expect(callArg?.expectedTrajectory).toBeUndefined();
+  });
+
+  it('forwards expectedTrajectory to step-scoped scorers', async () => {
+    const inputSchema = z.object({ prompt: z.string() });
+    const outputSchema = z.object({ upper: z.string() });
+    const upperStep = createStep({
+      id: 'upper',
+      inputSchema,
+      outputSchema,
+      execute: async ({ inputData }) => ({ upper: inputData.prompt.toUpperCase() }),
+    });
+    const workflow = createWorkflow({ id: 'one-step-wf', inputSchema, outputSchema }).then(upperStep).commit();
+    (mastra.getWorkflowById as ReturnType<typeof vi.fn>).mockReturnValue(workflow);
+    (mastra.getWorkflow as ReturnType<typeof vi.fn>).mockReturnValue(workflow);
+
+    const stepScorer = createAgentScorer('upper-scorer');
+
+    await runExperiment(mastra, {
+      data: [{ input: { prompt: 'Hello' }, expectedTrajectory }],
+      targetType: 'workflow',
+      targetId: 'one-step-wf',
+      scorers: { steps: { upper: [stepScorer] } } as any,
+    });
+
+    const callArg = (stepScorer.run as ReturnType<typeof vi.fn>).mock.calls[0]?.[0];
+    expect(callArg?.expectedTrajectory).toEqual(expectedTrajectory);
   });
 });
